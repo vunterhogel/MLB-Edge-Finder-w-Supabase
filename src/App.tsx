@@ -97,6 +97,12 @@ const LG_KRATE = 0.22;   // league avg batter strikeouts per plate appearance
 const LG_FIP = 4.05, LG_KPCT = 0.22, LG_BBPCT = 0.082, FIP_CONST = 3.10;
 const STARTER_SHARE = 0.6; // a hitter faces the opposing STARTER for ~60% of the game; bullpen (team RA/G) covers the rest
 
+// Supabase project — URL is safe to expose client-side; the Odds API key lives as a server-side secret.
+// Get SUPABASE_ANON_KEY from: Supabase Dashboard → Project Settings → API → "anon public"
+const SUPABASE_URL = "https://jkpctgapbsyzqjfiiuoe.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImprcGN0Z2FwYnN5enFqZmlpdW9lIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODc4NzE5MDMsImV4cCI6MjEwMzQ0NzkwM30.9UT8ILqf6Xpk9LNangxZKfQZmv6Woa7WlbzRVyxdttg"; // safe to expose — grants only public access
+const ODDS_PROXY_URL = `${SUPABASE_URL}/functions/v1/odds-proxy`;
+
 // Optional Baseball Savant game-feed layer. Keep blank for direct fetch during local testing.
 // For hosted/public deploys, route through a serverless proxy that accepts ?url=<encoded target>.
 const SAVANT_BASE = "https://baseballsavant.mlb.com";
@@ -117,12 +123,6 @@ const HITTER_PROPS = ["Hits", "Total Bases", "Home Run", "H+R+RBI"];
 const PITCHER_PROPS = ["Strikeouts", "Outs"];
 const ALL_PROPS = [...HITTER_PROPS, ...PITCHER_PROPS];
 const DEFAULT_LINE = { "Hits": "0.5", "Total Bases": "1.5", "Home Run": "0.5", "H+R+RBI": "1.5", "Strikeouts": "5.5", "Outs": "16.5" };
-
-/// Supabase project — URL is safe to expose client-side; the Odds API key lives as a server-side secret.
-// Get SUPABASE_ANON_KEY from: Supabase Dashboard → Project Settings → API → "anon public"
-const SUPABASE_URL = "https://jkpctgapbsyzqjfiiuoe.supabase.co";
-const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImprcGN0Z2FwYnN5enFqZmlpdW9lIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODc4NzE5MDMsImV4cCI6MjEwMzQ0NzkwM30.9UT8ILqf6Xpk9LNangxZKfQZmv6Woa7WlbzRVyxdttg"; // safe to expose — grants only public access
-const ODDS_PROXY_URL = `${SUPABASE_URL}/functions/v1/odds-proxy`;
 const ODDS_SPORT = "baseball_mlb";
 const TYPE_TO_MARKET = {
   "Hits": "batter_hits", "Total Bases": "batter_total_bases", "Home Run": "batter_home_runs",
