@@ -774,6 +774,7 @@ function pickAlias(names, key) {
   for (const c of cands) { const i = names.findIndex((n) => String(n).toLowerCase() === c.toLowerCase()); if (i >= 0) return i; }
   return -1;
 }
+const GAMELOG_ROWS = 8; // cap for the "Last N Games" log table (5-10 games, per product ask)
 async function fetchAthleteGamelog(athleteId, n = 4) {
   try {
     const d = await jget(`${ESPN_WEB}/athletes/${athleteId}/gamelog`);
@@ -789,7 +790,37 @@ async function fetchAthleteGamelog(athleteId, n = 4) {
     const season = sum(all); season.g = all.length;
     const recentSlice = all.slice(-n);
     const recent = sum(recentSlice); recent.games = recentSlice.length;
-    return { season, recent };
+
+    // Per-game log rows (week/date/opponent) for the "Last N Games" table. ESPN's `events`
+    // is a dict keyed by numeric event-id strings; JS enumerates integer-like string keys in
+    // ascending order, which is the same order findStatArrays walked to build `rows` above —
+    // so we zip event metadata onto stat rows by position. If the counts don't line up (a
+    // response shape we haven't verified live), we degrade to an empty log instead of
+    // mis-pairing games to stats.
+    let games = [];
+    const eventsObj = (d.events && typeof d.events === "object" && !Array.isArray(d.events)) ? d.events : null;
+    if (eventsObj) {
+      const eventIds = Object.keys(eventsObj);
+      if (eventIds.length && eventIds.length === all.length) {
+        games = eventIds.map((eid, i) => {
+          const ev = eventsObj[eid] || {};
+          const opp = (ev.opponent && (ev.opponent.abbreviation || ev.opponent.displayName)) || null;
+          return {
+            eventId: eid,
+            week: ev.week != null ? ev.week : null,
+            date: ev.gameDate || ev.date || null,
+            atVs: ev.atVs || null,
+            opp,
+            score: ev.score || null,
+            result: ev.gameResult || null,
+            ...all[i],
+          };
+        });
+      }
+    }
+    games = games.slice(-GAMELOG_ROWS).reverse(); // most-recent-first, capped
+
+    return { season, recent, games };
   } catch { return null; }
 }
 
@@ -1182,6 +1213,7 @@ export default function NFLApp() {
   const [gameFilter, setGameFilter] = useState("all");
   const [sideFilter, setSideFilter] = useState("all");
   const [classFilter, setClassFilter] = useState("all"); // all | props | lines
+  const [showProjBar, setShowProjBar] = useState(true); // toggles the proj-vs-line buffer bar on Board rows
   const [analysisProfile, setAnalysisProfile] = useState(null); // { player, game, side }
   const [analysisQuery, setAnalysisQuery] = useState("");
   const [analysisResults, setAnalysisResults] = useState([]);
@@ -1290,7 +1322,7 @@ export default function NFLApp() {
     const teamSpread = marketSpread != null ? marketSpread : modelSpread;
     return {
       pos: p.pos === "PK" ? "K" : p.pos,
-      season: gl ? gl.season : null, recent: gl ? gl.recent : null,
+      season: gl ? gl.season : null, recent: gl ? gl.recent : null, games: gl ? gl.games : null,
       teamSpread, weather: d.weather, stadium: d.stadium,
       injuryStatus: p.injuryStatus, depthRank: p.depthRank,
       impliedTeamPts, teamDrivesPerGame: 10.8, redZoneTdRate: 0.58,
@@ -1599,7 +1631,7 @@ export default function NFLApp() {
             <div className="flex items-center gap-3 text-[10px] text-slate-500" style={mono}>
               <span>odds credits: <b className={credits != null && credits < 1000 ? "text-amber-400" : "text-slate-300"}>{credits != null ? credits.toLocaleString() : "—"}</b><span className="text-slate-600"> / mo</span></span>
               <span>board log {boardLogCount.toLocaleString()}</span>
-              {stamp && <span>loaded {stamp.toLocaleTimeString()} · Week {week}, {SEASON_TYPE_LABEL[seasonType]} {year}</span>}
+              {stamp && <span>loaded {stamp.toLocaleTimeString()}</span>}
             </div>
           </div>
         </header>
@@ -1648,10 +1680,13 @@ export default function NFLApp() {
                           </div>
                           <div className="mt-3 bg-slate-950/60 border border-slate-800 rounded-lg p-3">
                             <div className="text-[10px] text-slate-500 font-bold tracking-wide mb-2">MODEL GAME LINE</div>
-                            <div className="flex flex-wrap items-center gap-x-6 gap-y-1 text-[13px]" style={mono}>
-                              <span className="text-slate-300">proj score <b className="text-sky-300">{g.away} {d.lambdaA.toFixed(1)} – {d.lambdaH.toFixed(1)} {g.home}</b></span>
-                              <span>total <b className="text-sky-300">{(d.lambdaA + d.lambdaH).toFixed(1)}</b></span>
-                            </div>
+                            {(() => { const gp = gameProbs(d.lambdaH, d.lambdaA); return (
+                              <div className="flex flex-wrap items-center gap-x-6 gap-y-1 text-[13px]" style={mono}>
+                                <span className="text-slate-300">proj score <b className="text-sky-300">{g.away} {d.lambdaA.toFixed(1)} – {d.lambdaH.toFixed(1)} {g.home}</b></span>
+                                <span>{g.home} <b className="text-emerald-400">{pct(gp.home)}</b> <span className="text-slate-600">({probToAmerican(gp.home)})</span></span>
+                                <span>{g.away} <b className="text-emerald-400">{pct(gp.away)}</b> <span className="text-slate-600">({probToAmerican(gp.away)})</span></span>
+                                <span>total <b className="text-sky-300">{gp.totalLambda.toFixed(1)}</b></span>
+                              </div>); })()}
                             <div className="text-[10px] text-slate-600 mt-1.5">model line from team scoring env (standings PF/PA × home field) — compare to market for game-line edges once moneyline odds are wired in.</div>
                           </div>
                           <div className="grid md:grid-cols-2 gap-3 mt-3">
@@ -1690,6 +1725,7 @@ export default function NFLApp() {
               <NumIn label="min edge %" v={minEdge} onChange={setMinEdge} placeholder="e.g. 4" />
               <NumIn label="min model %" v={minModel} onChange={setMinModel} placeholder="e.g. 55" />
               {filtersActive && <button onClick={clearFilters} className="text-[11px] text-slate-400 hover:text-rose-300 border border-slate-700 rounded px-2.5 py-1.5">clear</button>}
+              <button onClick={() => setShowProjBar((s) => !s)} className={`text-xs rounded px-2.5 py-1.5 border ${showProjBar ? "border-sky-700 text-sky-300" : "border-slate-700 text-slate-500 hover:text-slate-300"}`} title="Toggle projection bar">proj bar {showProjBar ? "▪" : "▫"}</button>
               <div className="ml-auto text-[11px] text-slate-500" style={mono}>{Object.values(grouped).reduce((n, a) => n + a.length, 0)} plays</div>
             </div>
             {boardEntries.length === 0 ? (
@@ -1701,7 +1737,7 @@ export default function NFLApp() {
                 <div key={t} className="mb-5">
                   <div className="text-[11px] font-bold tracking-wide text-slate-400 mb-1.5 uppercase">{t} <span className="text-slate-600">· {grouped[t].length}</span></div>
                   <div className="space-y-2">
-                    {grouped[t].map((e) => <BoardRow key={e.id} e={e} tracked={myBets.some((b) => b.key === e.id)} onTrack={trackBet} />)}
+                    {grouped[t].map((e) => <BoardRow key={e.id} e={e} tracked={myBets.some((b) => b.key === e.id)} onTrack={trackBet} showProjBar={showProjBar} />)}
                   </div>
                 </div>
               ))
@@ -1826,6 +1862,9 @@ export default function NFLApp() {
   /* helper bound inside component so it can reach games/detail/setAnalysisProfile */
   function goToAnalysis(g, side, p) {
     setAnalysisProfile({ game: g, side, player: p, detail: detail[g.pk] });
+    setAnalysisQuery((p && p.name) || "");
+    setAnalysisResults([]);
+    setAnalysisErr("");
     setTab("analysis");
   }
 }
@@ -1905,12 +1944,24 @@ function InjBadge({ status }) {
   const c = status === "OUT" || status === "IR" || status === "SUSPENDED" ? "bg-rose-600" : status === "DOUBTFUL" ? "bg-orange-600" : "bg-amber-600";
   return <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold text-white ${c}`}>{status.replace(/_/g, " ")}</span>;
 }
-function PlayerRow({ idx, p, onClick }) {
+// Headline recent-form stat per position (last-4-games rate), a lightweight NFL analogue of
+// MLB's L15-vs-season HotBadge — pulled straight from the gamelog the Slate tab already fetches
+// for featured players, no new plumbing required.
+const L4_HEADLINE = { QB: ["passYds", "pYds"], RB: ["rushYds", "rYds"], WR: ["recYds", "rcYds"], TE: ["recYds", "rcYds"], K: ["kickPts", "pts"] };
+function L4Hint({ gl, pos }) {
+  const cfg = L4_HEADLINE[pos];
+  if (!cfg || !gl || !gl.recent || !gl.recent.games) return null;
+  const [key, label] = cfg;
+  const perGame = (gl.recent[key] || 0) / gl.recent.games;
+  return <span className="text-[9px] text-slate-500 shrink-0" style={mono} title={`last ${gl.recent.games} games`}>L{gl.recent.games} {label} {perGame.toFixed(1)}/g</span>;
+}
+function PlayerRow({ idx, p, onClick, gl }) {
   return (
     <div className="flex items-center gap-2 text-[12px] px-1 py-1 rounded hover:bg-slate-900/60">
       <span className="text-slate-600 w-4 shrink-0" style={mono}>{idx}</span>
       <span className="w-9 text-[10px] text-slate-500 shrink-0" style={mono}>{p.pos}{p.depthRank && p.depthRank < 90 ? p.depthRank : ""}</span>
       <button onClick={() => onClick(p)} className="flex-1 text-left truncate hover:text-sky-300 cursor-pointer" title="Open player analysis">{p.name}</button>
+      <L4Hint gl={gl} pos={p.pos} />
       <InjBadge status={p.injuryStatus} />
     </div>
   );
@@ -1923,7 +1974,7 @@ function LineupCol({ title, d, side, onPlayerClick }) {
     <div className="bg-slate-950/60 border border-slate-800 rounded-lg p-2.5">
       <div className="text-[10px] text-slate-500 font-bold tracking-wide mb-1.5">{title}</div>
       <div className="space-y-0.5">
-        {rows.map((p, i) => <PlayerRow key={p.id} idx={i + 1} p={p} onClick={onPlayerClick} />)}
+        {rows.map((p, i) => <PlayerRow key={p.id} idx={i + 1} p={p} onClick={onPlayerClick} gl={d.gamelogs && d.gamelogs[p.id]} />)}
       </div>
     </div>
   );
@@ -1955,7 +2006,7 @@ function MathPanel({ r }) {
     </div>
   );
 }
-function BoardRow({ e, tracked, onTrack }) {
+function BoardRow({ e, tracked, onTrack, showProjBar = true }) {
   const [show, setShow] = useState(false);
   const evGood = e.ev >= 0;
   const pm = !isLineType(e.type) ? projMeta(e.proj, e.line, e.side) : null;
@@ -1976,7 +2027,7 @@ function BoardRow({ e, tracked, onTrack }) {
         <button onClick={() => setShow((s) => !s)} className="text-[11px] text-slate-500 hover:text-emerald-300 border border-slate-700 rounded px-2 py-1">{show ? "hide" : "math"}</button>
         <button onClick={() => onTrack(e)} disabled={tracked} className={`text-[11px] font-bold rounded px-2 py-1 ${tracked ? "bg-slate-700 text-slate-400" : "bg-emerald-600 hover:bg-emerald-500 text-white"}`}>{tracked ? "tracked" : "track"}</button>
       </div>
-      {pm && (
+      {pm && showProjBar && (
         <div className="relative h-1 mx-4 mb-2.5 bg-slate-800 rounded-full overflow-hidden" title={`proj ${e.proj != null ? e.proj.toFixed(2) : "—"} vs line ${e.line}`}>
           <div className="absolute inset-y-0 left-0" style={{ width: `${pm.projPct}%`, backgroundColor: pm.barColor }} />
           <div className="absolute inset-y-0 w-px bg-white/70" style={{ left: `${pm.linePct}%` }} />
@@ -2025,6 +2076,11 @@ function PlayerAnalysisPanel({ profile, ctx, projections, boardEntries, onTrack,
   const p = profile.player;
   const pos = ctx.pos;
   const season = ctx.season, recent = ctx.recent;
+  // A gamelog object can be truthy but real-zero-games (e.g. Week 1, before the player has
+  // played) — that's a valid state, not a fetch failure, so guard on games-played, not just
+  // truthiness, or every stat quad renders a misleading "0" instead of "—".
+  const hasSeason = !!(season && season.g > 0);
+  const hasRecent = !!(recent && recent.games > 0);
   const teamName = profile.side === "home" ? profile.game.home : profile.game.away;
   const rate = (obj, key) => obj && obj.g ? ((obj[key] || 0) / obj.g).toFixed(1) : "—";
   return (
@@ -2053,37 +2109,37 @@ function PlayerAnalysisPanel({ profile, ctx, projections, boardEntries, onTrack,
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-4">
           {pos === "QB" ? (
             <>
-              <MiniMetric label="Pass Yds" value={season ? Math.round(season.passYds || 0) : "—"} />
-              <MiniMetric label="Pass TD" value={season ? (season.passTd || 0) : "—"} />
-              <MiniMetric label="INT" value={season ? (season.ints || 0) : "—"} />
+              <MiniMetric label="Pass Yds" value={hasSeason ? Math.round(season.passYds || 0) : "—"} />
+              <MiniMetric label="Pass TD" value={hasSeason ? (season.passTd || 0) : "—"} />
+              <MiniMetric label="INT" value={hasSeason ? (season.ints || 0) : "—"} />
               <MiniMetric label="Yds/G" value={rate(season, "passYds")} />
             </>
           ) : pos === "RB" ? (
             <>
-              <MiniMetric label="Rush Yds" value={season ? Math.round(season.rushYds || 0) : "—"} />
-              <MiniMetric label="Rush TD" value={season ? (season.rushTd || 0) : "—"} />
-              <MiniMetric label="Rec" value={season ? (season.rec || 0) : "—"} />
-              <MiniMetric label="YPC" value={season && season.rushAtt ? (season.rushYds / season.rushAtt).toFixed(1) : "—"} />
+              <MiniMetric label="Rush Yds" value={hasSeason ? Math.round(season.rushYds || 0) : "—"} />
+              <MiniMetric label="Rush TD" value={hasSeason ? (season.rushTd || 0) : "—"} />
+              <MiniMetric label="Rec" value={hasSeason ? (season.rec || 0) : "—"} />
+              <MiniMetric label="YPC" value={hasSeason && season.rushAtt ? (season.rushYds / season.rushAtt).toFixed(1) : "—"} />
             </>
           ) : pos === "WR" || pos === "TE" ? (
             <>
-              <MiniMetric label="Rec" value={season ? (season.rec || 0) : "—"} />
-              <MiniMetric label="Rec Yds" value={season ? Math.round(season.recYds || 0) : "—"} />
-              <MiniMetric label="Rec TD" value={season ? (season.recTd || 0) : "—"} />
-              <MiniMetric label="Yds/Rec" value={season && season.rec ? (season.recYds / season.rec).toFixed(1) : "—"} />
+              <MiniMetric label="Rec" value={hasSeason ? (season.rec || 0) : "—"} />
+              <MiniMetric label="Rec Yds" value={hasSeason ? Math.round(season.recYds || 0) : "—"} />
+              <MiniMetric label="Rec TD" value={hasSeason ? (season.recTd || 0) : "—"} />
+              <MiniMetric label="Yds/Rec" value={hasSeason && season.rec ? (season.recYds / season.rec).toFixed(1) : "—"} />
             </>
           ) : pos === "K" ? (
             <>
-              <MiniMetric label="FG Made" value={season ? (season.fgMade || 0) : "—"} />
-              <MiniMetric label="Kick Pts" value={season ? (season.kickPts || 0) : "—"} />
+              <MiniMetric label="FG Made" value={hasSeason ? (season.fgMade || 0) : "—"} />
+              <MiniMetric label="Kick Pts" value={hasSeason ? (season.kickPts || 0) : "—"} />
               <MiniMetric label="Pts/G" value={rate(season, "kickPts")} />
-              <MiniMetric label="Games" value={season ? season.g : "—"} />
+              <MiniMetric label="Games" value={hasSeason ? season.g : "—"} />
             </>
           ) : (
             <>
-              <MiniMetric label="Sacks" value={season ? (season.sacks || 0) : "—"} />
-              <MiniMetric label="INT" value={season ? (season.defInt || 0) : "—"} />
-              <MiniMetric label="Games" value={season ? season.g : "—"} />
+              <MiniMetric label="Sacks" value={hasSeason ? (season.sacks || 0) : "—"} />
+              <MiniMetric label="INT" value={hasSeason ? (season.defInt || 0) : "—"} />
+              <MiniMetric label="Games" value={hasSeason ? season.g : "—"} />
               <MiniMetric label="Depth" value={p.depthRank && p.depthRank < 90 ? `#${p.depthRank}` : "—"} />
             </>
           )}
@@ -2103,16 +2159,18 @@ function PlayerAnalysisPanel({ profile, ctx, projections, boardEntries, onTrack,
         <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-3">
           <div className="text-[10px] text-slate-500 font-bold tracking-wide mb-1.5">SEASON (THIS YEAR)</div>
           <div className="text-[11px] text-slate-300 space-y-0.5" style={mono}>
-            {season ? Object.entries(season).filter(([k]) => k !== "g").map(([k, v]) => <div key={k}>{k}: {typeof v === "number" ? v.toFixed(1) : v}</div>) : <div className="text-slate-600">no season log yet</div>}
+            {hasSeason ? Object.entries(season).filter(([k]) => k !== "g").map(([k, v]) => <div key={k}>{k}: {typeof v === "number" ? v.toFixed(1) : v}</div>) : <div className="text-slate-600">no season log yet</div>}
           </div>
         </div>
         <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-3">
           <div className="text-[10px] text-slate-500 font-bold tracking-wide mb-1.5">LAST 4 GAMES</div>
           <div className="text-[11px] text-slate-300 space-y-0.5" style={mono}>
-            {recent ? Object.entries(recent).filter(([k]) => k !== "games").map(([k, v]) => <div key={k}>{k}: {typeof v === "number" ? v.toFixed(1) : v}</div>) : <div className="text-slate-600">no recent log yet</div>}
+            {hasRecent ? Object.entries(recent).filter(([k]) => k !== "games").map(([k, v]) => <div key={k}>{k}: {typeof v === "number" ? v.toFixed(1) : v}</div>) : <div className="text-slate-600">no recent log yet</div>}
           </div>
         </div>
       </div>
+
+      <GameLogCard pos={pos} games={ctx.games} />
 
       <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-3">
         <div className="text-xs font-bold text-slate-300">Model Projections</div>
@@ -2126,6 +2184,41 @@ function PlayerAnalysisPanel({ profile, ctx, projections, boardEntries, onTrack,
           <div className="space-y-2">{boardEntries.map((e) => <BoardRow key={e.id} e={e} tracked={myBets.some((b) => b.key === e.id)} onTrack={onTrack} />)}</div>
         </div>
       ) : null}
+    </div>
+  );
+}
+// Per-game log table, mirroring MLB's GameLogCard — most-recent-first, capped at GAMELOG_ROWS.
+// Columns are position-specific; any missing field renders "—" rather than crashing, since the
+// underlying gamelog fetch (fetchAthleteGamelog) degrades to games: [] when ESPN's per-event
+// metadata can't be reliably paired with its stat row.
+function GameLogCard({ pos, games }) {
+  const rows = (games || []).slice(0, GAMELOG_ROWS);
+  const cols = pos === "QB" ? [["passCmp", "CMP"], ["passAtt", "ATT"], ["passYds", "YDS"], ["passTd", "TD"], ["ints", "INT"]]
+    : pos === "RB" ? [["rushAtt", "CAR"], ["rushYds", "YDS"], ["rushTd", "TD"], ["rec", "REC"]]
+    : (pos === "WR" || pos === "TE") ? [["targets", "TGT"], ["rec", "REC"], ["recYds", "YDS"], ["recTd", "TD"]]
+    : pos === "K" ? [["fgMade", "FG"], ["kickPts", "PTS"]]
+    : [["sacks", "SACK"], ["defInt", "INT"]];
+  return (
+    <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-3">
+      <div className="text-[10px] text-slate-500 font-bold tracking-wide mb-2">LAST {GAMELOG_ROWS} GAMES</div>
+      {!rows.length ? <div className="text-sm text-slate-500">No game log returned.</div> : (
+        <div className="overflow-x-auto">
+          <table className="w-full text-[11px]" style={mono}>
+            <thead className="text-slate-600">
+              <tr>{["wk", "opp", ...cols.map(([, h]) => h)].map((h) => <th key={h} className="text-right font-semibold py-1 first:text-left">{h}</th>)}</tr>
+            </thead>
+            <tbody>
+              {rows.map((g, i) => (
+                <tr key={g.eventId || i} className="border-t border-slate-800/80">
+                  <td className="py-1 text-left text-slate-400">{g.week != null ? g.week : "—"}</td>
+                  <td className="text-right text-slate-400">{g.atVs || ""} {g.opp || "—"}</td>
+                  {cols.map(([k]) => <td key={k} className="text-right text-slate-200">{g[k] != null ? g[k] : "—"}</td>)}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
     </div>
   );
 }
