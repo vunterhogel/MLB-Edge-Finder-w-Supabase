@@ -1572,90 +1572,140 @@ export default function NFLApp() {
   ];
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 text-[13px]">
-      <div className="sticky top-0 z-20 bg-slate-950/95 backdrop-blur border-b border-slate-800 px-3 py-2">
-        <div className="flex flex-wrap items-center gap-2">
-          <div className="font-bold text-sm text-emerald-400 mr-2">🏈 NFL Edge Finder</div>
-          <Sel label="" v={seasonType} opts={[1, 2, 3]} labels={SEASON_TYPE_LABEL} onChange={(v) => setSeasonType(+v)} compact />
-          <NumIn label="Week" v={week} onChange={(v) => setWeek(clamp(+v || 1, 1, 22))} placeholder="wk" />
-          <NumIn label="Year" v={year} onChange={(v) => setYear(+v || year)} placeholder="yr" />
-          <button onClick={loadSchedule} className="px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-xs">{loading ? "Loading…" : "Refresh"}</button>
-          <Sel label="Book" v={book} opts={BOOKS.map((b) => b.key)} labels={BOOK_LABELS} onChange={setBook} compact />
-          <div className="text-[11px] text-slate-500 ml-auto">{credits != null ? `${credits} odds credits left` : ""} · board log {boardLogCount.toLocaleString()}</div>
-        </div>
-        <div className="flex gap-1 mt-2">
-          {TABS.map((t) => (
-            <button key={t.k} onClick={() => setTab(t.k)} className={`px-3 py-1.5 rounded text-xs font-semibold ${tab === t.k ? "bg-emerald-600 text-white" : "bg-slate-800 text-slate-300 hover:bg-slate-700"}`}>{t.t}</button>
-          ))}
-        </div>
-        {err ? <div className="mt-2 text-[11px] text-amber-400">{err}</div> : null}
-      </div>
+    <div className="min-h-screen bg-slate-950 text-slate-100" style={{ fontFamily: "ui-sans-serif, system-ui, sans-serif" }}>
+      <div className="max-w-5xl mx-auto px-4 pb-28">
+        <header className="pt-6 pb-3 sticky top-0 bg-slate-950 z-20 border-b border-slate-800">
+          <div className="flex items-end justify-between flex-wrap gap-3">
+            <div>
+              <h1 className="text-2xl font-black tracking-tight">🏈 NFL <span className="text-emerald-400">EDGE</span> FINDER</h1>
+              <p className="text-[11px] text-slate-500 mt-0.5" style={mono}>live odds · de-vigged edge · Monte-Carlo props</p>
+            </div>
+            <div className="flex items-center gap-2 flex-wrap">
+              <Sel label="" v={seasonType} opts={[1, 2, 3]} labels={SEASON_TYPE_LABEL} onChange={(v) => setSeasonType(+v)} />
+              <NumIn label="Wk" v={week} onChange={setWeek} placeholder="wk" min={1} max={22} />
+              <NumIn label="Yr" v={year} onChange={setYear} placeholder="yr" min={2015} max={2035} />
+              <select value={book} onChange={(e) => setBook(e.target.value)} className="bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-sm">
+                {BOOKS.map((b) => <option key={b.key} value={b.key}>{b.label}</option>)}
+              </select>
+              <button onClick={loadSchedule} className="bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-sm rounded-lg px-3 py-1.5">{loading ? "…" : "Refresh"}</button>
+            </div>
+          </div>
+          <div className="flex items-center justify-between mt-3 flex-wrap gap-2">
+            <div className="flex gap-1 flex-wrap">
+              {TABS.map((t) => (
+                <button key={t.k} onClick={() => setTab(t.k)} className={`px-3.5 py-1.5 rounded-lg text-sm font-semibold ${tab === t.k ? "bg-slate-800 text-emerald-400" : "text-slate-400 hover:text-slate-200"}`}>{t.t}</button>
+              ))}
+            </div>
+            <div className="flex items-center gap-3 text-[10px] text-slate-500" style={mono}>
+              <span>odds credits: <b className={credits != null && credits < 1000 ? "text-amber-400" : "text-slate-300"}>{credits != null ? credits.toLocaleString() : "—"}</b><span className="text-slate-600"> / mo</span></span>
+              <span>board log {boardLogCount.toLocaleString()}</span>
+              {stamp && <span>loaded {stamp.toLocaleTimeString()} · Week {week}, {SEASON_TYPE_LABEL[seasonType]} {year}</span>}
+            </div>
+          </div>
+        </header>
 
-      <div className="p-3">
+        {err && <div className="mt-3 text-sm text-amber-300 bg-amber-950/40 border border-amber-800/50 rounded-lg px-3 py-2">{err}</div>}
+
         {/* ---------------- SLATE ---------------- */}
         {tab === "slate" && (
-          <div className="space-y-2">
-            {stamp ? <div className="text-[11px] text-slate-500">Loaded {stamp.toLocaleTimeString()} · Week {week}, {SEASON_TYPE_LABEL[seasonType]} {year}</div> : null}
-            {games.map((g) => (
-              <div key={g.pk} className="border border-slate-800 rounded-lg overflow-hidden">
-                <button onClick={() => expand(g)} className="w-full flex items-center gap-3 px-3 py-2 bg-slate-900 hover:bg-slate-800 text-left">
-                  <Chip s={g.status} />
-                  <div className="flex-1 font-semibold">{g.away} @ {g.home}</div>
-                  <ScoreLine g={g} />
-                  <div className="text-[11px] text-slate-500">{g.time}</div>
-                  <div className="text-[11px] text-slate-500">{g.venue}</div>
-                </button>
-                {open === g.pk && (
-                  <div className="p-3 bg-slate-900/40 border-t border-slate-800">
-                    {!detail[g.pk] || detail[g.pk].loading ? <div className="text-slate-500 text-xs">Loading rosters, depth chart, weather…</div> : (
-                      <div className="grid md:grid-cols-2 gap-3">
-                        <LineupCol title={`${g.away} (away)`} d={detail[g.pk]} side="away" onPlayerClick={(p) => goToAnalysis(g, "away", p)} />
-                        <LineupCol title={`${g.home} (home)`} d={detail[g.pk]} side="home" onPlayerClick={(p) => goToAnalysis(g, "home", p)} />
+          <div className="mt-3 space-y-2">
+            {games.map((g) => {
+              const d = detail[g.pk]; const isOpen = open === g.pk; const hasOdds = (board[g.pk] || []).length;
+              return (
+                <div key={g.pk} className="bg-slate-900/70 border border-slate-800 rounded-xl overflow-hidden">
+                  <div className="w-full flex items-center gap-3 px-4 py-3">
+                    <button onClick={() => expand(g)} className="flex-1 flex items-center gap-3 text-left min-w-0">
+                      <div className="text-[11px] text-slate-500 w-16 shrink-0" style={mono}>{g.time}</div>
+                      <div className="flex-1 min-w-0">
+                        <div className="font-bold truncate">{g.away} <span className="text-slate-600">@</span> {g.home}</div>
+                        {(g.status === "LIVE" || g.status === "FINAL") && g.homeScore != null
+                          ? <ScoreLine g={g} />
+                          : <div className="text-[11px] text-slate-500 truncate">{g.venue || "TBD"}</div>}
                       </div>
-                    )}
-                    {detail[g.pk] && detail[g.pk].ready && (
-                      <div className="mt-2 text-[11px] text-slate-500">
-                        Model line: {g.away} {detail[g.pk].lambdaA.toFixed(1)} – {detail[g.pk].lambdaH.toFixed(1)} {g.home}
-                        {detail[g.pk].weather ? ` · ${detail[g.pk].weather.temp}°F, wind ${detail[g.pk].weather.wind}mph, precip ${detail[g.pk].weather.pop}%` : detail[g.pk].stadium.dome ? " · dome/closed roof" : ""}
-                      </div>
-                    )}
-                    <div className="mt-2 flex items-center gap-2">
-                      <button onClick={() => getOdds(g)} disabled={oddsLoading === g.pk} className="px-2 py-1 rounded bg-emerald-700 hover:bg-emerald-600 text-xs font-semibold disabled:opacity-50">
-                        {oddsLoading === g.pk ? "Fetching odds…" : `Fetch odds & build board (${book})`}
+                      <Chip s={g.status} />
+                    </button>
+                    {hasOdds ? <span className="shrink-0 text-[10px] font-bold text-emerald-300 bg-emerald-900/40 border border-emerald-800 rounded-full px-1.5 py-0.5" style={mono}>● {hasOdds}</span> : null}
+                    {g.status !== "FINAL" && (
+                      <button onClick={() => getOdds(g)} disabled={oddsLoading === g.pk}
+                        className={`text-[11px] font-bold rounded px-2 py-1 shrink-0 ${hasOdds ? "bg-slate-700 text-slate-200" : "bg-sky-600 hover:bg-sky-500 text-white"}`}>
+                        {oddsLoading === g.pk ? "…" : hasOdds ? "↻ odds" : "get odds"}
                       </button>
-                      {board[g.pk] ? <span className="text-[11px] text-slate-500">{board[g.pk].length} priced entries → see Board tab</span> : null}
-                    </div>
+                    )}
+                    <button onClick={() => expand(g)} className={`text-slate-600 transition ${isOpen ? "rotate-90" : ""}`}>▸</button>
                   </div>
-                )}
-              </div>
-            ))}
-            {!games.length && !loading ? <div className="text-slate-500 text-sm p-4">No games loaded. Try a different week/season, or check the season-type toggle (preseason vs regular season).</div> : null}
+
+                  {isOpen && (
+                    <div className="px-4 pb-4 border-t border-slate-800">
+                      {(!d || d.loading) && <div className="py-6 text-center text-sm text-slate-500" style={mono}>loading rosters, depth chart, weather…</div>}
+                      {d && d.ready && (
+                        <>
+                          <div className="flex flex-wrap gap-2 mt-3 text-[11px]" style={mono}>
+                            <Env label="VENUE" v={g.venue || "—"} />
+                            {d.stadium && d.stadium.dome ? <Env label="ROOF" v="dome/closed" /> : null}
+                            {d.weather ? <Env label="TEMP" v={`${d.weather.temp}°`} hot={d.weather.temp >= 90} cold={d.weather.temp <= 32} /> : null}
+                            {d.weather ? <Env label="WIND" v={`${d.weather.wind}mph`} hot={d.weather.wind >= 15} /> : null}
+                            {d.weather ? <Env label="RAIN" v={`${d.weather.pop}%`} hot={d.weather.pop >= 50} /> : null}
+                          </div>
+                          <div className="mt-3 bg-slate-950/60 border border-slate-800 rounded-lg p-3">
+                            <div className="text-[10px] text-slate-500 font-bold tracking-wide mb-2">MODEL GAME LINE</div>
+                            <div className="flex flex-wrap items-center gap-x-6 gap-y-1 text-[13px]" style={mono}>
+                              <span className="text-slate-300">proj score <b className="text-sky-300">{g.away} {d.lambdaA.toFixed(1)} – {d.lambdaH.toFixed(1)} {g.home}</b></span>
+                              <span>total <b className="text-sky-300">{(d.lambdaA + d.lambdaH).toFixed(1)}</b></span>
+                            </div>
+                            <div className="text-[10px] text-slate-600 mt-1.5">model line from team scoring env (standings PF/PA × home field) — compare to market for game-line edges once moneyline odds are wired in.</div>
+                          </div>
+                          <div className="grid md:grid-cols-2 gap-3 mt-3">
+                            <LineupCol title={`${g.away} (away)`} d={d} side="away" onPlayerClick={(p) => goToAnalysis(g, "away", p)} />
+                            <LineupCol title={`${g.home} (home)`} d={d} side="home" onPlayerClick={(p) => goToAnalysis(g, "home", p)} />
+                          </div>
+                          <div className="mt-3 flex items-center gap-2 flex-wrap">
+                            <button onClick={() => getOdds(g)} disabled={oddsLoading === g.pk} className="px-3 py-1.5 rounded-lg bg-emerald-700 hover:bg-emerald-600 text-xs font-bold disabled:opacity-50">
+                              {oddsLoading === g.pk ? "Fetching odds…" : `Fetch odds & build board (${BOOK_LABELS[book] || book})`}
+                            </button>
+                            {hasOdds
+                              ? <span className="text-[11px] text-emerald-400/80">{hasOdds} priced props on the Board.</span>
+                              : (g.status !== "FINAL" && <span className="text-[11px] text-slate-500">Tap to pull {BOOK_LABELS[book] || book} props for this game into the Board.</span>)}
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+            {!games.length && !loading ? <div className="text-slate-500 text-sm py-10 text-center">No games loaded. Try a different week/season, or check the season-type toggle (preseason vs regular season).</div> : null}
           </div>
         )}
 
         {/* ---------------- BOARD ---------------- */}
         {tab === "board" && (
-          <div>
-            <div className="flex flex-wrap gap-2 mb-3 items-end">
-              <Sel label="Class" v={classFilter} opts={["all", "props", "lines"]} onChange={setClassFilter} compact />
-              <Sel label="Category" v={catFilter} opts={["all", ...STAT_ORDER]} onChange={setCatFilter} compact />
-              <Sel label="Game" v={gameFilter} opts={["all", ...boardGames.map((g) => g.pk)]} labels={Object.fromEntries(boardGames.map((g) => [g.pk, g.label]))} onChange={setGameFilter} compact />
-              <Sel label="Side" v={sideFilter} opts={["all", "over", "under", "home", "away"]} onChange={setSideFilter} compact />
-              <Sel label="Sort" v={boardSort} opts={["ev_desc", "ev_asc", "edge_desc", "edge_asc", "proj_desc", "proj_asc"]} onChange={setBoardSort} compact />
-              <NumIn label="Min edge %" v={minEdge} onChange={setMinEdge} placeholder="e.g. 4" />
-              <NumIn label="Min model %" v={minModel} onChange={setMinModel} placeholder="e.g. 55" />
-              <input value={boardSearch} onChange={(e) => setBoardSearch(e.target.value)} placeholder="search player/team" className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs" />
-              {filtersActive ? <button onClick={clearFilters} className="px-2 py-1 rounded bg-slate-800 text-xs">Clear filters</button> : null}
+          <div className="mt-3">
+            <div className="flex items-center gap-2 flex-wrap mb-3">
+              <input value={boardSearch} onChange={(e) => setBoardSearch(e.target.value)} placeholder="search player or team" className="bg-slate-950 border border-slate-700 rounded px-2.5 py-1.5 text-sm w-44 text-slate-100" />
+              <Sel compact label="sort" v={boardSort} opts={["ev_desc", "ev_asc", "edge_desc", "edge_asc", "proj_desc", "proj_asc"]} labels={{ ev_desc: "EV ↓", ev_asc: "EV ↑", edge_desc: "Edge ↓", edge_asc: "Edge ↑", proj_desc: "Projection ↓", proj_asc: "Projection ↑" }} onChange={setBoardSort} />
+              <Sel compact label="market" v={classFilter} opts={["all", "props", "lines"]} labels={{ all: "All markets", props: "Player props", lines: "Game lines" }} onChange={setClassFilter} />
+              <Sel compact label="category" v={catFilter} opts={["all", ...STAT_ORDER]} labels={{ all: "All categories" }} onChange={setCatFilter} />
+              <Sel compact label="game" v={gameFilter} opts={["all", ...boardGames.map((g) => g.pk)]} labels={{ all: "All games", ...Object.fromEntries(boardGames.map((g) => [g.pk, g.label])) }} onChange={setGameFilter} />
+              <Sel compact label="side" v={sideFilter} opts={["all", "over", "under", "home", "away"]} labels={{ all: "Both" }} onChange={setSideFilter} />
+              <NumIn label="min edge %" v={minEdge} onChange={setMinEdge} placeholder="e.g. 4" />
+              <NumIn label="min model %" v={minModel} onChange={setMinModel} placeholder="e.g. 55" />
+              {filtersActive && <button onClick={clearFilters} className="text-[11px] text-slate-400 hover:text-rose-300 border border-slate-700 rounded px-2.5 py-1.5">clear</button>}
+              <div className="ml-auto text-[11px] text-slate-500" style={mono}>{Object.values(grouped).reduce((n, a) => n + a.length, 0)} plays</div>
             </div>
-            {Object.keys(grouped).length === 0 ? <div className="text-slate-500 text-sm">No board entries yet — expand a game on the Slate tab and click "Fetch odds & build board".</div> : null}
-            {Object.entries(grouped).map(([type, arr]) => (
-              <div key={type} className="mb-4">
-                <div className="text-xs font-bold text-emerald-400 mb-1">{type} ({arr.length})</div>
-                <div className="space-y-1">
-                  {arr.map((e) => <BoardRow key={e.id} e={e} tracked={myBets.some((b) => b.key === e.id)} onTrack={trackBet} />)}
+            {boardEntries.length === 0 ? (
+              <div className="text-sm text-slate-500 py-10 text-center">No odds pulled yet. On the Slate tab, expand a game and tap <span className="text-sky-400">get odds</span> to load {BOOK_LABELS[book] || book} props here, ranked by EV/edge.</div>
+            ) : Object.keys(grouped).length === 0 ? (
+              <div className="text-sm text-slate-500 py-10 text-center">No props pass the current filter.</div>
+            ) : (
+              STAT_ORDER.filter((t) => grouped[t]).map((t) => (
+                <div key={t} className="mb-5">
+                  <div className="text-[11px] font-bold tracking-wide text-slate-400 mb-1.5 uppercase">{t} <span className="text-slate-600">· {grouped[t].length}</span></div>
+                  <div className="space-y-2">
+                    {grouped[t].map((e) => <BoardRow key={e.id} e={e} tracked={myBets.some((b) => b.key === e.id)} onTrack={trackBet} />)}
+                  </div>
                 </div>
-              </div>
-            ))}
+              ))
+            )}
           </div>
         )}
 
@@ -1727,45 +1777,45 @@ export default function NFLApp() {
 
         {/* ---------------- MY BETS ---------------- */}
         {tab === "bets" && (
-          <div>
+          <div className="mt-3">
             <div className="flex flex-wrap gap-2 mb-3 items-end">
-              <Sel label="Status" v={betStatusFilter} opts={["all", "open", "won", "lost", "push", "void", "settled"]} onChange={setBetStatusFilter} compact />
-              <Sel label="Sort" v={betSort} opts={["recent", "model_desc", "ev_desc", "edge_desc"]} onChange={setBetSort} compact />
-              <input value={betSearch} onChange={(e) => setBetSearch(e.target.value)} placeholder="search" className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs" />
-              <Sel label="Stake mode (new bets)" v={stakeMode} opts={["flat", "kelly"]} onChange={setStakeMode} compact />
-              <button onClick={settleBets} className="px-2 py-1 rounded bg-emerald-700 text-xs font-semibold">Settle open bets</button>
-              <button onClick={exportCSV} className="px-2 py-1 rounded bg-slate-800 text-xs">Export CSV</button>
-              <button onClick={resetStats} className="px-2 py-1 rounded bg-rose-900 text-xs">Clear all</button>
+              <Sel label="status" v={betStatusFilter} opts={["all", "open", "won", "lost", "push", "void", "settled"]} onChange={setBetStatusFilter} compact />
+              <Sel label="sort" v={betSort} opts={["recent", "model_desc", "ev_desc", "edge_desc"]} labels={{ recent: "Recent", model_desc: "Model %", ev_desc: "EV", edge_desc: "Edge" }} onChange={setBetSort} compact />
+              <input value={betSearch} onChange={(e) => setBetSearch(e.target.value)} placeholder="search" className="bg-slate-950 border border-slate-700 rounded px-2.5 py-1.5 text-sm text-slate-100" />
+              <Sel label="stake mode (new bets)" v={stakeMode} opts={["flat", "kelly"]} onChange={setStakeMode} compact />
+              <button onClick={settleBets} className="bg-emerald-700 hover:bg-emerald-600 text-white font-bold text-xs rounded-lg px-3 py-1.5">Settle open bets</button>
+              <button onClick={exportCSV} className="border border-slate-700 text-slate-300 hover:text-slate-100 text-xs rounded-lg px-3 py-1.5">Export CSV</button>
+              <button onClick={resetStats} className="border border-rose-900 text-rose-400 hover:text-rose-300 text-xs rounded-lg px-3 py-1.5">Clear all</button>
               {settleMsg ? <span className="text-[11px] text-slate-500">{settleMsg}</span> : null}
             </div>
-            <div className="space-y-1">
+            <div className="space-y-2">
               {myBetsView.map((b) => <MyBetRow key={b.key} b={b} onOdds={updateBetOdds} onUnits={updateBetUnits} onRemove={removeBet} />)}
-              {!myBetsView.length ? <div className="text-slate-500 text-sm p-4">No tracked bets yet — click "Track" on a Board row.</div> : null}
+              {!myBetsView.length ? <div className="text-slate-500 text-sm py-10 text-center">No tracked bets yet — click "track" on a Board row.</div> : null}
             </div>
           </div>
         )}
 
         {/* ---------------- STATS ---------------- */}
         {tab === "stats" && (
-          <div>
+          <div className="mt-3">
             <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-4">
               <StatCard label="Record" v={`${stats.overall.w}-${stats.overall.l}-${stats.overall.ps}`} />
               <StatCard label="Win %" v={pct(stats.overall.winPct)} good={stats.overall.winPct > 0.5} />
               <StatCard label="Net units" v={stats.overall.net.toFixed(2)} good={stats.overall.net > 0} />
               <StatCard label="ROI" v={pct(stats.overall.roi)} good={stats.overall.roi > 0} />
             </div>
-            <div className="text-xs font-bold text-emerald-400 mb-1">By category</div>
-            <div className="space-y-1">
+            <div className="text-xs font-bold text-slate-300 mb-2">By category</div>
+            <div className="space-y-2">
               {Object.entries(stats.byType).map(([t, s]) => (
-                <div key={t} className="flex items-center gap-3 px-2 py-1 border border-slate-800 rounded text-xs">
+                <div key={t} className="flex items-center gap-3 bg-slate-900/70 border border-slate-800 rounded-xl px-4 py-2.5 text-xs flex-wrap">
                   <div className="w-32 font-semibold">{t}</div>
-                  <div className="text-slate-400">{s.w}-{s.l}-{s.ps}</div>
-                  <div className={s.winPct > 0.5 ? "text-emerald-400" : "text-rose-400"}>{pct(s.winPct)}</div>
+                  <div className="text-slate-400" style={mono}>{s.w}-{s.l}-{s.ps}</div>
+                  <div className={s.winPct > 0.5 ? "text-emerald-400 font-bold" : "text-rose-400 font-bold"}>{pct(s.winPct)}</div>
                   <div className={s.roi > 0 ? "text-emerald-400" : "text-rose-400"}>ROI {pct(s.roi)}</div>
                   <div className="text-slate-500">net {s.net.toFixed(2)}u</div>
                 </div>
               ))}
-              {!Object.keys(stats.byType).length ? <div className="text-slate-500 text-sm">Settle some bets to see category breakdowns — this is what drives CALIB_KEEP retuning per doc §5.</div> : null}
+              {!Object.keys(stats.byType).length ? <div className="text-slate-500 text-sm py-10 text-center">Settle some bets to see category breakdowns — this is what drives CALIB_KEEP retuning per doc §5.</div> : null}
             </div>
           </div>
         )}
@@ -1783,19 +1833,51 @@ export default function NFLApp() {
 /* ---------------------- subcomponents ---------------------- */
 function Sel({ label, v, opts, labels, onChange, compact }) {
   return (
-    <label className={`flex items-center gap-1 text-[11px] text-slate-400 ${compact ? "" : ""}`}>
+    <label className="flex items-center gap-1 text-[11px] text-slate-400">
       {label ? <span>{label}</span> : null}
-      <select value={v} onChange={(e) => onChange(e.target.value)} className="bg-slate-900 border border-slate-700 rounded px-1.5 py-1 text-xs text-slate-100">
+      <select value={v} onChange={(e) => onChange(e.target.value)} className={`bg-slate-950 border border-slate-700 rounded px-2 ${compact ? "py-1" : "py-1.5"} text-xs text-slate-100`}>
         {opts.map((o) => <option key={o} value={o}>{(labels && labels[o]) || o}</option>)}
       </select>
     </label>
   );
 }
-function NumIn({ label, v, onChange, placeholder }) {
+// Week/Year use a local text buffer so the field can be freely cleared and retyped —
+// only committing (and clamping to [min,max]) on blur/Enter, instead of snapping to `min`
+// on every keystroke (the old behavior: clearing "4" fired onChange("") -> +"" || 1 -> 1
+// immediately, so you could never type e.g. "14"). Fields with no min/max (the Board tab's
+// "min edge %"/"min model %" filters, which meaningfully use "" as "no filter") keep the
+// old plain pass-through behavior untouched.
+function NumIn({ label, v, onChange, placeholder, min, max }) {
+  const clamped = min != null || max != null;
+  const [buf, setBuf] = useState(String(v));
+  useEffect(() => { if (clamped) setBuf(String(v)); }, [v, clamped]);
+  if (!clamped) {
+    return (
+      <label className="flex items-center gap-1 text-[11px] text-slate-400">
+        {label ? <span>{label}</span> : null}
+        <input value={v} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} inputMode="decimal" className="w-16 bg-slate-950 border border-slate-700 rounded px-1.5 py-1 text-xs text-slate-100" />
+      </label>
+    );
+  }
+  const commit = () => {
+    const n = +buf;
+    if (buf.trim() === "" || !Number.isFinite(n)) { setBuf(String(v)); return; }
+    const c = Math.min(max ?? n, Math.max(min ?? n, Math.round(n)));
+    setBuf(String(c));
+    if (c !== v) onChange(c);
+  };
   return (
     <label className="flex items-center gap-1 text-[11px] text-slate-400">
       {label ? <span>{label}</span> : null}
-      <input value={v} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} className="w-16 bg-slate-900 border border-slate-700 rounded px-1.5 py-1 text-xs text-slate-100" />
+      <input
+        value={buf}
+        onChange={(e) => setBuf(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => { if (e.key === "Enter") { commit(); e.currentTarget.blur(); } }}
+        placeholder={placeholder}
+        inputMode="numeric"
+        className="w-14 bg-slate-950 border border-slate-700 rounded px-1.5 py-1 text-xs text-slate-100"
+      />
     </label>
   );
 }
@@ -1807,130 +1889,241 @@ function StatCard({ label, v, good }) {
     </div>
   );
 }
+function MiniMetric({ label, value, good }) {
+  return (
+    <div className="bg-slate-950/60 border border-slate-800 rounded-lg px-3 py-2">
+      <div className="text-[9px] text-slate-500 font-bold tracking-wide">{label}</div>
+      <div className={`text-lg font-black ${good === true ? "text-emerald-400" : good === false ? "text-rose-400" : "text-slate-100"}`}>{value}</div>
+    </div>
+  );
+}
+function Env({ label, v, hot, cold }) {
+  return <span className={`px-2 py-1 rounded border ${hot ? "border-rose-700 bg-rose-950/40 text-rose-300" : cold ? "border-sky-800 bg-sky-950/40 text-sky-300" : "border-slate-700 bg-slate-900 text-slate-300"}`}><span className="text-slate-500">{label} </span>{v}</span>;
+}
 function InjBadge({ status }) {
   if (!status) return null;
   const c = status === "OUT" || status === "IR" || status === "SUSPENDED" ? "bg-rose-600" : status === "DOUBTFUL" ? "bg-orange-600" : "bg-amber-600";
   return <span className={`px-1.5 py-0.5 rounded text-[9px] font-bold text-white ${c}`}>{status.replace(/_/g, " ")}</span>;
 }
-function PlayerRow({ p, onClick }) {
+function PlayerRow({ idx, p, onClick }) {
   return (
-    <button onClick={() => onClick(p)} className="w-full flex items-center gap-2 px-2 py-1 rounded hover:bg-slate-800 text-left">
-      <span className="w-8 text-[10px] text-slate-500">{p.pos}{p.depthRank ? p.depthRank : ""}</span>
-      <span className="flex-1 truncate">{p.name}</span>
+    <div className="flex items-center gap-2 text-[12px] px-1 py-1 rounded hover:bg-slate-900/60">
+      <span className="text-slate-600 w-4 shrink-0" style={mono}>{idx}</span>
+      <span className="w-9 text-[10px] text-slate-500 shrink-0" style={mono}>{p.pos}{p.depthRank && p.depthRank < 90 ? p.depthRank : ""}</span>
+      <button onClick={() => onClick(p)} className="flex-1 text-left truncate hover:text-sky-300 cursor-pointer" title="Open player analysis">{p.name}</button>
       <InjBadge status={p.injuryStatus} />
-    </button>
+    </div>
   );
 }
 function LineupCol({ title, d, side, onPlayerClick }) {
   const teamData = side === "home" ? d.home : d.away;
   if (!teamData) return null;
+  const rows = [...teamData.featured, { id: "dst", pos: "DST", name: `${title.split(" ")[0]} D/ST` }];
   return (
-    <div>
-      <div className="text-[11px] font-bold text-slate-400 mb-1">{title}</div>
-      <div className="border border-slate-800 rounded divide-y divide-slate-800">
-        {teamData.featured.map((p) => <PlayerRow key={p.id} p={p} onClick={onPlayerClick} />)}
-        <PlayerRow p={{ id: "dst", pos: "DST", name: `${title.split(" ")[0]} D/ST` }} onClick={onPlayerClick} />
+    <div className="bg-slate-950/60 border border-slate-800 rounded-lg p-2.5">
+      <div className="text-[10px] text-slate-500 font-bold tracking-wide mb-1.5">{title}</div>
+      <div className="space-y-0.5">
+        {rows.map((p, i) => <PlayerRow key={p.id} idx={i + 1} p={p} onClick={onPlayerClick} />)}
       </div>
     </div>
   );
 }
-function BoardRow({ e, tracked, onTrack }) {
-  const delta = e.proj != null && !isNaN(parseFloat(e.line)) ? e.proj - parseFloat(e.line) : null;
-  return (
-    <div className="flex items-center gap-2 px-2 py-1.5 border border-slate-800 rounded hover:border-slate-700">
-      <div className="w-40 truncate">
-        <div className="font-semibold truncate">{e.name}</div>
-        <div className="text-[10px] text-slate-500 truncate">{e.game}</div>
-      </div>
-      <div className="w-24 text-[11px]">{e.side} {e.line}</div>
-      <div className="w-16 text-[11px]" style={mono}>{fmtOdds(e.odds)}</div>
-      <div className="w-20 text-[11px] text-slate-400">proj {e.proj != null ? e.proj.toFixed(1) : "—"}{delta != null ? <span className={delta > 0 ? " text-emerald-400" : " text-rose-400"}> ({delta > 0 ? "+" : ""}{delta.toFixed(1)})</span> : null}</div>
-      <div className="w-16 text-[11px] font-semibold">{pct(e.modelP)}</div>
-      <div className={`w-16 text-[11px] font-semibold ${e.edge > 0 ? "text-emerald-400" : "text-rose-400"}`}>{e.edge != null ? `${e.edge > 0 ? "+" : ""}${(e.edge * 100).toFixed(1)}%` : "—"}</div>
-      <div className={`w-16 text-[11px] ${e.ev > 0 ? "text-emerald-400" : "text-rose-400"}`}>EV {e.ev != null ? e.ev.toFixed(2) : "—"}</div>
-      <button onClick={() => onTrack(e)} disabled={tracked} className={`ml-auto px-2 py-1 rounded text-[11px] font-semibold ${tracked ? "bg-slate-800 text-slate-500" : "bg-emerald-700 hover:bg-emerald-600"}`}>{tracked ? "Tracked" : "Track"}</button>
-    </div>
-  );
-}
-function MyBetRow({ b, onOdds, onUnits, onRemove }) {
-  const statusColor = { open: "text-slate-300", won: "text-emerald-400", lost: "text-rose-400", push: "text-slate-500", void: "text-slate-600" }[b.status] || "text-slate-300";
-  return (
-    <div className="flex items-center gap-2 px-2 py-1.5 border border-slate-800 rounded">
-      <div className="w-40 truncate"><div className="font-semibold truncate">{b.name}</div><div className="text-[10px] text-slate-500 truncate">{b.game}</div></div>
-      <div className="w-28 text-[11px]">{b.type} {b.side} {b.line}</div>
-      <input value={b.odds} onChange={(e) => onOdds(b.key, e.target.value)} className="w-16 bg-slate-900 border border-slate-700 rounded px-1 py-0.5 text-[11px]" style={mono} />
-      <input value={b.units} onChange={(e) => onUnits(b.key, e.target.value)} className="w-12 bg-slate-900 border border-slate-700 rounded px-1 py-0.5 text-[11px]" title="units" />
-      <div className="w-16 text-[11px]">{pct(b.modelP)}</div>
-      <div className={`w-16 text-[11px] ${b.edge > 0 ? "text-emerald-400" : "text-rose-400"}`}>{b.edge != null ? `${(b.edge * 100).toFixed(1)}%` : "—"}</div>
-      <div className={`w-16 text-[11px] font-bold uppercase ${statusColor}`}>{b.status}</div>
-      <button onClick={() => onRemove(b.key)} className="ml-auto px-2 py-1 rounded bg-slate-800 hover:bg-rose-900 text-[11px]">✕</button>
-    </div>
-  );
-}
-function AnalysisProjectionRow({ r }) {
-  return (
-    <div className="flex items-center gap-3 px-2 py-1.5 border border-slate-800 rounded text-[11px]">
-      <div className="w-36 font-semibold">{r.type}</div>
-      <div className="text-slate-400">line {r.line}</div>
-      <div className="text-slate-200">proj {r.proj != null ? r.proj.toFixed(2) : "—"}</div>
-      <div className="text-emerald-400">O {pct(r.overP)} ({r.overFair})</div>
-      <div className="text-rose-400">U {pct(r.underP)} ({r.underFair})</div>
-      {r.calc ? <div className="text-slate-600 truncate flex-1">{r.calc.dist} · {r.calc.params}</div> : null}
-    </div>
-  );
+// Returns projection-vs-line metadata for the visual buffer indicator, mirroring the MLB
+// app's projMeta: delta > 0 means the projection is on the "good" side of the line for the
+// bet direction (over: proj > line, under: line > proj).
+function projMeta(proj, lineStr, side) {
+  const l = parseFloat(String(lineStr));
+  if (proj == null || isNaN(l) || l <= 0) return null;
+  const delta = side === "over" ? proj - l : l - proj;
+  const color = delta < 0 ? "text-rose-400" : delta > 0.3 * l ? "text-emerald-400" : delta > 0.05 * l ? "text-emerald-600" : "text-slate-500";
+  const barColor = delta < 0 ? "#f87171" : delta > 0.3 * l ? "#34d399" : "#86efac";
+  const max = Math.max(l * 2.5, proj * 1.5, l + 2);
+  const linePct = clamp((l / max) * 100, 1, 98);
+  const projPct = clamp((proj / max) * 100, 0, 100);
+  return { delta, color, barColor, linePct, projPct };
 }
 function MathPanel({ r }) {
   if (!r || !r.calc) return null;
   const c = r.calc;
+  const activeMults = (c.mults || []).filter(([, v]) => Math.abs(Number(v) - 1) > 0.0005);
+  const chain = activeMults.length ? activeMults.map(([k, v]) => `${k} ${Number(v).toFixed(3)}`).join("  ×  ") : "neutral context";
   return (
-    <div className="text-[10px] text-slate-500 border border-slate-800 rounded p-2 mt-1">
-      <div>{c.dist} · {c.params} · proj {c.proj != null ? c.proj.toFixed(2) : "—"}</div>
-      <div>{c.baseStr}</div>
-      {c.mults && c.mults.length ? <div className="mt-1 flex flex-wrap gap-2">{c.mults.map(([k, v]) => <span key={k}>{k}: {typeof v === "number" ? v.toFixed(3) : v}</span>)}</div> : null}
+    <div className="border-t border-slate-800 px-4 py-2.5 text-[11px] text-slate-400 space-y-1" style={mono}>
+      <div><span className="text-slate-500">1 · base</span> &nbsp;{c.baseStr}</div>
+      <div><span className="text-slate-500">2 · context</span> &nbsp;{chain}</div>
+      <div><span className="text-slate-500">3 · projection</span> &nbsp;E[{r.type}] = <span className="text-sky-300">{(c.proj ?? r.proj) != null ? (c.proj ?? r.proj).toFixed(2) : "—"}</span> &nbsp;→ {c.dist}({c.params})</div>
+    </div>
+  );
+}
+function BoardRow({ e, tracked, onTrack }) {
+  const [show, setShow] = useState(false);
+  const evGood = e.ev >= 0;
+  const pm = !isLineType(e.type) ? projMeta(e.proj, e.line, e.side) : null;
+  return (
+    <div className="bg-slate-900/70 border border-slate-800 rounded-xl overflow-hidden">
+      <div className="flex items-center gap-3 px-4 py-3 flex-wrap">
+        <div className="flex-1 min-w-[160px]">
+          <div className="font-semibold truncate">{e.name} <span className="text-slate-500 text-xs">{e.game}</span></div>
+          <div className="text-[11px] text-slate-400" style={mono}>
+            {e.side} {e.line} {e.type} @ {fmtOdds(e.odds)} · <span className="text-sky-300">proj {e.proj != null ? e.proj.toFixed(2) : "—"}</span>
+            {pm && <span className={`ml-1.5 font-bold ${pm.color}`}>{pm.delta >= 0 ? "+" : "−"}{Math.abs(pm.delta).toFixed(2)}</span>}
+          </div>
+        </div>
+        <div className="text-right text-[11px]" style={mono}>
+          <div className="text-slate-400">model {pct(e.modelP)} · fair {e.fair}</div>
+          <div className={evGood ? "text-emerald-400 font-bold" : "text-rose-400 font-bold"}>EV {evGood ? "+" : ""}{e.ev != null ? (e.ev * 100).toFixed(1) : "—"}% · edge {e.edge != null ? `${e.edge >= 0 ? "+" : ""}${(e.edge * 100).toFixed(1)}%` : "—"}</div>
+        </div>
+        <button onClick={() => setShow((s) => !s)} className="text-[11px] text-slate-500 hover:text-emerald-300 border border-slate-700 rounded px-2 py-1">{show ? "hide" : "math"}</button>
+        <button onClick={() => onTrack(e)} disabled={tracked} className={`text-[11px] font-bold rounded px-2 py-1 ${tracked ? "bg-slate-700 text-slate-400" : "bg-emerald-600 hover:bg-emerald-500 text-white"}`}>{tracked ? "tracked" : "track"}</button>
+      </div>
+      {pm && (
+        <div className="relative h-1 mx-4 mb-2.5 bg-slate-800 rounded-full overflow-hidden" title={`proj ${e.proj != null ? e.proj.toFixed(2) : "—"} vs line ${e.line}`}>
+          <div className="absolute inset-y-0 left-0" style={{ width: `${pm.projPct}%`, backgroundColor: pm.barColor }} />
+          <div className="absolute inset-y-0 w-px bg-white/70" style={{ left: `${pm.linePct}%` }} />
+        </div>
+      )}
+      {show && <MathPanel r={e} />}
+    </div>
+  );
+}
+function MyBetRow({ b, onOdds, onUnits, onRemove }) {
+  const statusColor = { open: "bg-slate-700 text-slate-300", won: "bg-emerald-600 text-white", lost: "bg-rose-600 text-white", push: "bg-amber-600 text-slate-950", void: "bg-slate-600 text-slate-200" }[b.status] || "bg-slate-700 text-slate-300";
+  return (
+    <div className="flex items-center gap-3 bg-slate-900/70 border border-slate-800 rounded-xl px-4 py-3 flex-wrap">
+      <div className="flex-1 min-w-[160px]">
+        <div className="font-semibold truncate">{b.name}</div>
+        <div className="text-[11px] text-slate-500 truncate" style={mono}>{b.game} · {b.book}</div>
+      </div>
+      <div className="text-[11px] text-slate-300" style={mono}>{b.type} {b.side} {b.line}</div>
+      <input value={b.odds} onChange={(e) => onOdds(b.key, e.target.value)} className="w-16 bg-slate-950 border border-slate-700 rounded px-1.5 py-1 text-[11px] text-slate-100" style={mono} />
+      <input value={b.units} onChange={(e) => onUnits(b.key, e.target.value)} className="w-14 bg-slate-950 border border-slate-700 rounded px-1.5 py-1 text-[11px] text-slate-100" title="units" />
+      <div className="text-[11px] text-slate-400" style={mono}>model {pct(b.modelP)}</div>
+      <div className={`text-[11px] font-bold ${b.edge > 0 ? "text-emerald-400" : "text-rose-400"}`} style={mono}>{b.edge != null ? `${(b.edge * 100).toFixed(1)}%` : "—"}</div>
+      <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${statusColor}`}>{b.status}</span>
+      <button onClick={() => onRemove(b.key)} className="text-[11px] text-slate-500 hover:text-rose-400 border border-slate-700 rounded px-2 py-1">✕</button>
+    </div>
+  );
+}
+function AnalysisProjectionRow({ r }) {
+  const [show, setShow] = useState(false);
+  return (
+    <div className="bg-slate-900/70 border border-slate-800 rounded-xl overflow-hidden">
+      <div className="flex items-center gap-3 px-4 py-3 flex-wrap">
+        <div className="w-32 font-semibold shrink-0">{r.type}</div>
+        <div className="text-[11px] text-slate-400" style={mono}>line {r.line} · <span className="text-sky-300">proj {r.proj != null ? r.proj.toFixed(2) : "—"}</span></div>
+        <div className="text-[11px] ml-auto flex items-center gap-3" style={mono}>
+          <span className="text-emerald-400">O {pct(r.overP)} ({r.overFair})</span>
+          <span className="text-rose-400">U {pct(r.underP)} ({r.underFair})</span>
+          {r.calc ? <button onClick={() => setShow((s) => !s)} className="text-slate-500 hover:text-emerald-300 border border-slate-700 rounded px-2 py-1">{show ? "hide" : "math"}</button> : null}
+        </div>
+      </div>
+      {show && <MathPanel r={r} />}
     </div>
   );
 }
 function PlayerAnalysisPanel({ profile, ctx, projections, boardEntries, onTrack, myBets }) {
   const p = profile.player;
+  const pos = ctx.pos;
+  const season = ctx.season, recent = ctx.recent;
+  const teamName = profile.side === "home" ? profile.game.home : profile.game.away;
+  const rate = (obj, key) => obj && obj.g ? ((obj[key] || 0) / obj.g).toFixed(1) : "—";
   return (
     <div className="space-y-3">
-      <div className="flex items-center gap-2">
-        <div className="text-lg font-bold">{p.name}</div>
-        <span className="px-2 py-0.5 rounded bg-slate-800 text-[11px]">{ctx.pos}</span>
-        <InjBadge status={ctx.injuryStatus} />
-        <div className="text-[11px] text-slate-500 ml-2">{profile.game.away} @ {profile.game.home}</div>
-      </div>
-      <div className="grid md:grid-cols-3 gap-2 text-[11px]">
-        <div className="border border-slate-800 rounded p-2">
-          <div className="text-slate-500 uppercase text-[10px] mb-1">Season (this year)</div>
-          {ctx.season ? Object.entries(ctx.season).filter(([k]) => k !== "g").map(([k, v]) => <div key={k}>{k}: {typeof v === "number" ? v.toFixed(1) : v}</div>) : <div className="text-slate-600">no season log yet</div>}
-        </div>
-        <div className="border border-slate-800 rounded p-2">
-          <div className="text-slate-500 uppercase text-[10px] mb-1">Last 4 games</div>
-          {ctx.recent ? Object.entries(ctx.recent).filter(([k]) => k !== "games").map(([k, v]) => <div key={k}>{k}: {typeof v === "number" ? v.toFixed(1) : v}</div>) : <div className="text-slate-600">no recent log yet</div>}
-        </div>
-        <div className="border border-slate-800 rounded p-2">
-          <div className="text-slate-500 uppercase text-[10px] mb-1">Context</div>
-          <div>game script (spread): {ctx.teamSpread != null ? ctx.teamSpread.toFixed(1) : "—"}</div>
-          <div>implied team pts: {ctx.impliedTeamPts != null ? ctx.impliedTeamPts.toFixed(1) : "—"}</div>
-          <div>weather: {ctx.weather ? `${ctx.weather.temp}°F, wind ${ctx.weather.wind}mph` : ctx.stadium && ctx.stadium.dome ? "dome/closed" : "—"}</div>
-        </div>
-      </div>
-      <div>
-        <div className="text-xs font-bold text-emerald-400 mb-1">Default-line projections (every major prop for this position)</div>
-        <div className="space-y-1">
-          {projections.map((r) => (
-            <div key={r.type}>
-              <AnalysisProjectionRow r={r} />
-              <MathPanel r={r} />
+      <div className="bg-slate-900/70 border border-slate-800 rounded-xl p-4">
+        <div className="flex items-start justify-between gap-3 flex-wrap">
+          <div className="flex items-start gap-3">
+            <img
+              src={`https://a.espncdn.com/i/headshots/nfl/players/full/${p.id}.png`}
+              alt=""
+              className="w-16 h-16 rounded-xl object-cover border border-slate-700 bg-slate-800 flex-shrink-0"
+              onError={(e) => { e.currentTarget.style.display = "none"; }}
+            />
+            <div>
+              <div className="text-2xl font-black tracking-tight">{p.name}</div>
+              <div className="text-[11px] text-slate-500 mt-1" style={mono}>
+                {teamName || "—"} · {pos}{p.depthRank && p.depthRank < 90 ? p.depthRank : ""}
+              </div>
             </div>
-          ))}
+          </div>
+          <div className="flex items-center gap-2">
+            <InjBadge status={ctx.injuryStatus} />
+            <Chip s={profile.game.status} />
+          </div>
+        </div>
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mt-4">
+          {pos === "QB" ? (
+            <>
+              <MiniMetric label="Pass Yds" value={season ? Math.round(season.passYds || 0) : "—"} />
+              <MiniMetric label="Pass TD" value={season ? (season.passTd || 0) : "—"} />
+              <MiniMetric label="INT" value={season ? (season.ints || 0) : "—"} />
+              <MiniMetric label="Yds/G" value={rate(season, "passYds")} />
+            </>
+          ) : pos === "RB" ? (
+            <>
+              <MiniMetric label="Rush Yds" value={season ? Math.round(season.rushYds || 0) : "—"} />
+              <MiniMetric label="Rush TD" value={season ? (season.rushTd || 0) : "—"} />
+              <MiniMetric label="Rec" value={season ? (season.rec || 0) : "—"} />
+              <MiniMetric label="YPC" value={season && season.rushAtt ? (season.rushYds / season.rushAtt).toFixed(1) : "—"} />
+            </>
+          ) : pos === "WR" || pos === "TE" ? (
+            <>
+              <MiniMetric label="Rec" value={season ? (season.rec || 0) : "—"} />
+              <MiniMetric label="Rec Yds" value={season ? Math.round(season.recYds || 0) : "—"} />
+              <MiniMetric label="Rec TD" value={season ? (season.recTd || 0) : "—"} />
+              <MiniMetric label="Yds/Rec" value={season && season.rec ? (season.recYds / season.rec).toFixed(1) : "—"} />
+            </>
+          ) : pos === "K" ? (
+            <>
+              <MiniMetric label="FG Made" value={season ? (season.fgMade || 0) : "—"} />
+              <MiniMetric label="Kick Pts" value={season ? (season.kickPts || 0) : "—"} />
+              <MiniMetric label="Pts/G" value={rate(season, "kickPts")} />
+              <MiniMetric label="Games" value={season ? season.g : "—"} />
+            </>
+          ) : (
+            <>
+              <MiniMetric label="Sacks" value={season ? (season.sacks || 0) : "—"} />
+              <MiniMetric label="INT" value={season ? (season.defInt || 0) : "—"} />
+              <MiniMetric label="Games" value={season ? season.g : "—"} />
+              <MiniMetric label="Depth" value={p.depthRank && p.depthRank < 90 ? `#${p.depthRank}` : "—"} />
+            </>
+          )}
         </div>
       </div>
+
+      <div className="grid lg:grid-cols-3 gap-3">
+        <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-3">
+          <div className="text-[10px] text-slate-500 font-bold tracking-wide mb-1.5">MATCHUP</div>
+          <div className="text-[11px] text-slate-300 space-y-1" style={mono}>
+            <div>{profile.game.away} @ {profile.game.home}</div>
+            <div>game script (spread): {ctx.teamSpread != null ? ctx.teamSpread.toFixed(1) : "—"}</div>
+            <div>implied team pts: {ctx.impliedTeamPts != null ? ctx.impliedTeamPts.toFixed(1) : "—"}</div>
+            <div>weather: {ctx.weather ? `${ctx.weather.temp}°F, wind ${ctx.weather.wind}mph` : ctx.stadium && ctx.stadium.dome ? "dome/closed" : "—"}</div>
+          </div>
+        </div>
+        <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-3">
+          <div className="text-[10px] text-slate-500 font-bold tracking-wide mb-1.5">SEASON (THIS YEAR)</div>
+          <div className="text-[11px] text-slate-300 space-y-0.5" style={mono}>
+            {season ? Object.entries(season).filter(([k]) => k !== "g").map(([k, v]) => <div key={k}>{k}: {typeof v === "number" ? v.toFixed(1) : v}</div>) : <div className="text-slate-600">no season log yet</div>}
+          </div>
+        </div>
+        <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-3">
+          <div className="text-[10px] text-slate-500 font-bold tracking-wide mb-1.5">LAST 4 GAMES</div>
+          <div className="text-[11px] text-slate-300 space-y-0.5" style={mono}>
+            {recent ? Object.entries(recent).filter(([k]) => k !== "games").map(([k, v]) => <div key={k}>{k}: {typeof v === "number" ? v.toFixed(1) : v}</div>) : <div className="text-slate-600">no recent log yet</div>}
+          </div>
+        </div>
+      </div>
+
+      <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-3">
+        <div className="text-xs font-bold text-slate-300">Model Projections</div>
+        <div className="text-[11px] text-slate-500 mb-2" style={mono}>every major {pos} prop, priced to the default line</div>
+        <div className="space-y-2">{projections.map((r) => <AnalysisProjectionRow key={r.type} r={r} />)}</div>
+      </div>
+
       {boardEntries.length ? (
-        <div>
-          <div className="text-xs font-bold text-emerald-400 mb-1">Live market lines for this player (from Board)</div>
-          <div className="space-y-1">{boardEntries.map((e) => <BoardRow key={e.id} e={e} tracked={myBets.some((b) => b.key === e.id)} onTrack={onTrack} />)}</div>
+        <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-3">
+          <div className="text-xs font-bold text-slate-300 mb-2">Live market lines for this player (from Board)</div>
+          <div className="space-y-2">{boardEntries.map((e) => <BoardRow key={e.id} e={e} tracked={myBets.some((b) => b.key === e.id)} onTrack={onTrack} />)}</div>
         </div>
       ) : null}
     </div>
