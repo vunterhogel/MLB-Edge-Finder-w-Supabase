@@ -231,16 +231,17 @@ const CALIB_KEEP = { "Hits": 0.30, "Total Bases": 0.45, "Home Run": 0.30, "H+R+R
 //             mean reverted to single formula (decomposed version inflated projections for good hitters).
 const CALIB_KEEP_DEFAULT = 0.6; // moneyline / total and any uncategorized market
 function keepFor(type) { return (type != null && CALIB_KEEP[type] != null) ? CALIB_KEEP[type] : CALIB_KEEP_DEFAULT; }
-// K projection calibration: global 10% deflation; mean is unbiased (proj bias=+0.01 Aug data).
+// K projection calibration: Sep 2-7 data (N=220): bias=-0.485 (model underprojects vs actual by 0.485 Ks).
+// Prior 10% deflation (0.90) overcorrected past zero — model was already underestimating.
+// Removing deflation (1.00). K_SOFT_CAP compression stays to handle elite-starter IP limits.
 // K_SOFT_CAP / K_SOFT_COMPRESS: elite K starters (K/9>11) burn more pitches per inning → shorter actual IP.
-// Aug data: proj=[6-8) overs win only 29% with avg_proj=6.68 vs avg_actual=5.52 (-1.16 Ks).
-// Regression compresses projections above the cap; low/mid K starters are unaffected (proj<5.5).
-const K_PROJ_CALIB = 0.90;
+const K_PROJ_CALIB = 1.00;
 const K_SOFT_CAP = 5.5;       // K projections above this regress toward the cap
 const K_SOFT_COMPRESS = 0.50; // 50% of excess above cap is kept (e.g., 7.80 → 5.5 + 1.15 = 6.65)
-// Outs mean calibration: model overestimates IP by ~0.2 per start (proj=16.19, actual=15.59, Aug N=69).
-// Actual Outs var/mean=0.71 (sub-Poisson; model NB phi=1.5 was overdispersed). Switching to Poisson family.
-const OUTS_PROJ_CALIB = 0.963;
+// Outs mean calibration: Sep 2-7 data (N=92): bias=-0.476 (model underprojects vs actual; mean proj=15.15, actual=15.63).
+// Prior deflation (0.963) was based on Aug data showing overestimation — reversed sign in Sep. Flipped to 1.032.
+// Actual Outs var/mean=0.71 (sub-Poisson; Poisson family retained).
+const OUTS_PROJ_CALIB = 1.032;
 // Sanity cap: if |proj_outs - line| > this threshold, pitcher role/IP data is stale
 // (swingman evolved to starter, injury return on pitch limit, etc.). Force edge to 0.
 // All extreme-edge Outs blowups in Aug data had |delta| > 3 outs. 3.5 catches these
