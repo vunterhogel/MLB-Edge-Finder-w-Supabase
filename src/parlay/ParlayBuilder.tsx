@@ -121,6 +121,12 @@ function normalizeLeg(row, sport) {
   };
 }
 
+// order-independent identity for a set of legs — used to detect "this generated
+// candidate is the same parlay as one already tracked" regardless of leg order.
+function legSetKey(legs) {
+  return legs.map((l) => l.poolId || l.matchKey).sort().join("|");
+}
+
 /* ---------------------- parlay combination math ---------------------- */
 function combineLegs(legs) {
   let dec = 1, modelP = 1, fairP = 1;
@@ -435,10 +441,15 @@ export default function ParlayBuilder() {
       return (b.ev - a.ev) || (b.edge - a.edge);
     });
     const wantN = Number(numResults) || 10;
-    let results, diversityStarved = false;
+    let results;
+    let shortBy = 0;
     if (allowDuplicateLegs) {
       results = scored.slice(0, wantN);
     } else {
+      // Strict: a result NEVER shares a leg with an already-shown higher-ranked result.
+      // If that leaves fewer than requested, we show fewer — we do not pad with
+      // overlapping combos just to hit the requested count (that's what "duplicate
+      // picks off" means; silently padding was the bug where #1 and #10 shared legs).
       results = [];
       const usedLegs = new Set();
       for (const c of scored) {
@@ -448,25 +459,20 @@ export default function ParlayBuilder() {
         results.push(c);
         for (const k of keys) usedLegs.add(k);
       }
-      if (results.length < wantN && results.length < scored.length) {
-        // Couldn't find enough leg-disjoint combos among the scored candidates — top up with the
-        // next-best overlapping ones rather than quietly showing fewer than asked for.
-        diversityStarved = results.length < Math.min(wantN, 3);
-        for (const c of scored) {
-          if (results.length >= wantN) break;
-          if (!results.includes(c)) results.push(c);
-        }
-      }
+      shortBy = wantN - results.length;
     }
     setGenerated(results);
     const spaceNote = exact ? "" : " (sampled — the full combination space was too large to enumerate exactly, so this is a random sample across the whole pool rather than a complete search)";
-    const starvedNote = diversityStarved ? " Very few leg-disjoint options were found, so some results below still share legs — a standout leg or two may be dominating this pool; consider excluding it manually to force more variety." : "";
-    setGenMsg(`Explored ${combos.length.toLocaleString()} combination(s)${spaceNote} from ${capped.length} pooled legs, ${scored.length.toLocaleString()} net +EV — showing ${results.length} parlay(s)${allowDuplicateLegs ? "" : ", leg-diversity preferred"}, ${RISK_LEVELS[riskLevel - 1].hint} (risk: ${RISK_LEVELS[riskLevel - 1].label}).${starvedNote}`);
+    const shortNote = shortBy > 0 ? ` Only ${results.length} fully leg-disjoint parlay(s) could be built from this pool (you asked for ${wantN}) — the rest of the net +EV combos all reuse a leg already used above. Raise pool size, loosen pool filters, or turn on "allow duplicate legs" to see more.` : "";
+    setGenMsg(`Explored ${combos.length.toLocaleString()} combination(s)${spaceNote} from ${capped.length} pooled legs, ${scored.length.toLocaleString()} net +EV — showing ${results.length} parlay(s)${allowDuplicateLegs ? "" : ", leg-diversity preferred"}, ${RISK_LEVELS[riskLevel - 1].hint} (risk: ${RISK_LEVELS[riskLevel - 1].label}).${shortNote}`);
   }
 
   /* ---- tracked parlays ---- */
   const [tracked, setTracked] = useState(() => loadTracked());
   function persistTracked(next) { setTracked(next); saveTracked(next); }
+  // set of leg-set identities already tracked, so generated results can gray out
+  // their Track button instead of letting you track the exact same parlay twice.
+  const trackedLegKeys = useMemo(() => new Set(tracked.map((p) => legSetKey(p.legs))), [tracked]);
   function trackParlay(candidate) {
     const rec = {
       id: `plb_${Date.now()}_${Math.floor(Math.random() * 1e6)}`,
@@ -711,23 +717,30 @@ export default function ParlayBuilder() {
             {genMsg && <div className="text-[11px] text-slate-500 mb-2">{genMsg}</div>}
 
             <div className="space-y-2">
-              {generated.map((c, i) => (
-                <div key={i} className="p-2.5 rounded-lg bg-slate-950 border border-slate-800">
-                  <div className="flex flex-wrap items-center gap-3 text-sm mb-1.5">
-                    <span className="font-bold text-slate-400">#{i + 1}</span>
-                    <span className="font-bold">{c.legs.length} legs</span>
-                    <span style={mono}>{fmtOdds(c.american)}</span>
-                    <span className="text-slate-400">model {fmtPct(c.modelP)}</span>
-                    <span className={c.edge > 0 ? "text-emerald-400" : "text-rose-400"}>edge {fmtPct(c.edge)}</span>
-                    <span className={`font-bold ${c.ev > 0 ? "text-emerald-400" : "text-rose-400"}`}>EV {fmtPct(c.ev)}</span>
-                    {c.sgp && <span className="text-amber-400 font-bold text-xs">SGP</span>}
-                    <button onClick={() => trackParlay(c)} className="ml-auto bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded-lg px-3 py-1.5">Track (1u)</button>
+              {generated.map((c, i) => {
+                const already = trackedLegKeys.has(legSetKey(c.legs));
+                return (
+                  <div key={i} className="p-2.5 rounded-lg bg-slate-950 border border-slate-800">
+                    <div className="flex flex-wrap items-center gap-3 text-sm mb-1.5">
+                      <span className="font-bold text-slate-400">#{i + 1}</span>
+                      <span className="font-bold">{c.legs.length} legs</span>
+                      <span style={mono}>{fmtOdds(c.american)}</span>
+                      <span className="text-slate-400">model {fmtPct(c.modelP)}</span>
+                      <span className={c.edge > 0 ? "text-emerald-400" : "text-rose-400"}>edge {fmtPct(c.edge)}</span>
+                      <span className={`font-bold ${c.ev > 0 ? "text-emerald-400" : "text-rose-400"}`}>EV {fmtPct(c.ev)}</span>
+                      {c.sgp && <span className="text-amber-400 font-bold text-xs">SGP</span>}
+                      <button
+                        onClick={() => !already && trackParlay(c)}
+                        disabled={already}
+                        className={`ml-auto font-bold text-xs rounded-lg px-3 py-1.5 ${already ? "bg-slate-800 text-slate-500 cursor-not-allowed" : "bg-emerald-600 hover:bg-emerald-500 text-white"}`}
+                      >{already ? "Tracked ✓" : "Track (1u)"}</button>
+                    </div>
+                    <div className="rounded-lg border border-slate-800 overflow-hidden">
+                      {c.legs.map((l, j) => <LegRow key={j} leg={l} index={j} />)}
+                    </div>
                   </div>
-                  <div className="rounded-lg border border-slate-800 overflow-hidden">
-                    {c.legs.map((l, j) => <LegRow key={j} leg={l} index={j} />)}
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
         </div>
