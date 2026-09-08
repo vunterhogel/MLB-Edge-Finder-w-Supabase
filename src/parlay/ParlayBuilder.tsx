@@ -77,14 +77,23 @@ function normalizeLeg(row, sport) {
   const ev = numOrNull(row.ev);
   const settled = String(row.settled).toLowerCase() === "true";
   const result = (row.result || "").toLowerCase() || null; // won / lost / push / void / ""
+  const matchKey = `${sport}|${gamePk}|${row.playerId || ""}|${row.type}|${row.line}|${row.side}`;
   return {
-    poolId: `${sport}:${row.logId || `${row.gamePk}-${row.playerId || ""}-${row.type}-${row.line}-${row.side}`}`,
+    // keyed by "the same bet" (sport+game+player+market+line+side), NOT by logId — the board
+    // log re-logs every candidate on every board refresh, so the same bet can appear dozens of
+    // times with different logIds/timestamps. Pooling on matchKey collapses those snapshots.
+    poolId: matchKey,
     logId: row.logId || "",
+    loggedAt: row.loggedAt || "",
     sport,
     dateLabel: row.date || (row.week ? `Wk ${row.week}` : ""),
     game: row.game || "",
     gamePk,
     gameKey: `${sport}:${gamePk}`,
+    // groups the two sides (and any alternate lines) of the SAME market together, so the "best
+    // side only" pool filter can collapse over-vs-under duplicates down to whichever one the
+    // model actually favors.
+    marketKey: `${sport}|${gamePk}|${row.playerId || ""}|${row.type}|${row.line}`,
     playerId: row.playerId || "",
     name: row.name || "",
     type: row.type || "",
@@ -99,7 +108,7 @@ function normalizeLeg(row, sport) {
     settled,
     actualStat: row.actualStat || null,
     result,
-    matchKey: `${sport}|${gamePk}|${row.playerId || ""}|${row.type}|${row.line}|${row.side}`,
+    matchKey,
   };
 }
 
@@ -191,6 +200,21 @@ function ResultBadge({ result }) {
   };
   return <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${map[result] || "bg-slate-700 text-slate-200"}`}>{result}</span>;
 }
+// A single leg rendered "bet-slip" style — one row: sport tag, player/game + market/line/side,
+// odds right-aligned, with an optional trailing slot for a result badge / settle buttons.
+function LegRow({ leg, index, right }) {
+  return (
+    <div className={`flex items-center gap-2.5 px-2.5 py-1.5 ${index > 0 ? "border-t border-slate-800" : ""} bg-slate-900/60`}>
+      <span className="text-[9px] font-bold text-slate-500 w-8 shrink-0">{leg.sport.toUpperCase()}</span>
+      <div className="flex-1 min-w-0">
+        <div className="text-[13px] font-semibold text-slate-100 truncate">{leg.name || leg.game}</div>
+        <div className="text-[11px] text-slate-500 truncate">{leg.game && leg.name ? `${leg.game} · ` : ""}{leg.type} {leg.line} <span className="uppercase text-slate-400">{leg.side}</span></div>
+      </div>
+      <span className="text-sm font-bold shrink-0" style={mono}>{fmtOdds(leg.odds)}</span>
+      {right}
+    </div>
+  );
+}
 
 /* ============================================================================ */
 export default function ParlayBuilder() {
@@ -206,21 +230,28 @@ export default function ParlayBuilder() {
   function updateBlock(id, patch) { setBlocks((b) => b.map((x) => (x.id === id ? { ...x, ...patch } : x))); }
 
   function addAllToPool() {
-    let added = 0, skipped = 0;
-    const next = [...pool];
-    const seen = new Set(next.map((l) => l.poolId));
+    // The board log re-logs every candidate on every board refresh, so the same exact bet
+    // (same market + line + side) can show up dozens/hundreds of times with different logIds
+    // as the day goes on. Collapse those to one row per bet, keeping the most recently logged
+    // snapshot (freshest odds/model read) — merge into the existing pool so re-adding another
+    // CSV later updates rather than duplicates.
+    const merged = new Map(pool.map((l) => [l.poolId, l]));
+    let parsedRows = 0, blank = 0;
     for (const blk of blocks) {
       if (!blk.text.trim()) continue;
       const rows = parseCsvRows(blk.text);
       for (const r of rows) {
-        if (!r.type && !r.name) { skipped++; continue; }
+        if (!r.type && !r.name) { blank++; continue; }
+        parsedRows++;
         const leg = normalizeLeg(r, blk.sport);
-        if (seen.has(leg.poolId)) { skipped++; continue; }
-        seen.add(leg.poolId); next.push(leg); added++;
+        const existing = merged.get(leg.poolId);
+        if (!existing || String(leg.loggedAt || "") >= String(existing.loggedAt || "")) merged.set(leg.poolId, leg);
       }
     }
+    const next = [...merged.values()];
+    const collapsed = parsedRows - next.length + pool.length;
     setPool(next);
-    setPoolMsg(`Added ${added} leg(s) to the pool${skipped ? ` (${skipped} skipped — blank or already in pool)` : ""}.`);
+    setPoolMsg(`Parsed ${parsedRows} row(s) → ${next.length} unique bet(s) in the pool${collapsed > 0 ? ` (collapsed ${collapsed} repeated board-refresh snapshot(s) of the same bet, kept the most recent each)` : ""}${blank ? `; ${blank} blank row(s) skipped` : ""}.`);
   }
   function clearPool() { if (window.confirm("Clear the entire candidate pool?")) { setPool([]); setSelectedIds(new Set()); setPoolMsg(""); } }
 
@@ -231,22 +262,45 @@ export default function ParlayBuilder() {
   const [fMinEV, setFMinEV] = useState("");
   const [fSearch, setFSearch] = useState("");
   const [fOnlyOpen, setFOnlyOpen] = useState(true);
+  // The board log carries BOTH sides of every market (over and under, or every alt line) as
+  // separate rows, since it logs everything the board ever showed. Only one side of a given
+  // market is ever worth putting in a parlay — the one the model actually favors — so by
+  // default collapse each (game, player, market, line) group down to its single highest-EV
+  // side. Turn off to line-shop / eyeball both sides yourself.
+  const [fBestSide, setFBestSide] = useState(true);
+  // Explicit side control (e.g. exclude "under" entirely) — this is the general fix for markets
+  // like Home Run where the "under" side is almost never worth taking: rather than hardcoding
+  // that special case, let the user turn any side off pool-wide. Set of EXCLUDED sides; empty =
+  // nothing excluded (all sides shown), matching the chips' default "all on" appearance.
+  const [fSideExclude, setFSideExclude] = useState(new Set());
 
   const allTypes = useMemo(() => [...new Set(pool.map((l) => l.type).filter(Boolean))].sort(), [pool]);
+  const allSides = useMemo(() => [...new Set(pool.map((l) => l.side).filter(Boolean))].sort(), [pool]);
 
   const filteredPool = useMemo(() => {
     const minEdge = fMinEdge === "" ? null : Number(fMinEdge) / 100;
     const minEV = fMinEV === "" ? null : Number(fMinEV) / 100;
     const q = fSearch.trim().toLowerCase();
-    return pool
+    let rows = pool
       .filter((l) => fSports.has(l.sport))
       .filter((l) => fTypes.size === 0 || fTypes.has(l.type))
+      .filter((l) => !fSideExclude.has(l.side))
       .filter((l) => (fOnlyOpen ? !l.settled : true))
       .filter((l) => (minEdge == null || (l.edge != null && l.edge >= minEdge)))
       .filter((l) => (minEV == null || (l.ev != null && l.ev >= minEV)))
-      .filter((l) => !q || l.name.toLowerCase().includes(q) || l.game.toLowerCase().includes(q))
-      .sort((a, b) => (b.edge ?? -99) - (a.edge ?? -99));
-  }, [pool, fSports, fTypes, fMinEdge, fMinEV, fSearch, fOnlyOpen]);
+      .filter((l) => !q || l.name.toLowerCase().includes(q) || l.game.toLowerCase().includes(q));
+    if (fBestSide) {
+      const best = new Map(); // marketKey -> best-EV row for that (game, player, market, line)
+      for (const l of rows) {
+        const cur = best.get(l.marketKey);
+        const score = l.ev != null ? l.ev : (l.edge != null ? l.edge : -Infinity);
+        const curScore = cur ? (cur.ev != null ? cur.ev : (cur.edge != null ? cur.edge : -Infinity)) : -Infinity;
+        if (!cur || score > curScore) best.set(l.marketKey, l);
+      }
+      rows = [...best.values()];
+    }
+    return rows.sort((a, b) => (b.edge ?? -99) - (a.edge ?? -99));
+  }, [pool, fSports, fTypes, fSideExclude, fMinEdge, fMinEV, fSearch, fOnlyOpen, fBestSide]);
 
   function toggleSet(setFn, val) { setFn((prev) => { const n = new Set(prev); if (n.has(val)) n.delete(val); else n.add(val); return n; }); }
 
@@ -265,6 +319,12 @@ export default function ParlayBuilder() {
   const [allowSGP, setAllowSGP] = useState(false);
   const [maxPerGame, setMaxPerGame] = useState(2);
   const [numResults, setNumResults] = useState(10);
+  // Off by default: without this, the top-EV combos almost always share their strongest 1-2
+  // legs (the same standout edge shows up in nearly every high-scoring combination), so the
+  // "top 10" list was really just 1-2 real ideas wearing different extra legs. Off = greedily
+  // skip any candidate that reuses a leg already used by a higher-ranked parlay in this batch,
+  // so the results shown are actually independent picks. On = pure top-N by EV, duplicates allowed.
+  const [allowDuplicateLegs, setAllowDuplicateLegs] = useState(false);
   const [generated, setGenerated] = useState([]);
   const [genMsg, setGenMsg] = useState("");
 
@@ -279,8 +339,23 @@ export default function ParlayBuilder() {
       return { legs, ...c };
     }).filter((c) => c.modelP >= floor);
     scored.sort((a, b) => (b.ev - a.ev) || (b.edge - a.edge));
-    setGenerated(scored.slice(0, Number(numResults) || 10));
-    setGenMsg(`Explored ${combos.length.toLocaleString()} combination(s) from ${capped.length} pooled legs — showing top ${Math.min(scored.length, Number(numResults) || 10)} by EV (min combined win prob ${fmtPct(floor, 0)}).`);
+    const wantN = Number(numResults) || 10;
+    let results;
+    if (allowDuplicateLegs) {
+      results = scored.slice(0, wantN);
+    } else {
+      results = [];
+      const usedLegs = new Set();
+      for (const c of scored) {
+        if (results.length >= wantN) break;
+        const keys = c.legs.map((l) => l.poolId);
+        if (keys.some((k) => usedLegs.has(k))) continue;
+        results.push(c);
+        for (const k of keys) usedLegs.add(k);
+      }
+    }
+    setGenerated(results);
+    setGenMsg(`Explored ${combos.length.toLocaleString()} combination(s) from ${capped.length} pooled legs — showing ${results.length}${allowDuplicateLegs ? "" : " leg-independent"} parlay(s) by EV (min combined win prob ${fmtPct(floor, 0)})${allowDuplicateLegs ? "" : ". Turn on \"allow duplicate legs\" to instead see the pure top-EV list, which often reuses the same standout leg(s)."}`);
   }
 
   /* ---- tracked parlays ---- */
@@ -424,6 +499,13 @@ export default function ParlayBuilder() {
               <span className="w-px h-4 bg-slate-700 mx-1" />
               {allTypes.map((t) => <Chip key={t} active={fTypes.has(t)} onClick={() => toggleSet(setFTypes, t)}>{t}</Chip>)}
             </div>
+            {allSides.length > 0 && (
+              <div className="flex flex-wrap gap-1.5 items-center mb-2">
+                <span className="text-[11px] text-slate-500">side:</span>
+                {allSides.map((s) => <Chip key={s} active={!fSideExclude.has(s)} onClick={() => toggleSet(setFSideExclude, s)} tone="emerald">{s}</Chip>)}
+                <span className="text-[10px] text-slate-500">— click a side to turn it off pool-wide (e.g. exclude Home Run unders)</span>
+              </div>
+            )}
             <div className="flex flex-wrap items-end gap-3 mb-2">
               <label className="text-xs text-slate-400 flex flex-col gap-1">min edge %
                 <input value={fMinEdge} onChange={(e) => setFMinEdge(e.target.value)} placeholder="any" inputMode="decimal" className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-20 text-slate-100" />
@@ -436,6 +518,9 @@ export default function ParlayBuilder() {
               </label>
               <label className="text-xs text-slate-400 flex items-center gap-1.5 pb-1.5">
                 <input type="checkbox" checked={fOnlyOpen} onChange={(e) => setFOnlyOpen(e.target.checked)} /> only unsettled legs
+              </label>
+              <label className="text-xs text-slate-400 flex items-center gap-1.5 pb-1.5" title="The board log carries both sides of every market (over/under, alt lines) as separate rows. This keeps only the single highest-EV side per game+player+market+line.">
+                <input type="checkbox" checked={fBestSide} onChange={(e) => setFBestSide(e.target.checked)} /> best side only (collapse over/under)
               </label>
             </div>
             <div className="overflow-x-auto max-h-80 overflow-y-auto border border-slate-800 rounded">
@@ -489,14 +574,14 @@ export default function ParlayBuilder() {
           <div className="bg-slate-900/40 border border-slate-800 rounded-lg p-3">
             <div className="text-sm font-bold mb-2">3. Auto-build &amp; rank by strength</div>
             <div className="flex flex-wrap items-end gap-3 mb-3">
-              <label className="text-xs text-slate-400 flex flex-col gap-1">pool size (top edge)
-                <input type="number" min={2} max={60} value={poolCap} onChange={(e) => setPoolCap(e.target.value)} className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-20" />
+              <label className="text-xs text-slate-400 flex flex-col gap-1" title="How many of the filtered pool's legs (sorted best-edge-first) get fed into the combination search. The search space explodes with pool size, so this caps it to just the top-edge legs — raise it to consider weaker legs too, at the cost of a slower/coarser search; lower it to search faster among only your very best legs.">pool size (top edge) ⓘ
+                <input type="number" min={2} max={60} value={poolCap} onChange={(e) => setPoolCap(e.target.value)} onWheel={(e) => e.currentTarget.blur()} className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-20" />
               </label>
               <label className="text-xs text-slate-400 flex flex-col gap-1">legs: min
-                <input type="number" min={2} max={10} value={minLegs} onChange={(e) => setMinLegs(e.target.value)} className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-16" />
+                <input type="number" min={2} max={10} value={minLegs} onChange={(e) => setMinLegs(e.target.value)} onWheel={(e) => e.currentTarget.blur()} className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-16" />
               </label>
               <label className="text-xs text-slate-400 flex flex-col gap-1">legs: max
-                <input type="number" min={2} max={10} value={maxLegs} onChange={(e) => setMaxLegs(e.target.value)} className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-16" />
+                <input type="number" min={2} max={10} value={maxLegs} onChange={(e) => setMaxLegs(e.target.value)} onWheel={(e) => e.currentTarget.blur()} className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-16" />
               </label>
               <label className="text-xs text-slate-400 flex flex-col gap-1 w-44">risk scale: <span className="text-slate-200 font-bold">{RISK_LEVELS[riskLevel - 1].label}</span>
                 <input type="range" min={1} max={5} value={riskLevel} onChange={(e) => setRiskLevel(Number(e.target.value))} />
@@ -506,11 +591,14 @@ export default function ParlayBuilder() {
               </label>
               {allowSGP && (
                 <label className="text-xs text-slate-400 flex flex-col gap-1">max legs / game
-                  <input type="number" min={2} max={6} value={maxPerGame} onChange={(e) => setMaxPerGame(e.target.value)} className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-16" />
+                  <input type="number" min={2} max={6} value={maxPerGame} onChange={(e) => setMaxPerGame(e.target.value)} onWheel={(e) => e.currentTarget.blur()} className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-16" />
                 </label>
               )}
               <label className="text-xs text-slate-400 flex flex-col gap-1"># results
-                <input type="number" min={1} max={30} value={numResults} onChange={(e) => setNumResults(e.target.value)} className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-16" />
+                <input type="number" min={1} max={30} value={numResults} onChange={(e) => setNumResults(e.target.value)} onWheel={(e) => e.currentTarget.blur()} className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-16" />
+              </label>
+              <label className="text-xs text-slate-400 flex items-center gap-1.5 pb-1.5" title="Off (default): skip any candidate that reuses a leg already used by a higher-ranked parlay in this batch, so the results are independent picks, not the same 1-2 strong legs repackaged. On: pure top-N by EV, duplicates allowed.">
+                <input type="checkbox" checked={allowDuplicateLegs} onChange={(e) => setAllowDuplicateLegs(e.target.checked)} /> allow duplicate legs across parlays
               </label>
               <button onClick={generate} className="bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-sm rounded-lg px-3 py-1.5">Generate parlays</button>
             </div>
@@ -529,10 +617,8 @@ export default function ParlayBuilder() {
                     {c.sgp && <span className="text-amber-400 font-bold text-xs">SGP</span>}
                     <button onClick={() => trackParlay(c)} className="ml-auto bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded-lg px-3 py-1.5">Track (1u)</button>
                   </div>
-                  <div className="flex flex-wrap gap-1.5 text-[11px] text-slate-400">
-                    {c.legs.map((l, j) => (
-                      <span key={j} className="bg-slate-900 border border-slate-800 rounded px-1.5 py-0.5">{l.sport.toUpperCase()} · {l.name || l.game} {l.type} {l.line} {l.side} ({fmtOdds(l.odds)})</span>
-                    ))}
+                  <div className="rounded-lg border border-slate-800 overflow-hidden">
+                    {c.legs.map((l, j) => <LegRow key={j} leg={l} index={j} />)}
                   </div>
                 </div>
               ))}
@@ -581,20 +667,20 @@ export default function ParlayBuilder() {
                     <span className="text-[10px] text-slate-500 ml-auto">{new Date(p.builtAt).toLocaleString()}</span>
                     <button onClick={() => untrackParlay(p.id)} className="text-xs text-slate-500 hover:text-rose-400">✕</button>
                   </div>
-                  <div className="space-y-1">
+                  <div className="rounded-lg border border-slate-800 overflow-hidden">
                     {p.legs.map((l, j) => (
-                      <div key={j} className="flex items-center gap-2 text-[11px] text-slate-400 bg-slate-900 border border-slate-800 rounded px-2 py-1">
-                        <span className="w-10 text-slate-500">{l.sport.toUpperCase()}</span>
-                        <span className="flex-1 truncate">{l.name || l.game} {l.type} {l.line} {l.side} ({fmtOdds(l.odds)})</span>
-                        <ResultBadge result={l.result} settled={l.settled} />
-                        {!l.result && (
-                          <div className="flex gap-1">
-                            {["won", "lost", "push", "void"].map((r) => (
-                              <button key={r} onClick={() => setLegManual(p.id, j, r)} className="text-[9px] px-1.5 py-0.5 rounded border border-slate-700 hover:border-slate-400 text-slate-300">{r}</button>
-                            ))}
-                          </div>
-                        )}
-                      </div>
+                      <LegRow key={j} leg={l} index={j} right={
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          <ResultBadge result={l.result} />
+                          {!l.result && (
+                            <div className="flex gap-1">
+                              {["won", "lost", "push", "void"].map((r) => (
+                                <button key={r} onClick={() => setLegManual(p.id, j, r)} className="text-[9px] px-1.5 py-0.5 rounded border border-slate-700 hover:border-slate-400 text-slate-300">{r}</button>
+                              ))}
+                            </div>
+                          )}
+                        </div>
+                      } />
                     ))}
                   </div>
                 </div>
