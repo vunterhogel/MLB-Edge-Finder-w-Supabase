@@ -1581,6 +1581,17 @@ function loadBets() { try { return JSON.parse(localStorage.getItem(LS_BETS)) || 
 function saveBets(b) { try { localStorage.setItem(LS_BETS, JSON.stringify(b)); } catch { /* storage unavailable */ } }
 const LS_CREDITS = "mlbef_credits_v1";
 function loadCredits() { try { const v = localStorage.getItem(LS_CREDITS); return v == null || v === "" ? null : +v; } catch { return null; } }
+// per-market book overrides: some books (DraftKings, notably) frequently omit
+// specific prop markets from the-odds-api's feed — Home Run is the recurring
+// offender. Rather than switching the WHOLE board to another book just to see
+// that one market, each prop type can independently source its odds from a
+// different book than the main "book" selector. Defaults to ESPN BET for Home
+// Run (matching the workaround users were already doing by hand) and "same as
+// main book" for everything else.
+const LS_BOOK_OVERRIDES = "mlbef_bookoverrides_v1";
+const DEFAULT_BOOK_OVERRIDES = { "Home Run": "espnbet" };
+function loadBookOverrides() { try { const v = JSON.parse(localStorage.getItem(LS_BOOK_OVERRIDES)); return v && typeof v === "object" ? v : { ...DEFAULT_BOOK_OVERRIDES }; } catch { return { ...DEFAULT_BOOK_OVERRIDES }; } }
+function saveBookOverrides(o) { try { localStorage.setItem(LS_BOOK_OVERRIDES, JSON.stringify(o)); } catch { /* storage unavailable */ } }
 
 /* ---- Board Snapshot Logger ----
  * Logs EVERY board candidate (not just tracked bets) on each board load.
@@ -1861,6 +1872,16 @@ export default function App() {
   const [open, setOpen] = useState(null);
   const [detail, setDetail] = useState({});
   const [book, setBook] = useState("draftkings");
+  const [bookOverrides, setBookOverrides] = useState(() => loadBookOverrides());
+  const [showBookPanel, setShowBookPanel] = useState(false);
+  function setBookOverride(type, bk) {
+    setBookOverrides((prev) => {
+      const next = { ...prev };
+      if (!bk) delete next[type]; else next[type] = bk;
+      saveBookOverrides(next);
+      return next;
+    });
+  }
   const [board, setBoard] = useState({});            // pk -> entries[]
   const [oddsLoading, setOddsLoading] = useState(null);
   const [credits, setCredits] = useState(loadCredits());
@@ -2056,10 +2077,30 @@ export default function App() {
       }
       const ev = matchEvent(eventsRef.current.events, g);
       if (!ev) { setErr(`No odds event matched ${g.away}@${g.home}.`); setOddsLoading(null); return; }
-      const res = await fetchEventOdds(ev.id, book); if (res.remaining != null) setCredits(res.remaining);
+      // pull the primary book PLUS any per-market override books in one call — the-odds-api
+      // charges per (region, market) regardless of how many bookmakers you list, so this
+      // costs the same as a single-book fetch (see refreshLines' comment on the same trick).
+      const validOverrides = Object.fromEntries(Object.entries(bookOverrides).filter(([t, bk]) => bk && bk !== book && BOOKS.some((b) => b.key === bk) && ALL_PROPS.includes(t)));
+      const booksNeeded = [...new Set([book, ...Object.values(validOverrides)])];
+      const res = await fetchEventOdds(ev.id, booksNeeded.join(",")); if (res.remaining != null) setCredits(res.remaining);
       setOddsFetches((n) => n + 1);
       const dbg = oddsDebug(res.data, book);
-      const rows = parseEventOdds(res.data, book);
+      // rows are parsed per-book, then merged type-by-type: a type with an override sources
+      // its rows from that book instead of the primary one (falls back to primary if the
+      // override book didn't return that market for this event either).
+      const rowsByBook = {}; for (const bk of booksNeeded) rowsByBook[bk] = parseEventOdds(res.data, bk);
+      const rows = [];
+      for (const t of ALL_PROPS) {
+        const overrideBook = validOverrides[t];
+        const primaryHasIt = (rowsByBook[book] || []).some((r) => r.type === t);
+        // prefer the override book whenever the primary book is missing this market;
+        // otherwise stick with the primary book so the rest of the board stays on it.
+        const effectiveBook = overrideBook && !primaryHasIt ? overrideBook : book;
+        const bkRows = (rowsByBook[effectiveBook] || []).filter((r) => r.type === t);
+        for (const r of bkRows) rows.push({ ...r, srcBook: effectiveBook });
+      }
+      const hrOverrideBook = validOverrides["Home Run"];
+      const hrDbg = hrOverrideBook ? oddsDebug(res.data, hrOverrideBook) : null;
       // name -> {ctx} for hitters and pitchers in this game
       const hitterByName = {};
       for (const pid in d.hitters) { const h = d.hitters[pid]; if (h && h.name) hitterByName[normName(h.name)] = { ctx: hitterCtx(d, h, pid), name: h.name, id: pid }; }
@@ -2075,7 +2116,8 @@ export default function App() {
         for (const side of ["over", "under"]) {
           const odds = side === "over" ? row.over : row.under;
           if (odds == null) continue;
-          const bet = { gamePk: g.pk, game: `${g.away}@${g.home}`, playerId: found.id, name: found.name, type: row.type, line: String(row.point), side, odds, overOdds: row.over, underOdds: row.under, ctx: found.ctx, book };
+          const rowBook = row.srcBook || book;
+          const bet = { gamePk: g.pk, game: `${g.away}@${g.home}`, playerId: found.id, name: found.name, type: row.type, line: String(row.point), side, odds, overOdds: row.over, underOdds: row.under, ctx: found.ctx, book: rowBook };
           const ev2 = evalBet(bet, pre);
           entries.push({ id: `${g.pk}-${found.id}-${row.type}-${row.point}-${side}`, ...bet, ...ev2 });
         }
@@ -2085,7 +2127,9 @@ export default function App() {
       entries.push(...lineEntries);
       const returned = [...new Set(rows.map((r) => r.type)), ...lineEntries.map((e) => e.type)];
       const matched = [...new Set(entries.map((e) => e.type))];
-      setCoverage((c) => ({ ...c, [g.pk]: { game: `${g.away}@${g.home}`, book, returned, matched, rawKeys: dbg.rawKeys, hasHR: dbg.hasHR, hrSample: dbg.hrSample, books: dbg.books, usedBook: dbg.usedBook, statcast: d.statcastCoverage || (d.statcast && d.statcast.verification) } }));
+      const hrUsedBook = (rows.find((r) => r.type === "Home Run") || {}).srcBook || null;
+      const hrFellBack = !!(hrOverrideBook && hrUsedBook === hrOverrideBook);
+      setCoverage((c) => ({ ...c, [g.pk]: { game: `${g.away}@${g.home}`, book, returned, matched, rawKeys: dbg.rawKeys, hasHR: dbg.hasHR, hrSample: dbg.hrSample, books: dbg.books, usedBook: dbg.usedBook, hrUsedBook, hrFellBack, hrOverrideAvailable: hrDbg ? hrDbg.hasHR : null, statcast: d.statcastCoverage || (d.statcast && d.statcast.verification) } }));
       setBoard((b) => ({ ...b, [g.pk]: entries }));
       if (!entries.length) setErr(`Got odds for ${g.away}@${g.home} but matched no players (try closer to lineup lock, or another book).`);
     } catch (e) {
@@ -2589,9 +2633,32 @@ export default function App() {
               <select value={book} onChange={(e) => setBook(e.target.value)} className="bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-sm">
                 {BOOKS.map((b) => <option key={b.key} value={b.key}>{b.label}</option>)}
               </select>
+              <button onClick={() => setShowBookPanel((v) => !v)} className={`rounded-lg px-2 py-1.5 text-xs font-medium border ${showBookPanel || Object.keys(bookOverrides).length ? "border-sky-700 bg-sky-950 text-sky-300" : "border-slate-700 bg-slate-900 text-slate-400 hover:text-slate-200"}`} title="Per-market book overrides — e.g. pull Home Run odds from a different book than the rest of the board">
+                books{Object.keys(bookOverrides).length ? ` (${Object.keys(bookOverrides).length})` : ""} ▾
+              </button>
               <button onClick={() => loadSchedule(date)} className="bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-sm rounded-lg px-3 py-1.5">{loading ? "…" : "Refresh"}</button>
             </div>
           </div>
+          {showBookPanel && (
+            <div className="mt-2 bg-slate-900/70 border border-slate-800 rounded-lg px-3 py-2.5 flex flex-wrap items-center gap-x-4 gap-y-2 text-xs">
+              <span className="text-slate-500 w-full sm:w-auto" style={mono}>
+                per-market book — sources that prop's odds from a different book than "{BOOK_LABELS[book]}" above, but only when {BOOK_LABELS[book]} doesn't carry that market for the game; otherwise it still uses {BOOK_LABELS[book]}. Costs no extra odds credits (both books pulled in one call).
+              </span>
+              {ALL_PROPS.map((t) => (
+                <label key={t} className="flex items-center gap-1.5 text-slate-300">
+                  {t}
+                  <select
+                    value={bookOverrides[t] || ""}
+                    onChange={(e) => setBookOverride(t, e.target.value)}
+                    className="bg-slate-950 border border-slate-700 rounded px-1.5 py-1 text-xs"
+                  >
+                    <option value="">(same as {BOOK_LABELS[book]})</option>
+                    {BOOKS.filter((b) => b.key !== book).map((b) => <option key={b.key} value={b.key}>{b.label}</option>)}
+                  </select>
+                </label>
+              ))}
+            </div>
+          )}
           <div className="flex items-center justify-between mt-3 flex-wrap gap-2">
             <div className="flex gap-1 flex-wrap">
               {[["slate", "Slate"], ["board", `Board${boardEntries.length ? ` (${boardEntries.length})` : ""}`], ["analysis", "Player Analysis"], ["mybets", `My Bets${myBets.length ? ` (${myBets.length})` : ""}`], ["stats", "Stats"]].map(([k, l]) => (
@@ -2749,6 +2816,8 @@ export default function App() {
                     <div>{c.hasHR
                       ? <span className="text-emerald-500">batter_home_runs IS present{c.hrSample ? ` · sample → name:"${c.hrSample.name}" desc:"${c.hrSample.description}" point:${c.hrSample.point}` : ""}</span>
                       : <span className="text-amber-500">batter_home_runs NOT returned by {c.usedBook || c.book} (book/feed didn't carry it for this game)</span>}</div>
+                    {c.hrFellBack && <div className="text-sky-400">Home Run odds fell back to {BOOK_LABELS[c.hrUsedBook] || c.hrUsedBook} for this game (primary book didn't carry it)</div>}
+                    {!c.hasHR && !c.hrFellBack && c.hrOverrideAvailable === false && <div className="text-amber-500">fallback book didn't carry Home Run odds for this game either</div>}
                     {c.statcast && <div className={c.statcast.verdict === "statcast_confirmed" ? "text-emerald-500" : "text-slate-600"}>statcast: {c.statcast.verdict} · EV balls {c.statcast.battedBallsWithExitVelo || 0} · xBA balls {c.statcast.battedBallsWithXBA || 0}</div>}
                     {c.statcast && c.statcast.sources && <div className="text-slate-600">source: {c.statcast.sources}</div>}
                     {c.books && c.books.length > 1 && <div className="text-slate-600">books in response: {c.books.join(", ")}</div>}
