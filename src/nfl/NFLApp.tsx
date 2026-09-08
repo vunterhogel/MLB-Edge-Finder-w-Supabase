@@ -634,7 +634,20 @@ const ESPN_SITE = "https://site.api.espn.com/apis/site/v2/sports/football/nfl";
 const ESPN_WEB = "https://site.web.api.espn.com/apis/common/v3/sports/football/nfl";
 const ESPN_CORE = "https://sports.core.api.espn.com/v2/sports/football/leagues/nfl";
 async function jget(url) { const r = await fetch(url); if (!r.ok) throw new Error(`${r.status}`); return r.json(); }
-function refId(ref) { if (!ref) return null; const m = String(ref).match(/\/(\d+)(?:[/?]|$)/); return m ? m[1] : null; }
+function refId(ref) {
+  // Extract the resource id from an ESPN URL — the LAST "/digits" path
+  // segment, e.g. ".../seasons/2026/athletes/4431452?lang=en&region=us"
+  // -> "4431452", or ".../player/_/id/3139477/patrick-mahomes" -> "3139477".
+  // MUST take the *last* match, not the first: Core-API "$ref" URLs have an
+  // earlier "/seasons/<year>/" segment that also looks like "/<digits>/",
+  // and matching the first occurrence silently grabbed the season year
+  // instead of the real id — breaking every id-keyed lookup that depends on
+  // this (e.g. depth-chart rank matching, which is why the wrong player was
+  // showing as a team's starter).
+  if (!ref) return null;
+  const matches = [...String(ref).matchAll(/\/(\d+)(?=[/?]|$)/g)];
+  return matches.length ? matches[matches.length - 1][1] : null;
+}
 
 /* ---- schedule / scoreboard ---- */
 function classify(comp) {
@@ -656,6 +669,10 @@ function mapGame(ev) {
     homeName: (home.team && home.team.displayName) || "", awayName: (away.team && away.team.displayName) || "",
     homeRec: rec(home), awayRec: rec(away),
     time: ev.date ? new Date(ev.date).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "TBD",
+    // NFL weeks aren't confined to Thu/Sun/Mon (Saturday, international Friday,
+    // Thanksgiving/Black-Friday/Christmas games all exist) — surface the actual
+    // day so a card never implies a game is "this weekend" when it isn't.
+    dateLabel: ev.date ? new Date(ev.date).toLocaleDateString([], { weekday: "short", month: "numeric", day: "numeric" }) : "",
     venue: (comp.venue && comp.venue.fullName) || "",
     indoor: !!(comp.venue && comp.venue.indoor),
     status: classify(comp),
@@ -670,9 +687,12 @@ async function fetchSchedule(seasonType, week, year) {
   return (d.events || []).map(mapGame);
 }
 function currentWeekGuess(today = new Date()) {
-  // Rough season-structure heuristic (Labor Day anchors Week 1): good enough as a DEFAULT,
-  // always overridable in the UI — mirrors MLB's date picker defaulting to "today" but letting
-  // you pick any date.
+  // Rough season-structure heuristic (Labor Day anchors Week 1): a SYNCHRONOUS
+  // first-paint default only, so the UI isn't blank while fetchCurrentWeek()'s
+  // live lookup resolves — always overridable in the UI, and always corrected
+  // by fetchCurrentWeek() below once that live call returns. Do not rely on
+  // this alone: it hardcodes assumptions (e.g. exactly 4 preseason weeks) that
+  // drift from the real schedule season to season (recent seasons have used 3).
   const y = today.getFullYear();
   const laborDay = (() => { const d = new Date(y, 8, 1); while (d.getDay() !== 1) d.setDate(d.getDate() + 1); return d; })();
   const week1Kickoff = new Date(laborDay); week1Kickoff.setDate(week1Kickoff.getDate() + 3); // first Thursday after Labor Day
@@ -681,6 +701,45 @@ function currentWeekGuess(today = new Date()) {
   if (today < week1Kickoff) { const wk = clamp(Math.ceil((today - preseasonStart) / 6.048e8) + 1, 1, 4); return { seasonType: 1, week: wk, year: y }; }
   const wk = clamp(Math.floor((today - week1Kickoff) / 6.048e8) + 1, 1, 18);
   return { seasonType: 2, week: wk, year: y };
+}
+/* ---- live current-week lookup: replaces calendar-math guessing with the real
+   NFL schedule. ESPN's scoreboard, fetched with no narrow week/seasontype filter,
+   includes leagues[0].calendar — an array of season-type groups (Preseason=1,
+   Regular Season=2, Postseason=3, matching this app's seasonType numbering),
+   each with an `entries` array of that phase's weeks (also covering odd ones
+   like Hall of Fame Weekend or Wild Card), every entry carrying its own
+   startDate/endDate and a 1-based `value` = the week number ESPN's own
+   scoreboard/week params expect. Verified live (2026-09-08): top-level
+   season.type=2, week.number=1 for that date, and the calendar's Preseason
+   group correctly lists 3 weeks (Hall of Fame Weekend, Pre Wk 1, Pre Wk 2) for
+   the 2026 season — confirming this reads the real schedule shape instead of
+   assuming a fixed preseason length or fixed game days. */
+async function fetchCurrentWeek(now = new Date()) {
+  const d = await jget(`${ESPN_SITE}/scoreboard`);
+  const cal = (d.leagues && d.leagues[0] && d.leagues[0].calendar) || [];
+  const weeks = [];
+  for (const group of cal) {
+    const seasonType = +group.value;
+    for (const entry of group.entries || []) {
+      const week = +entry.value;
+      const start = entry.startDate ? new Date(entry.startDate) : null;
+      const end = entry.endDate ? new Date(entry.endDate) : null;
+      if (Number.isFinite(seasonType) && Number.isFinite(week) && start && !isNaN(start) && end && !isNaN(end)) {
+        weeks.push({ seasonType, week, start, end });
+      }
+    }
+  }
+  if (!weeks.length) throw new Error("empty calendar");
+  weeks.sort((a, b) => a.start - b.start);
+  const nowT = now.getTime();
+  const year = (d.season && d.season.year) || now.getFullYear();
+  // the week containing "now" ...
+  let found = weeks.find((w) => nowT >= w.start.getTime() && nowT < w.end.getTime());
+  // ... else the NEXT upcoming week (we're between weeks) ...
+  if (!found) found = weeks.find((w) => w.start.getTime() > nowT);
+  // ... else the whole season has concluded: fall back to the most recent past week.
+  if (!found) found = weeks[weeks.length - 1];
+  return { seasonType: found.seasonType, week: found.week, year };
 }
 
 /* ---- roster (embeds injuries — one call per team gets both) ---- */
@@ -880,23 +939,50 @@ async function fetchWeather(lat, lon) {
 async function fetchGameSummary(eventId) {
   try {
     const d = await jget(`${ESPN_SITE}/summary?event=${eventId}`);
-    const final = !!(d.header && d.header.competitions && d.header.competitions[0] && d.header.competitions[0].status && d.header.competitions[0].status.type && d.header.competitions[0].status.type.completed);
     const comp = d.header && d.header.competitions && d.header.competitions[0];
+    const statusType = comp && comp.status && comp.status.type;
+    // completed covers overtime the same as regulation (ESPN's flag is period-agnostic) —
+    // no special OT handling needed here.
+    const final = !!(statusType && statusType.completed);
+    // A game ESPN has marked as never going to be played as scheduled (weather/logistics
+    // cancellation, forfeit) will NEVER flip `completed` true — left alone it would sit open
+    // forever. Postponed/suspended games are NOT included here: those are usually replayed
+    // (often at the same event id) or resume later, so they're correctly left open until
+    // ESPN resolves them one way or the other.
+    const canceled = !!(statusType && /CANCELED|CANCELLED|FORFEIT/i.test(String(statusType.name || "")));
     const home = comp && (comp.competitors || []).find((c) => c.homeAway === "home");
     const away = comp && (comp.competitors || []).find((c) => c.homeAway === "away");
     const players = {};
-    for (const team of d.boxscore && d.boxscore.players || []) {
+    for (const team of (d.boxscore && d.boxscore.players) || []) {
       for (const cat of team.statistics || []) {
+        const catName = cat.name || "";
+        const labels = cat.labels || cat.names || [];
+        const keys = cat.keys || [];
         for (const ath of cat.athletes || []) {
           const id = ath.athlete && ath.athlete.id; if (!id) continue;
-          players[id] = players[id] || { participated: true };
-          const labels = cat.labels || cat.names || [];
-          (ath.stats || []).forEach((v, i) => { const label = labels[i]; if (label) players[id][label] = num(v); });
+          const p = (players[id] = players[id] || { participated: true });
+          // namespace by category so a player who shows up in more than one (a receiving RB,
+          // a rushing QB) doesn't have one category's "YDS"/"TD" clobber another's.
+          const bucket = (p[catName] = p[catName] || {});
+          (ath.stats || []).forEach((v, i) => {
+            const key = keys[i], label = labels[i];
+            const sv = String(v);
+            if (sv.includes("/")) {
+              // combined "made/attempted" cell (passing C/ATT "24/35", kicking FG "2/3", XP "1/1")
+              const [a, b] = sv.split("/").map((x) => num(x));
+              if (key) { bucket[`${key}#0`] = a; bucket[`${key}#1`] = b; }
+              if (label) { bucket[`${label}#0`] = a; bucket[`${label}#1`] = b; }
+            } else {
+              const n = num(v);
+              if (key) bucket[key] = n;
+              if (label) bucket[label] = n;
+            }
+          });
         }
       }
     }
-    return { final, homeScore: home ? +home.score : null, awayScore: away ? +away.score : null, players };
-  } catch { return { final: false, homeScore: null, awayScore: null, players: {} }; }
+    return { final, canceled, homeScore: home ? +home.score : null, awayScore: away ? +away.score : null, players };
+  } catch { return { final: false, canceled: false, homeScore: null, awayScore: null, players: {} }; }
 }
 
 /* ============================================================
@@ -1104,18 +1190,60 @@ async function settleBoardLog(settledBets) {
   if (changed) saveBoardLog(updated);
 }
 
-/* ---- settling helpers ---- */
-const STAT_LABEL_FOR = {
-  "Pass Yards": ["YDS"], "Pass TDs": ["TD"], "Interceptions": ["INT"], "Pass Completions": ["CMP"], "Pass Attempts": ["ATT"],
-  "Rush Yards": ["YDS"], "Rush TDs": ["TD"], "Receptions": ["REC"], "Receiving Yards": ["YDS"], "Receiving TDs": ["TD"],
-  "Kicking Points": ["PTS"], "Field Goals Made": ["FG"], "Sacks": ["SACKS"], "Def. Interceptions": ["INT"],
+/* ---- settling helpers ----
+   ESPN's box score groups a player's stats into CATEGORIES (passing, rushing, receiving,
+   kicking, defensive, interceptions, …), each with its own `labels` (display, e.g. "YDS")
+   AND `keys` (semantic, e.g. "passingYards") arrays — but several categories reuse the same
+   bare label ("YDS"/"TD" all appear in passing, rushing, receiving AND kicking/return
+   categories; "INT" appears in BOTH passing [thrown] and the separate interceptions
+   category [picks made]). A player who shows up in more than one category in the same game
+   — any receiving RB, any rushing QB — would silently have one category's number clobber
+   another's if stats were flattened into one bare-label bag. fetchGameSummary below keys
+   each player's stats by CATEGORY first (players[id][categoryName][field]), and this table
+   matches on (category, field) pairs — field tried as the semantic key first, falling back
+   to the display label, the same tolerant-matching posture STAT_ALIASES uses for gamelogs. */
+const BOX_STAT_FOR = {
+  "Pass Yards": [["passing", "passingYards"], ["passing", "YDS"]],
+  "Pass TDs": [["passing", "passingTouchdowns"], ["passing", "TD"]],
+  "Interceptions": [["passing", "interceptions"], ["passing", "INT"]],
+  // ESPN's passing box score reports completions/attempts as ONE combined cell ("24/35", label
+  // "C/ATT") — not separate "CMP"/"ATT" fields. fetchGameSummary splits that combined cell into
+  // "<key>#0" (made/completions) and "<key>#1" (attempted) so each half is gradeable on its own.
+  "Pass Completions": [["passing", "completions/passingAttempts#0"]],
+  "Pass Attempts": [["passing", "completions/passingAttempts#1"]],
+  "Rush Yards": [["rushing", "rushingYards"], ["rushing", "YDS"]],
+  "Rush TDs": [["rushing", "rushingTouchdowns"], ["rushing", "TD"]],
+  "Longest Rush": [["rushing", "longRushing"], ["rushing", "LONG"]],
+  "Receptions": [["receiving", "receptions"], ["receiving", "REC"]],
+  "Receiving Yards": [["receiving", "receivingYards"], ["receiving", "YDS"]],
+  "Receiving TDs": [["receiving", "receivingTouchdowns"], ["receiving", "TD"]],
+  "Longest Reception": [["receiving", "longReception"], ["receiving", "LONG"]],
+  "Kicking Points": [["kicking", "totalKickingPoints"], ["kicking", "PTS"]],
+  "Field Goals Made": [["kicking", "fieldGoalsMade/fieldGoalAttempts#0"]],
+  "Sacks": [["defensive", "sacks"], ["defensive", "SACKS"]],
+  "Def. Interceptions": [["interceptions", "interceptions"], ["interceptions", "INT"]],
+  // no "Longest Completion" here: ESPN's box score summary doesn't carry that field at all
+  // (only longest rush / longest reception) — left ungraded (stays open) rather than guessing.
 };
 function actualFor(type, ps) {
-  if (!ps) return null;
-  const labels = STAT_LABEL_FOR[type];
-  if (!labels) return null;
-  for (const l of labels) if (ps[l] != null) return ps[l];
-  return null;
+  if (!ps) return null; // handled upstream: player never appeared anywhere in the box score -> void/DNP
+  if (type === "Anytime TD") {
+    // matches projectAnytimeTD's own definition (union of rush-TD and rec-TD probability):
+    // a thrown TD pass doesn't count — the QB isn't the one "scoring" it for this market.
+    const rushTd = (ps.rushing && (ps.rushing.rushingTouchdowns ?? ps.rushing.TD)) || 0;
+    const recTd = (ps.receiving && (ps.receiving.receivingTouchdowns ?? ps.receiving.TD)) || 0;
+    return rushTd + recTd;
+  }
+  const cands = BOX_STAT_FOR[type];
+  if (!cands) return null;
+  for (const [cat, field] of cands) {
+    const bucket = ps[cat];
+    if (bucket && bucket[field] != null) return bucket[field];
+  }
+  // Player DID appear in the box score (participated) but recorded nothing in this specific
+  // category — e.g. an RB with zero carries this week. That's a real, gradeable zero, not an
+  // unknown to leave open forever (mirrors MLB: a batter with 0 hits still grades, not voids).
+  return 0;
 }
 function gradeBet(side, point, actual) {
   if (actual == null) return null;
@@ -1205,9 +1333,17 @@ export default function NFLApp() {
   const [credits, setCredits] = useState(loadCredits());
   const [oddsFetches, setOddsFetches] = useState(0);
   const [boardLogCount, setBoardLogCount] = useState(() => loadBoardLog().length);
+  const [boardLogSettling, setBoardLogSettling] = useState(false);
+  const [boardLogSettleMsg, setBoardLogSettleMsg] = useState("");
   const [boardSort, setBoardSort] = useState("ev_desc");
   const [minEdge, setMinEdge] = useState("");
   const [minModel, setMinModel] = useState("");
+  const [minOdds, setMinOdds] = useState("");
+  const [maxOdds, setMaxOdds] = useState("");
+  const [minDelta, setMinDelta] = useState("");
+  const [maxDelta, setMaxDelta] = useState("");
+  const [dirAligned, setDirAligned] = useState(false); // only show plays where proj direction matches bet side
+  const [showMoreBoard, setShowMoreBoard] = useState(false);
   const [catFilter, setCatFilter] = useState("all");
   const [boardSearch, setBoardSearch] = useState("");
   const [gameFilter, setGameFilter] = useState("all");
@@ -1233,6 +1369,26 @@ export default function NFLApp() {
   useEffect(() => { void settleBoardLog(myBets); }, [myBets]);
   useEffect(() => { boardLogReady.then((rows) => setBoardLogCount(rows.length)); }, []);
   useEffect(() => { if (credits != null) { try { localStorage.setItem(LS_CREDITS, String(credits)); } catch {} } }, [credits]);
+  // Best-guess-then-verify: currentWeekGuess() above painted a synchronous
+  // default so the homepage isn't blank; now confirm it against ESPN's real
+  // live schedule and correct if wrong (this is what actually fixes "opens to
+  // a fully-completed past week" — calendar math alone can't track holiday
+  // scheduling, variable preseason length, or bye-week structure). Only
+  // applies once, and only if the user hasn't already navigated to a
+  // different week/season/year while the lookup was in flight.
+  useEffect(() => {
+    let cancelled = false;
+    fetchCurrentWeek().then((live) => {
+      if (cancelled) return;
+      // each field only overwrites if it still equals the synchronous initial
+      // guess, i.e. the user hasn't manually navigated it away in the meantime.
+      setSeasonType((cur) => (cur === wk0.seasonType ? live.seasonType : cur));
+      setWeek((cur) => (cur === wk0.week ? live.week : cur));
+      setYear((cur) => (cur === wk0.year ? live.year : cur));
+    }).catch(() => { /* live lookup unavailable — keep the calendar-math default */ });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line
+  }, []);
 
   const sportKey = seasonType === 1 ? ODDS_SPORT_PRESEASON : ODDS_SPORT;
 
@@ -1262,9 +1418,17 @@ export default function NFLApp() {
     const byPos = {};
     for (const p of roster) { (byPos[p.pos] = byPos[p.pos] || []).push(p); }
     const rankOf = (p) => (depth[p.id] ? depth[p.id].rank : 99);
-    const pick = (pos, n) => (byPos[pos] || []).slice().sort((a, b) => rankOf(a) - rankOf(b)).slice(0, n);
-    return [...pick("QB", 1), ...pick("RB", 2), ...pick("WR", 3), ...pick("TE", 1), ...pick("PK", 1), ...pick("K", 1)]
-      .map((p) => ({ ...p, depthRank: rankOf(p) }));
+    // depthConfirmed: whether the TOP pick in this position group actually came from
+    // real depth-chart data (rank < 99), vs. fetchDepthChart returning nothing for this
+    // team (network hiccup, missing data) and this "starter" really just being arbitrary
+    // roster-listing order — surfaced to the UI instead of silently presenting either
+    // case the same way.
+    const pick = (pos, n) => {
+      const sorted = (byPos[pos] || []).slice().sort((a, b) => rankOf(a) - rankOf(b)).slice(0, n);
+      const topConfirmed = sorted.length === 0 || rankOf(sorted[0]) < 99;
+      return sorted.map((p, i) => ({ ...p, depthRank: rankOf(p), depthConfirmed: i === 0 ? topConfirmed : true }));
+    };
+    return [...pick("QB", 1), ...pick("RB", 2), ...pick("WR", 3), ...pick("TE", 1), ...pick("PK", 1), ...pick("K", 1)];
   }
   async function loadDetail(g) {
     if (detail[g.pk] && detail[g.pk].ready) return detail[g.pk];
@@ -1454,14 +1618,25 @@ export default function NFLApp() {
     for (const e of boardEntries) if (!seen[e.gamePk]) { seen[e.gamePk] = 1; out.push({ pk: String(e.gamePk), label: e.game }); }
     return out;
   }, [boardEntries]);
+  // raw proj-minus-line (not side-adjusted — dirAligned below handles direction)
+  const getDelta = (e) => (e.proj ?? 0) - parseFloat(e.line ?? 0);
   const grouped = useMemo(() => {
     const minE = parseFloat(minEdge);
     const minM = parseFloat(minModel);
+    const minO = parseFloat(minOdds);
+    const maxO = parseFloat(maxOdds);
+    const minD = parseFloat(minDelta);
+    const maxD = parseFloat(maxDelta);
     const f = boardEntries.filter((e) => {
       if (e.modelP == null) return false;
       if (e.modelP >= 0.999 || e.modelP <= 0.001) return false;
       if (!isNaN(minE) && !(e.edge != null && e.edge * 100 >= minE)) return false;
       if (!isNaN(minM) && !(e.modelP * 100 >= minM)) return false;
+      if (!isNaN(minO) && !(e.odds != null && e.odds >= minO)) return false;
+      if (!isNaN(maxO) && !(e.odds != null && e.odds <= maxO)) return false;
+      if (!isNaN(minD) && getDelta(e) < minD) return false;
+      if (!isNaN(maxD) && getDelta(e) > maxD) return false;
+      if (dirAligned) { const d = getDelta(e); if (e.side === "over" && d <= 0) return false; if (e.side === "under" && d >= 0) return false; }
       if (catFilter !== "all" && e.type !== catFilter) return false;
       if (gameFilter !== "all" && String(e.gamePk) !== gameFilter) return false;
       if (sideFilter !== "all" && e.side !== sideFilter) return false;
@@ -1474,13 +1649,14 @@ export default function NFLApp() {
       ev_desc: (a, b) => (b.ev ?? -9) - (a.ev ?? -9), ev_asc: (a, b) => (a.ev ?? 9) - (b.ev ?? 9),
       edge_desc: (a, b) => (b.edge ?? -9) - (a.edge ?? -9), edge_asc: (a, b) => (a.edge ?? 9) - (b.edge ?? 9),
       proj_desc: (a, b) => (b.proj ?? -9) - (a.proj ?? -9), proj_asc: (a, b) => (a.proj ?? 9e9) - (b.proj ?? 9e9),
+      delta_desc: (a, b) => getDelta(b) - getDelta(a), delta_asc: (a, b) => getDelta(a) - getDelta(b),
     }[boardSort];
     const out = {};
     for (const t of STAT_ORDER) { const arr = f.filter((e) => e.type === t).sort(cmp); if (arr.length) out[t] = arr; }
     return out;
-  }, [boardEntries, boardSort, minEdge, minModel, catFilter, classFilter, gameFilter, sideFilter, boardSearch]);
-  const filtersActive = classFilter !== "all" || catFilter !== "all" || gameFilter !== "all" || sideFilter !== "all" || minEdge !== "" || minModel !== "" || boardSearch !== "";
-  function clearFilters() { setClassFilter("all"); setCatFilter("all"); setGameFilter("all"); setSideFilter("all"); setMinEdge(""); setMinModel(""); setBoardSearch(""); }
+  }, [boardEntries, boardSort, minEdge, minModel, minOdds, maxOdds, minDelta, maxDelta, dirAligned, catFilter, classFilter, gameFilter, sideFilter, boardSearch]);
+  const filtersActive = classFilter !== "all" || catFilter !== "all" || gameFilter !== "all" || sideFilter !== "all" || minEdge !== "" || minModel !== "" || minOdds !== "" || maxOdds !== "" || minDelta !== "" || maxDelta !== "" || dirAligned || boardSearch !== "";
+  function clearFilters() { setClassFilter("all"); setCatFilter("all"); setGameFilter("all"); setSideFilter("all"); setMinEdge(""); setMinModel(""); setMinOdds(""); setMaxOdds(""); setMinDelta(""); setMaxDelta(""); setDirAligned(false); setBoardSearch(""); }
 
   /* ---- my bets ---- */
   function trackBet(e) {
@@ -1510,7 +1686,11 @@ export default function NFLApp() {
     let graded = 0;
     setMyBets((prev) => prev.map((b) => {
       if (b.status !== "open") return b;
-      const res = results[b.gamePk]; if (!res || !res.final) return b;
+      const res = results[b.gamePk]; if (!res) return b;
+      // A game ESPN has flagged as canceled/forfeited never reaches `final` — void
+      // immediately rather than leaving these open forever.
+      if (res.canceled) { graded++; return { ...b, status: "void", actual: "CANCELED" }; }
+      if (!res.final) return b;
       if (isLineType(b.type)) {
         const { status, actual } = gradeLine(b.type, b.side, parseFloat(b.line), res.homeScore, res.awayScore);
         if (!status) return b; graded++; return { ...b, status, actual };
@@ -1523,6 +1703,80 @@ export default function NFLApp() {
       graded++; return { ...b, status: st, actual };
     }));
     setSettleMsg(`Settled ${graded} bet(s). Unsettled games are still in progress.`);
+  }
+
+  // ── Full Board Log Settlement (mirrors MLB's settleFullBoardLog) ───────────────────────
+  // Grades EVERY board-log candidate for finished games — not just tracked bets — using the
+  // free ESPN summary endpoint (no Odds API credits). This is what turns the board log from
+  // a raw model-output archive into a real calibration dataset as the season plays out.
+  async function settleFullBoardLog() {
+    await boardLogReady;
+    const log = loadBoardLog();
+    const unsettled = log.filter((e) => !e.settled);
+    if (!unsettled.length) { setBoardLogSettleMsg("Board log is fully settled — nothing to do."); return; }
+    const pks = [...new Set(unsettled.map((e) => e.gamePk))];
+    setBoardLogSettling(true);
+    setBoardLogSettleMsg(`Fetching results for ${pks.length} game(s)…`);
+    try {
+      const results = {};
+      for (const pk of pks) results[pk] = await fetchGameSummary(pk);
+      let graded = 0;
+      const updated = log.map((e) => {
+        if (e.settled) return e;
+        const res = results[e.gamePk];
+        if (!res) return e;
+        if (res.canceled) { graded++; return { ...e, settled: true, actualStat: "CANCELED", result: "void" }; }
+        if (!res.final) return e; // game still in progress — leave unsettled
+        if (isLineType(e.type)) {
+          const { status, actual } = gradeLine(e.type, e.side, parseFloat(e.line || "0"), res.homeScore, res.awayScore);
+          if (!status) return e;
+          graded++; return { ...e, settled: true, actualStat: actual, result: status };
+        }
+        const ps = res.players[e.playerId];
+        if (!ps) { graded++; return { ...e, settled: true, actualStat: "DNP", result: "void" }; }
+        const actual = actualFor(e.type, ps);
+        const status = gradeBet(e.side, parseFloat(String(e.line)), actual);
+        if (status == null) return e;
+        graded++; return { ...e, settled: true, actualStat: actual, result: status };
+      });
+      saveBoardLog(updated);
+      const totalSettled = updated.filter((e) => e.settled).length;
+      setBoardLogCount(updated.length);
+      setBoardLogSettleMsg(`Graded ${graded} board log entr${graded === 1 ? "y" : "ies"} across ${pks.length} game(s). ${totalSettled.toLocaleString()} / ${updated.length.toLocaleString()} total entries now settled.`);
+    } catch (err) {
+      setBoardLogSettleMsg(`Settlement failed: ${String((err && err.message) || err)}`);
+    } finally {
+      setBoardLogSettling(false);
+    }
+  }
+  function exportBoardLogCSV() {
+    const log = loadBoardLog();
+    if (!log.length) { alert("No board log entries yet. Load a game to start logging."); return; }
+    const esc = (v) => { if (v == null) return ""; const s = String(v); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
+    const headers = ["logId", "loggedAt", "modelVersion", "week", "game", "gamePk", "playerId", "name", "type", "line", "side", "odds", "novig", "rawModelP", "calibratedP", "edge", "ev", "proj", "settled", "actualStat", "result"];
+    const rows = [headers.join(",")];
+    for (const e of log) {
+      rows.push([
+        esc(e.logId), esc(e.loggedAt), esc(e.modelVersion), esc(e.week),
+        esc(e.game), esc(e.gamePk), esc(e.playerId), esc(e.name),
+        esc(e.type), esc(e.line), esc(e.side), esc(e.odds),
+        e.novig ?? "", e.rawModelP ?? "", e.calibratedP ?? "",
+        e.edge ?? "", e.ev ?? "", e.proj ?? "",
+        e.settled ? "true" : "false", e.actualStat ?? "", esc(e.result),
+      ].join(","));
+    }
+    const blob = new Blob([rows.join("\n")], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = `nfl-board-log-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+  function clearBoardLog() {
+    if (typeof window !== "undefined" && !window.confirm("Clear ALL board log entries? This cannot be undone. Export a CSV first.")) return;
+    saveBoardLog([]);
+    setBoardLogCount(0);
+    setBoardLogSettleMsg("");
   }
 
   /* live recompute of My Bets EV (odds editable) — mirrors MLB */
@@ -1572,6 +1826,33 @@ export default function NFLApp() {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a"); a.href = url; a.download = `nfl-edge-finder-bets-${new Date().toISOString().slice(0, 10)}.csv`; a.click();
     URL.revokeObjectURL(url);
+  }
+  // lossless backup of the tracked-bet log so it survives a host/browser change (localStorage
+  // does not) — mirrors MLB's backup/restore pair verbatim.
+  function backupBets() {
+    const data = JSON.stringify({ app: "nfl-edge-finder", v: 1, exported: new Date().toISOString(), bets: myBets }, null, 2);
+    const blob = new Blob([data], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = `nfl-edge-finder-bets-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+  function restoreBets(file) {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(reader.result);
+        const incoming = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.bets) ? parsed.bets : null);
+        if (!incoming) { setSettleMsg("Restore failed: not a valid bet backup file."); return; }
+        const have = new Set(myBets.map((b) => b.key));
+        const toAdd = incoming.filter((b) => b && b.key != null && !have.has(b.key));
+        setMyBets((cur) => { const k = new Set(cur.map((b) => b.key)); return [...cur, ...toAdd.filter((b) => !k.has(b.key))]; });
+        setSettleMsg(`Restored ${toAdd.length} bet(s) from backup (${incoming.length} in file; duplicates skipped).`);
+      } catch { setSettleMsg("Restore failed: could not parse the JSON file."); }
+    };
+    reader.readAsText(file);
   }
 
   /* ---- Player Analysis: build ctx + every prop projection for the selected player ---- */
@@ -1647,7 +1928,10 @@ export default function NFLApp() {
                 <div key={g.pk} className="bg-slate-900/70 border border-slate-800 rounded-xl overflow-hidden">
                   <div className="w-full flex items-center gap-3 px-4 py-3">
                     <button onClick={() => expand(g)} className="flex-1 flex items-center gap-3 text-left min-w-0">
-                      <div className="text-[11px] text-slate-500 w-16 shrink-0" style={mono}>{g.time}</div>
+                      <div className="w-16 shrink-0 leading-tight" style={mono}>
+                        {g.dateLabel && <div className="text-[10px] text-slate-600 truncate">{g.dateLabel}</div>}
+                        <div className="text-[11px] text-slate-500">{g.time}</div>
+                      </div>
                       <div className="flex-1 min-w-0">
                         <div className="font-bold truncate">{g.away} <span className="text-slate-600">@</span> {g.home}</div>
                         {(g.status === "LIVE" || g.status === "FINAL") && g.homeScore != null
@@ -1717,17 +2001,43 @@ export default function NFLApp() {
           <div className="mt-3">
             <div className="flex items-center gap-2 flex-wrap mb-3">
               <input value={boardSearch} onChange={(e) => setBoardSearch(e.target.value)} placeholder="search player or team" className="bg-slate-950 border border-slate-700 rounded px-2.5 py-1.5 text-sm w-44 text-slate-100" />
-              <Sel compact label="sort" v={boardSort} opts={["ev_desc", "ev_asc", "edge_desc", "edge_asc", "proj_desc", "proj_asc"]} labels={{ ev_desc: "EV ↓", ev_asc: "EV ↑", edge_desc: "Edge ↓", edge_asc: "Edge ↑", proj_desc: "Projection ↓", proj_asc: "Projection ↑" }} onChange={setBoardSort} />
+              <Sel compact label="sort" v={boardSort} opts={["ev_desc", "ev_asc", "edge_desc", "edge_asc", "proj_desc", "proj_asc", "delta_desc", "delta_asc"]} labels={{ ev_desc: "EV ↓", ev_asc: "EV ↑", edge_desc: "Edge ↓", edge_asc: "Edge ↑", proj_desc: "Projection ↓", proj_asc: "Projection ↑", delta_desc: "Proj Δ ↓", delta_asc: "Proj Δ ↑" }} onChange={setBoardSort} />
               <Sel compact label="market" v={classFilter} opts={["all", "props", "lines"]} labels={{ all: "All markets", props: "Player props", lines: "Game lines" }} onChange={setClassFilter} />
               <Sel compact label="category" v={catFilter} opts={["all", ...STAT_ORDER]} labels={{ all: "All categories" }} onChange={setCatFilter} />
               <Sel compact label="game" v={gameFilter} opts={["all", ...boardGames.map((g) => g.pk)]} labels={{ all: "All games", ...Object.fromEntries(boardGames.map((g) => [g.pk, g.label])) }} onChange={setGameFilter} />
               <Sel compact label="side" v={sideFilter} opts={["all", "over", "under", "home", "away"]} labels={{ all: "Both" }} onChange={setSideFilter} />
-              <NumIn label="min edge %" v={minEdge} onChange={setMinEdge} placeholder="e.g. 4" />
-              <NumIn label="min model %" v={minModel} onChange={setMinModel} placeholder="e.g. 55" />
-              {filtersActive && <button onClick={clearFilters} className="text-[11px] text-slate-400 hover:text-rose-300 border border-slate-700 rounded px-2.5 py-1.5">clear</button>}
+              {(() => { const n = [minEdge, minModel, minOdds, maxOdds, minDelta, maxDelta].filter((x) => x !== "").length + (dirAligned ? 1 : 0); return (
+                <button onClick={() => setShowMoreBoard((s) => !s)} className={`text-xs rounded px-2.5 py-1.5 border ${showMoreBoard || n ? "border-emerald-700 text-emerald-300" : "border-slate-700 text-slate-400 hover:text-slate-200"}`}>filters{n ? ` (${n})` : ""} {showMoreBoard ? "▴" : "▾"}</button>
+              ); })()}
               <button onClick={() => setShowProjBar((s) => !s)} className={`text-xs rounded px-2.5 py-1.5 border ${showProjBar ? "border-sky-700 text-sky-300" : "border-slate-700 text-slate-500 hover:text-slate-300"}`} title="Toggle projection bar">proj bar {showProjBar ? "▪" : "▫"}</button>
+              {filtersActive && <button onClick={clearFilters} className="text-[11px] text-slate-400 hover:text-rose-300 border border-slate-700 rounded px-2.5 py-1.5">clear</button>}
               <div className="ml-auto text-[11px] text-slate-500" style={mono}>{Object.values(grouped).reduce((n, a) => n + a.length, 0)} plays</div>
             </div>
+            {showMoreBoard && (
+              <div className="flex items-end gap-3 flex-wrap mb-3 p-2.5 rounded-lg bg-slate-900/40 border border-slate-800">
+                <label className="text-xs text-slate-400 flex flex-col gap-1">min edge %
+                  <input value={minEdge} onChange={(e) => setMinEdge(e.target.value)} placeholder="any" inputMode="decimal" className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-20 text-slate-100" />
+                </label>
+                <label className="text-xs text-slate-400 flex flex-col gap-1">min model %
+                  <input value={minModel} onChange={(e) => setMinModel(e.target.value)} placeholder="65" inputMode="decimal" className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-20 text-slate-100" />
+                </label>
+                <label className="text-xs text-slate-400 flex flex-col gap-1">min proj Δ
+                  <input value={minDelta} onChange={(e) => setMinDelta(e.target.value)} placeholder="e.g. 0.5" inputMode="decimal" className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-20 text-slate-100" />
+                </label>
+                <label className="text-xs text-slate-400 flex flex-col gap-1">max proj Δ
+                  <input value={maxDelta} onChange={(e) => setMaxDelta(e.target.value)} placeholder="e.g. 5.0" inputMode="decimal" className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-20 text-slate-100" />
+                </label>
+                <label className="text-xs text-slate-400 flex flex-col gap-1">min odds
+                  <input value={minOdds} onChange={(e) => setMinOdds(e.target.value)} placeholder="-300" inputMode="numeric" className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-20 text-slate-100" />
+                </label>
+                <label className="text-xs text-slate-400 flex flex-col gap-1">max odds
+                  <input value={maxOdds} onChange={(e) => setMaxOdds(e.target.value)} placeholder="+300" inputMode="numeric" className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-20 text-slate-100" />
+                </label>
+                <label className="text-xs text-slate-400 flex flex-col gap-1">proj aligned
+                  <button onClick={() => setDirAligned((s) => !s)} className={`text-xs rounded px-3 py-1.5 border font-medium ${dirAligned ? "border-sky-600 bg-sky-950 text-sky-300" : "border-slate-700 text-slate-500 hover:text-slate-300"}`} title="Only show plays where proj direction agrees with the bet side (proj > line for overs, proj < line for unders)">{dirAligned ? "on" : "off"}</button>
+                </label>
+              </div>
+            )}
             {boardEntries.length === 0 ? (
               <div className="text-sm text-slate-500 py-10 text-center">No odds pulled yet. On the Slate tab, expand a game and tap <span className="text-sky-400">get odds</span> to load {BOOK_LABELS[book] || book} props here, ranked by EV/edge.</div>
             ) : Object.keys(grouped).length === 0 ? (
@@ -1821,12 +2131,29 @@ export default function NFLApp() {
               <Sel label="stake mode (new bets)" v={stakeMode} opts={["flat", "kelly"]} onChange={setStakeMode} compact />
               <button onClick={settleBets} className="bg-emerald-700 hover:bg-emerald-600 text-white font-bold text-xs rounded-lg px-3 py-1.5">Settle open bets</button>
               <button onClick={exportCSV} className="border border-slate-700 text-slate-300 hover:text-slate-100 text-xs rounded-lg px-3 py-1.5">Export CSV</button>
+              <button onClick={backupBets} disabled={myBets.length === 0} className="border border-slate-700 text-slate-300 hover:text-slate-100 disabled:opacity-40 text-xs rounded-lg px-3 py-1.5" title="Save a .json backup you can restore later or on another device">Backup</button>
+              <label className="border border-slate-700 text-slate-300 hover:text-slate-100 text-xs rounded-lg px-3 py-1.5 cursor-pointer" title="Restore bets from a .json backup">Restore
+                <input type="file" accept="application/json,.json" className="hidden" onChange={(e) => { restoreBets(e.target.files && e.target.files[0]); e.target.value = ""; }} />
+              </label>
               <button onClick={resetStats} className="border border-rose-900 text-rose-400 hover:text-rose-300 text-xs rounded-lg px-3 py-1.5">Clear all</button>
               {settleMsg ? <span className="text-[11px] text-slate-500">{settleMsg}</span> : null}
             </div>
+            {myBets.length > 0 && (
+              <div className="text-[11px] text-slate-400 mb-2 flex items-center gap-x-3 gap-y-1 flex-wrap">
+                <span>showing <b className="text-slate-200">{myBetsView.length}</b> of {myBets.length} bets</span>
+                {(() => {
+                  const set = myBetsView.filter((b) => b.status === "won" || b.status === "lost" || b.status === "push" || b.status === "void");
+                  if (!set.length) return null;
+                  const w = set.filter((b) => b.status === "won").length, l = set.filter((b) => b.status === "lost").length, p = set.filter((b) => b.status === "push").length;
+                  const net = set.reduce((s, b) => s + (profitUnits(b.status, Number(b.odds), b.units != null ? b.units : 1) || 0), 0);
+                  const wr = (w + l) ? (w / (w + l) * 100).toFixed(1) : "0.0";
+                  return <span>· settled in view: <b className="text-slate-200">{w}-{l}{p ? `-${p}` : ""}</b> ({wr}%) · net <b className={net >= 0 ? "text-emerald-400" : "text-rose-400"}>{net >= 0 ? "+" : ""}{net.toFixed(2)}u</b></span>;
+                })()}
+              </div>
+            )}
             <div className="space-y-2">
               {myBetsView.map((b) => <MyBetRow key={b.key} b={b} onOdds={updateBetOdds} onUnits={updateBetUnits} onRemove={removeBet} />)}
-              {!myBetsView.length ? <div className="text-slate-500 text-sm py-10 text-center">No tracked bets yet — click "track" on a Board row.</div> : null}
+              {!myBetsView.length ? <div className="text-slate-500 text-sm py-10 text-center">{myBets.length ? "No bets match this filter." : "No tracked bets yet — click \"track\" on a Board row."}</div> : null}
             </div>
           </div>
         )}
@@ -1834,6 +2161,47 @@ export default function NFLApp() {
         {/* ---------------- STATS ---------------- */}
         {tab === "stats" && (
           <div className="mt-3">
+            {/* Board Log section — calibration dataset (every prop the model evaluated, not just tracked bets) */}
+            <div className="mb-4 p-3 rounded-lg bg-slate-900/60 border border-slate-800">
+              <div className="flex items-center justify-between flex-wrap gap-2">
+                <div>
+                  <div className="text-xs font-bold text-slate-300 mb-0.5">Board Snapshot Log</div>
+                  <div className="text-[11px] text-slate-500">
+                    Every prop shown on the board is logged here for calibration analysis — not just tracked bets.
+                    {boardLogCount > 0
+                      ? <span className="text-emerald-400 ml-1">{boardLogCount.toLocaleString()} candidates logged · model {MODEL_VERSION}</span>
+                      : <span className="text-slate-600 ml-1">No entries yet — load a game to start logging.</span>}
+                    {boardLogSettleMsg && <span className="block mt-0.5 text-sky-400">{boardLogSettleMsg}</span>}
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <button
+                    onClick={settleFullBoardLog}
+                    disabled={boardLogSettling || boardLogCount === 0}
+                    className="bg-emerald-700 hover:bg-emerald-600 disabled:opacity-40 text-white font-bold text-xs rounded-lg px-3 py-1.5"
+                    title="Grade every board candidate for finished games — uses the free ESPN summary endpoint, no Odds API credits"
+                  >
+                    {boardLogSettling ? "Settling…" : "Settle board log"}
+                  </button>
+                  <button
+                    onClick={exportBoardLogCSV}
+                    disabled={boardLogCount === 0}
+                    className="bg-sky-700 hover:bg-sky-600 disabled:opacity-40 text-white font-bold text-xs rounded-lg px-3 py-1.5"
+                    title="Export every board candidate with raw model probability, calibrated probability, edge, projection, and settlement result"
+                  >
+                    Export CSV
+                  </button>
+                  <button
+                    onClick={clearBoardLog}
+                    disabled={boardLogCount === 0}
+                    className="bg-slate-800 hover:bg-rose-800 disabled:opacity-40 border border-slate-700 text-slate-400 font-bold text-xs rounded-lg px-3 py-1.5"
+                    title="Permanently delete all board log entries (export first)"
+                  >
+                    Clear log
+                  </button>
+                </div>
+              </div>
+            </div>
             <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-4">
               <StatCard label="Record" v={`${stats.overall.w}-${stats.overall.l}-${stats.overall.ps}`} />
               <StatCard label="Win %" v={pct(stats.overall.winPct)} good={stats.overall.winPct > 0.5} />
@@ -1959,7 +2327,10 @@ function PlayerRow({ idx, p, onClick, gl }) {
   return (
     <div className="flex items-center gap-2 text-[12px] px-1 py-1 rounded hover:bg-slate-900/60">
       <span className="text-slate-600 w-4 shrink-0" style={mono}>{idx}</span>
-      <span className="w-9 text-[10px] text-slate-500 shrink-0" style={mono}>{p.pos}{p.depthRank && p.depthRank < 90 ? p.depthRank : ""}</span>
+      <span className="w-9 text-[10px] text-slate-500 shrink-0 inline-flex items-center gap-0.5" style={mono}>
+        {p.pos}{p.depthRank && p.depthRank < 90 ? p.depthRank : ""}
+        {p.depthConfirmed === false && <span className="text-amber-500" title="No confirmed depth chart for this team — pick order falls back to arbitrary roster listing, not a verified starter">?</span>}
+      </span>
       <button onClick={() => onClick(p)} className="flex-1 text-left truncate hover:text-sky-300 cursor-pointer" title="Open player analysis">{p.name}</button>
       <L4Hint gl={gl} pos={p.pos} />
       <InjBadge status={p.injuryStatus} />
@@ -1996,6 +2367,7 @@ function projMeta(proj, lineStr, side) {
 function MathPanel({ r }) {
   if (!r || !r.calc) return null;
   const c = r.calc;
+  const p = r.modelP, q = p != null ? 1 - p : null;
   const activeMults = (c.mults || []).filter(([, v]) => Math.abs(Number(v) - 1) > 0.0005);
   const chain = activeMults.length ? activeMults.map(([k, v]) => `${k} ${Number(v).toFixed(3)}`).join("  ×  ") : "neutral context";
   return (
@@ -2003,6 +2375,12 @@ function MathPanel({ r }) {
       <div><span className="text-slate-500">1 · base</span> &nbsp;{c.baseStr}</div>
       <div><span className="text-slate-500">2 · context</span> &nbsp;{chain}</div>
       <div><span className="text-slate-500">3 · projection</span> &nbsp;E[{r.type}] = <span className="text-sky-300">{(c.proj ?? r.proj) != null ? (c.proj ?? r.proj).toFixed(2) : "—"}</span> &nbsp;→ {c.dist}({c.params})</div>
+      {p != null && <div><span className="text-slate-500">4 · model</span> &nbsp;P({r.side} {r.line}) = <span className="text-emerald-300">{pct(p)}</span> → fair {r.fair}</div>}
+      {!isNaN(Number(r.odds)) && <div><span className="text-slate-500">5 · market</span> &nbsp;{fmtOdds(r.odds)} {r.devigged ? "(de-vigged" : "(raw"} {r.novig != null ? pct(r.novig) : "—"}{r.devigged ? ")" : ")"}, pays ${r.b != null ? r.b.toFixed(2) : "—"}/$1</div>}
+      {p != null && r.b != null && (
+        <div><span className="text-slate-500">6 · EV</span> &nbsp;= p·b − (1−p) = ({p.toFixed(3)})({r.b.toFixed(2)}) − ({q.toFixed(3)}) = <span className={r.ev >= 0 ? "text-emerald-300" : "text-rose-300"}>{r.ev >= 0 ? "+" : ""}{r.ev != null ? (r.ev * 100).toFixed(1) : "—"}%</span></div>
+      )}
+      {r.edge != null && <div className="text-slate-600">edge = model − {r.devigged ? "no-vig" : "implied"} = {r.edge >= 0 ? "+" : ""}{(r.edge * 100).toFixed(1)} pts</div>}
     </div>
   );
 }
@@ -2098,6 +2476,7 @@ function PlayerAnalysisPanel({ profile, ctx, projections, boardEntries, onTrack,
               <div className="text-2xl font-black tracking-tight">{p.name}</div>
               <div className="text-[11px] text-slate-500 mt-1" style={mono}>
                 {teamName || "—"} · {pos}{p.depthRank && p.depthRank < 90 ? p.depthRank : ""}
+                {p.depthConfirmed === false && <span className="text-amber-500 ml-1" title="No confirmed depth chart for this team — pick order falls back to arbitrary roster listing, not a verified starter">(no confirmed depth chart)</span>}
               </div>
             </div>
           </div>

@@ -1872,6 +1872,7 @@ export default function App() {
   const [minDelta, setMinDelta] = useState("");
   const [maxDelta, setMaxDelta] = useState("");
   const [dirAligned, setDirAligned] = useState(false); // only show plays where proj direction matches bet side
+  const [signalFilter, setSignalFilter] = useState("all"); // all | moderate | strong — delta gate signal tier
   const [coverage, setCoverage] = useState({});   // pk -> { game, book, returned[], matched[] }
   const [classFilter, setClassFilter] = useState("all");   // all | props | lines
   const [analysisQuery, setAnalysisQuery] = useState("");
@@ -2157,6 +2158,7 @@ export default function App() {
       if (!isNaN(minD) && getDelta(e) < minD) return false;
       if (!isNaN(maxD) && getDelta(e) > maxD) return false;
       if (dirAligned) { const d = getDelta(e); if (e.side === "over" && d <= 0) return false; if (e.side === "under" && d >= 0) return false; }
+      if (signalFilter !== "all") { const sig = getDeltaSignal(e.type, e.proj, e.line); if (signalFilter === "strong" && sig !== "strong") return false; if (signalFilter === "moderate" && sig == null) return false; }
       if (!matchesQuery(e, boardSearch)) return false;
       return true;
     });
@@ -2169,9 +2171,9 @@ export default function App() {
     const out = {};
     for (const t of STAT_ORDER) { const arr = f.filter((e) => e.type === t).sort(cmp); if (arr.length) out[t] = arr; }
     return out;
-  }, [boardEntries, boardSort, minEdge, minModel, catFilter, classFilter, gameFilter, sideFilter, minOdds, maxOdds, minDelta, maxDelta, dirAligned, boardSearch]);
-  const filtersActive = classFilter !== "all" || catFilter !== "all" || gameFilter !== "all" || sideFilter !== "all" || minEdge !== "" || minModel !== "" || minOdds !== "" || maxOdds !== "" || minDelta !== "" || maxDelta !== "" || dirAligned || boardSearch !== "";
-  function clearFilters() { setClassFilter("all"); setCatFilter("all"); setGameFilter("all"); setSideFilter("all"); setMinEdge(""); setMinModel(""); setMinOdds(""); setMaxOdds(""); setMinDelta(""); setMaxDelta(""); setDirAligned(false); setBoardSearch(""); }
+  }, [boardEntries, boardSort, minEdge, minModel, catFilter, classFilter, gameFilter, sideFilter, minOdds, maxOdds, minDelta, maxDelta, dirAligned, signalFilter, boardSearch]);
+  const filtersActive = classFilter !== "all" || catFilter !== "all" || gameFilter !== "all" || sideFilter !== "all" || minEdge !== "" || minModel !== "" || minOdds !== "" || maxOdds !== "" || minDelta !== "" || maxDelta !== "" || dirAligned || signalFilter !== "all" || boardSearch !== "";
+  function clearFilters() { setClassFilter("all"); setCatFilter("all"); setGameFilter("all"); setSideFilter("all"); setMinEdge(""); setMinModel(""); setMinOdds(""); setMaxOdds(""); setMinDelta(""); setMaxDelta(""); setDirAligned(false); setSignalFilter("all"); setBoardSearch(""); }
 
   /* ---- my bets ---- */
   function trackBet(e) {
@@ -2684,7 +2686,7 @@ export default function App() {
               <Sel compact label="category" v={catFilter} opts={["all", ...CATEGORY_ORDER]} labels={{ all: "All categories" }} onChange={setCatFilter} />
               <Sel compact label="game" v={gameFilter} opts={["all", ...boardGames.map((x) => x.pk)]} labels={{ all: "All games", ...Object.fromEntries(boardGames.map((x) => [x.pk, x.label])) }} onChange={setGameFilter} />
               <Sel compact label="side" v={sideFilter} opts={["all", "over", "under"]} labels={{ all: "Both", over: "Over", under: "Under" }} onChange={setSideFilter} />
-              {(() => { const n = [minEdge, minModel, minOdds, maxOdds, minDelta, maxDelta].filter((x) => x !== "").length + (dirAligned ? 1 : 0); return (
+              {(() => { const n = [minEdge, minModel, minOdds, maxOdds, minDelta, maxDelta].filter((x) => x !== "").length + (dirAligned ? 1 : 0) + (signalFilter !== "all" ? 1 : 0); return (
                 <button onClick={() => setShowMoreBoard((s) => !s)} className={`text-xs rounded px-2.5 py-1.5 border ${showMoreBoard || n ? "border-emerald-700 text-emerald-300" : "border-slate-700 text-slate-400 hover:text-slate-200"}`}>filters{n ? ` (${n})` : ""} {showMoreBoard ? "▴" : "▾"}</button>
               ); })()}
               <button onClick={() => setShowProjBar((s) => !s)} className={`text-xs rounded px-2.5 py-1.5 border ${showProjBar ? "border-sky-700 text-sky-300" : "border-slate-700 text-slate-500 hover:text-slate-300"}`} title="Toggle projection bar">proj bar {showProjBar ? "▪" : "▫"}</button>
@@ -2713,6 +2715,13 @@ export default function App() {
                 </label>
                 <label className="text-xs text-slate-400 flex flex-col gap-1">proj aligned
                   <button onClick={() => setDirAligned((s) => !s)} className={`text-xs rounded px-3 py-1.5 border font-medium ${dirAligned ? "border-sky-600 bg-sky-950 text-sky-300" : "border-slate-700 text-slate-500 hover:text-slate-300"}`} title="Only show plays where proj direction agrees with the bet side (proj > line for overs, proj < line for unders)">{dirAligned ? "on" : "off"}</button>
+                </label>
+                <label className="text-xs text-slate-400 flex flex-col gap-1">signal
+                  <div className="flex gap-1">
+                    {(["all", "moderate", "strong"] as const).map((v) => (
+                      <button key={v} onClick={() => setSignalFilter(v)} className={`text-xs rounded px-2 py-1.5 border font-medium ${signalFilter === v ? (v === "strong" ? "border-emerald-600 bg-emerald-950 text-emerald-300" : v === "moderate" ? "border-yellow-600 bg-yellow-950 text-yellow-300" : "border-sky-600 bg-sky-950 text-sky-300") : "border-slate-700 text-slate-500 hover:text-slate-300"}`}>{v === "all" ? "all" : v === "moderate" ? "🟡 mod+" : "🟢 strong"}</button>
+                    ))}
+                  </div>
                 </label>
               </div>
             )}
@@ -3604,6 +3613,23 @@ function projMeta(proj, lineStr, side) {
   return { delta, color, barColor, linePct, projPct };
 }
 
+// Delta gate signal indicator (Option B — visual dot on board row).
+// Returns "strong" | "moderate" | null based on category-specific thresholds derived from Sep 2-7 data.
+// TB / H+R+RBI: |Δ| thresholds (both directions meaningful). Hits / K: direction-only (positive delta only).
+// Outs, HR, game lines omitted — delta signal unreliable or inverted for those categories.
+function getDeltaSignal(type, proj, line) {
+  if (proj == null || line == null) return null;
+  const lineNum = parseFloat(line);
+  if (isNaN(lineNum)) return null;
+  const delta = proj - lineNum;
+  const abs = Math.abs(delta);
+  if (type === "Total Bases") return abs >= 1.0 ? "strong" : abs >= 0.75 ? "moderate" : null;
+  if (type === "H+R+RBI")     return abs >= 1.0 ? "strong" : abs >= 0.75 ? "moderate" : null;
+  if (type === "Hits")        return delta > 0.5 ? "strong" : delta > 0 ? "moderate" : null;
+  if (type === "Strikeouts")  return delta > 0 ? "moderate" : null; // no strong tier — direction only
+  return null;
+}
+
 function BoardRow({ e, tracked, onTrack, showProjBar = true }) {
   const [show, setShow] = useState(false);
   const evGood = e.ev >= 0;
@@ -3616,6 +3642,7 @@ function BoardRow({ e, tracked, onTrack, showProjBar = true }) {
           <div className="text-[11px] text-slate-400" style={mono}>
             {e.side} {e.line} {e.type} @ {fmtOdds(e.odds)} · <span className="text-sky-300">proj {e.proj != null ? e.proj.toFixed(2) : "—"}</span>
             {pm && <span className={`ml-1.5 font-bold ${pm.color}`}>{pm.delta >= 0 ? "+" : "−"}{Math.abs(pm.delta).toFixed(2)}</span>}
+            {(() => { const sig = getDeltaSignal(e.type, e.proj, e.line); return sig ? <span className={`ml-1 ${sig === "strong" ? "text-emerald-400" : "text-yellow-400"}`}>●</span> : null; })()}
           </div>
         </div>
         <div className="text-right text-[11px]" style={mono}>
