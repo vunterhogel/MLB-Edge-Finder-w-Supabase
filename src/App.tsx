@@ -1842,6 +1842,16 @@ function ScoreLine({ g }) {
 export default function App() {
   const todayStr = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; };
   const [date, setDate] = useState(todayStr());
+  // ◂/▸ day-step + "today" shortcut (ported from the NBA Edge Finder's date nav) — shifts by
+  // calendar day using Date's own rollover so month/year boundaries are handled for free.
+  function shiftDate(days) {
+    setDate((cur) => {
+      const [y, m, d] = cur.split("-").map(Number);
+      const nd = new Date(y, (m || 1) - 1, d || 1);
+      nd.setDate(nd.getDate() + days);
+      return `${nd.getFullYear()}-${String(nd.getMonth() + 1).padStart(2, "0")}-${String(nd.getDate()).padStart(2, "0")}`;
+    });
+  }
   const season = date.slice(0, 4);
   const [games, setGames] = useState([]);
   const [loading, setLoading] = useState(false);
@@ -2566,14 +2576,19 @@ export default function App() {
         <header className="pt-6 pb-3 sticky top-0 bg-slate-950 z-20 border-b border-slate-800">
           <div className="flex items-end justify-between flex-wrap gap-3">
             <div>
-              <h1 className="text-2xl font-black tracking-tight">MLB <span className="text-emerald-400">EDGE</span> FINDER</h1>
+              <h1 className="text-2xl font-black tracking-tight">⚾ MLB <span className="text-emerald-400">EDGE</span> FINDER</h1>
               <p className="text-[11px] text-slate-500 mt-0.5" style={mono}>live odds · de-vigged edge · Monte-Carlo props</p>
             </div>
             <div className="flex items-center gap-2 flex-wrap">
+              <div className="flex items-center gap-1">
+                <button onClick={() => shiftDate(-1)} className="bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-sm hover:bg-slate-800">◂</button>
+                <input type="date" value={date} onChange={(e) => setDate(e.target.value)} className="bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-sm text-slate-100" />
+                <button onClick={() => shiftDate(1)} className="bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-sm hover:bg-slate-800">▸</button>
+                <button onClick={() => setDate(todayStr())} className="bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs hover:bg-slate-800 text-slate-400">today</button>
+              </div>
               <select value={book} onChange={(e) => setBook(e.target.value)} className="bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-sm">
                 {BOOKS.map((b) => <option key={b.key} value={b.key}>{b.label}</option>)}
               </select>
-              <input type="date" value={date} onChange={(e) => setDate(e.target.value)} className="bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-sm" />
               <button onClick={() => loadSchedule(date)} className="bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-sm rounded-lg px-3 py-1.5">{loading ? "…" : "Refresh"}</button>
             </div>
           </div>

@@ -760,7 +760,22 @@ async function fetchEventOdds(sportKey, eventId, book) {
   const data = await r.json();
   return { data, remaining: remaining != null ? +remaining : null };
 }
+// Match by NICKNAME (e.g. "clippers", "lakers"), not full display-name substring. ESPN's
+// displayName and The Odds API's home_team/away_team don't always agree on the CITY half for
+// NBA specifically — "LA Clippers" vs "Los Angeles Clippers" is the classic case (both teams
+// share the "LA"/"Los Angeles" market with the Lakers, so this isn't a hypothetical edge case).
+// A full-string "includes" match silently fails there even though the game is obviously the
+// same one; anchoring on the nickname (which both sources always agree on) is robust to any
+// city-name formatting difference. Falls back to the old full-name substring match if a team
+// id doesn't resolve to our TEAMS table for some reason.
+function nickOf(teamId, fallbackFullName) {
+  const t = TEAMS[teamId];
+  return normName(t ? t.name : fallbackFullName);
+}
 function matchEvent(events, g) {
+  const hNick = nickOf(g.homeId, g.homeName), aNick = nickOf(g.awayId, g.awayName);
+  const byNick = (events || []).find((e) => hNick && aNick && normName(e.home_team).endsWith(hNick) && normName(e.away_team).endsWith(aNick));
+  if (byNick) return byNick;
   const hn = normName(g.homeName), an = normName(g.awayName);
   return (events || []).find((e) => normName(e.home_team).includes(hn) && normName(e.away_team).includes(an));
 }
@@ -788,18 +803,24 @@ function parseEventOdds(data, bookKey) {
 function parseGameOdds(data, bookKey, g) {
   const bm = (data.bookmakers || []).find((b) => b.key === bookKey) || (data.bookmakers || [])[0];
   if (!bm) return {};
+  // nickname-anchored match, same reasoning as matchEvent above — an outcome named "LA
+  // Clippers" needs to resolve to our home/away side even when g.homeName is ESPN's
+  // "Los Angeles Clippers" (or vice versa).
+  const hNick = nickOf(g.homeId, g.homeName), aNick = nickOf(g.awayId, g.awayName);
   const hn = normName(g.homeName), an = normName(g.awayName);
+  const isHome = (nm) => (hNick && nm.endsWith(hNick)) || (hn && nm.includes(hn));
+  const isAway = (nm) => (aNick && nm.endsWith(aNick)) || (an && nm.includes(an));
   const out = {};
   for (const mk of bm.markets || []) {
     if (mk.key === "h2h") {
       out.h2h = {};
-      for (const o of mk.outcomes || []) { const nm = normName(o.name); if (hn && nm.includes(hn)) out.h2h.home = o.price; else if (an && nm.includes(an)) out.h2h.away = o.price; }
+      for (const o of mk.outcomes || []) { const nm = normName(o.name); if (isHome(nm)) out.h2h.home = o.price; else if (isAway(nm)) out.h2h.away = o.price; }
     } else if (mk.key === "totals") {
       out.totals = {};
       for (const o of mk.outcomes || []) { const s = (o.name || "").toLowerCase(); if (o.point != null) out.totals.point = o.point; if (s === "over") out.totals.over = o.price; else if (s === "under") out.totals.under = o.price; }
     } else if (mk.key === "spreads") {
       out.spreads = {};
-      for (const o of mk.outcomes || []) { const nm = normName(o.name); if (hn && nm.includes(hn)) { out.spreads.homePoint = o.point; out.spreads.home = o.price; } else if (an && nm.includes(an)) { out.spreads.awayPoint = o.point; out.spreads.away = o.price; } }
+      for (const o of mk.outcomes || []) { const nm = normName(o.name); if (isHome(nm)) { out.spreads.homePoint = o.point; out.spreads.home = o.price; } else if (isAway(nm)) { out.spreads.awayPoint = o.point; out.spreads.away = o.price; } }
     }
   }
   return out;
