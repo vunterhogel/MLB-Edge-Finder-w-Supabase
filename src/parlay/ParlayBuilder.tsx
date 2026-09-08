@@ -47,12 +47,21 @@ const SPORTS = [
   { key: "nfl", label: "🏈 NFL" },
   { key: "nba", label: "🏀 NBA" },
 ];
+// Risk scale used to be a hard MINIMUM COMBINED WIN PROBABILITY floor. That breaks down as soon
+// as a parlay has more than 1-2 legs: combined probability is a PRODUCT of each leg's individual
+// probability, so even a great 3-leg combo of genuine +EV longshots (say ~11% each) multiplies
+// down to ~0.1% combined — nowhere close to even the loosest floor — and got silently thrown
+// away despite being exactly the kind of longshot parlay a "Longshot" risk setting should surface.
+// EV, unlike probability, does NOT collapse toward zero as legs multiply (a real edge on each leg
+// compounds into a real, often LARGER, combined edge), so it's the correct universal floor: any
+// combo with combined EV <= 0 is excluded (never recommend a -EV parlay) regardless of risk level.
+// Risk level instead controls how the (always +EV) survivors are RANKED — never what's excluded.
 const RISK_LEVELS = [
-  { level: 1, label: "Very Safe", floor: 0.30 },
-  { level: 2, label: "Safe", floor: 0.20 },
-  { level: 3, label: "Balanced", floor: 0.12 },
-  { level: 4, label: "Aggressive", floor: 0.06 },
-  { level: 5, label: "Longshot", floor: 0.02 },
+  { level: 1, label: "Very Safe", sort: "prob", hint: "ranks by highest combined win probability" },
+  { level: 2, label: "Safe", sort: "prob", hint: "ranks by highest combined win probability" },
+  { level: 3, label: "Balanced", sort: "ev", hint: "ranks by highest combined EV" },
+  { level: 4, label: "Aggressive", sort: "payout", hint: "ranks by highest combined payout" },
+  { level: 5, label: "Longshot", sort: "payout", hint: "ranks by highest combined payout" },
 ];
 
 /* ---------------------- CSV parsing (Board Log export format) ---------------------- */
@@ -330,15 +339,30 @@ export default function ParlayBuilder() {
 
   function generate() {
     const capped = filteredPool.slice(0, Math.max(2, Number(poolCap) || 25));
-    if (capped.length < Number(minLegs)) { setGenMsg(`Not enough legs in the filtered pool (have ${capped.length}, need ${minLegs}). Loosen filters or raise pool size.`); setGenerated([]); return; }
+    if (capped.length < Number(minLegs)) {
+      setGenMsg(`Not enough legs in the filtered pool (have ${capped.length}, need at least ${minLegs}). Loosen the pool filters above, or raise "pool size (top edge)".`);
+      setGenerated([]); return;
+    }
     const combos = generateCombos(capped, Number(minLegs), Number(maxLegs), allowSGP, Number(maxPerGame) || 2);
-    const floor = RISK_LEVELS[riskLevel - 1].floor;
+    if (combos.length === 0) {
+      setGenMsg(`No valid ${minLegs}${maxLegs !== minLegs ? `–${maxLegs}` : ""}-leg combination exists among these ${capped.length} pooled legs${allowSGP ? ` once "max legs / game" (${maxPerGame || 2}) is applied` : " without allowing same-game legs"}. Try: raising pool size, lowering legs:min, or turning on "allow same-game legs (SGP)".`);
+      setGenerated([]); return;
+    }
     const scored = combos.map((idxs) => {
       const legs = idxs.map((i) => capped[i]);
       const c = combineLegs(legs);
       return { legs, ...c };
-    }).filter((c) => c.modelP >= floor);
-    scored.sort((a, b) => (b.ev - a.ev) || (b.edge - a.edge));
+    }).filter((c) => c.ev > 0); // the only hard bar: never surface a net negative-EV parlay
+    if (scored.length === 0) {
+      setGenMsg(`Explored ${combos.length.toLocaleString()} combination(s) from ${capped.length} pooled legs, but none were net positive-EV once combined — each leg's edge didn't survive being multiplied together (this happens when legs' edges are thin or partly offsetting). Try raising "min edge %"/"min EV %" on the pool filters so only stronger legs feed the generator, or reduce legs:max.`);
+      setGenerated([]); return;
+    }
+    const mode = RISK_LEVELS[riskLevel - 1].sort;
+    scored.sort((a, b) => {
+      if (mode === "prob") return (b.modelP - a.modelP) || (b.ev - a.ev);
+      if (mode === "payout") return (b.decimal - a.decimal) || (b.ev - a.ev);
+      return (b.ev - a.ev) || (b.edge - a.edge);
+    });
     const wantN = Number(numResults) || 10;
     let results;
     if (allowDuplicateLegs) {
@@ -353,9 +377,10 @@ export default function ParlayBuilder() {
         results.push(c);
         for (const k of keys) usedLegs.add(k);
       }
+      if (results.length === 0) results = scored.slice(0, wantN); // every +EV combo overlapped — fall back rather than show nothing
     }
     setGenerated(results);
-    setGenMsg(`Explored ${combos.length.toLocaleString()} combination(s) from ${capped.length} pooled legs — showing ${results.length}${allowDuplicateLegs ? "" : " leg-independent"} parlay(s) by EV (min combined win prob ${fmtPct(floor, 0)})${allowDuplicateLegs ? "" : ". Turn on \"allow duplicate legs\" to instead see the pure top-EV list, which often reuses the same standout leg(s)."}`);
+    setGenMsg(`Explored ${combos.length.toLocaleString()} combination(s) from ${capped.length} pooled legs, ${scored.length.toLocaleString()} net +EV — showing ${results.length}${allowDuplicateLegs ? "" : " leg-independent"} parlay(s), ${RISK_LEVELS[riskLevel - 1].hint} (risk: ${RISK_LEVELS[riskLevel - 1].label}).`);
   }
 
   /* ---- tracked parlays ---- */
@@ -583,7 +608,7 @@ export default function ParlayBuilder() {
               <label className="text-xs text-slate-400 flex flex-col gap-1">legs: max
                 <input type="number" min={2} max={10} value={maxLegs} onChange={(e) => setMaxLegs(e.target.value)} onWheel={(e) => e.currentTarget.blur()} className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-16" />
               </label>
-              <label className="text-xs text-slate-400 flex flex-col gap-1 w-44">risk scale: <span className="text-slate-200 font-bold">{RISK_LEVELS[riskLevel - 1].label}</span>
+              <label className="text-xs text-slate-400 flex flex-col gap-1 w-48" title="Every result is already required to be net positive-EV — risk scale never throws results away, it only changes which +EV combos rank highest: Safe surfaces the highest win-probability combos, Longshot surfaces the highest-payout combos, Balanced ranks by raw EV.">risk scale: <span className="text-slate-200 font-bold">{RISK_LEVELS[riskLevel - 1].label}</span> <span className="text-slate-600 normal-case font-normal">({RISK_LEVELS[riskLevel - 1].hint})</span>
                 <input type="range" min={1} max={5} value={riskLevel} onChange={(e) => setRiskLevel(Number(e.target.value))} />
               </label>
               <label className="text-xs text-slate-400 flex items-center gap-1.5 pb-1.5">
