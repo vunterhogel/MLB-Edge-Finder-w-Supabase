@@ -158,7 +158,25 @@ function parlayProfitUnits(status, legs, units = 1) {
 }
 
 /* ---------------------- combinatorial generator (bounded) ---------------------- */
-function generateCombos(pool, minLegs, maxLegs, allowSGP, maxPerGame, budgetMs = 1800, capResults = 250000) {
+function nCk(n, k) {
+  if (k < 0 || k > n) return 0;
+  k = Math.min(k, n - k);
+  let r = 1;
+  for (let i = 0; i < k; i++) r = (r * (n - i)) / (i + 1);
+  return r;
+}
+function totalCombosCount(n, minLegs, maxLegs) {
+  let total = 0;
+  for (let k = minLegs; k <= maxLegs; k++) total += nCk(n, k);
+  return total;
+}
+// Exact enumeration, in lexicographic order (pool sorted best-edge-first). Complete and
+// deterministic, but its DFS order is heavily biased toward combos containing the pool's
+// earliest (highest-edge) legs — fine when the full space fits under the cap, but if the cap
+// cuts exploration short, EVERY explored combo ends up sharing the same top 1-2 legs, which
+// then collapses the leg-diversity dedupe down to just 1 result. Only used when the full
+// combination space actually fits under capResults; larger spaces use random sampling instead.
+function exactCombos(pool, minLegs, maxLegs, allowSGP, maxPerGame, budgetMs, capResults) {
   const n = pool.length;
   const out = [];
   const start = Date.now();
@@ -186,6 +204,59 @@ function generateCombos(pool, minLegs, maxLegs, allowSGP, maxPerGame, budgetMs =
   }
   backtrack(0, []);
   return out;
+}
+function shuffledIndices(n) {
+  const arr = Array.from({ length: n }, (_, i) => i);
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+// Random sampling: draws combos from a random leg order each attempt, so — unlike the exact
+// DFS — the sample spreads across the WHOLE pool instead of getting stuck in the lexicographic
+// "starts with leg 0" corner. This is what makes the pool-of-200 case work: with millions of
+// possible combos, an exact search would never get past combos containing the single strongest
+// leg before its budget ran out, starving the diversity dedupe of any alternative to show.
+function sampleCombos(pool, minLegs, maxLegs, allowSGP, maxPerGame, budgetMs, targetSamples) {
+  const n = pool.length;
+  const out = [];
+  const seen = new Set();
+  const start = Date.now();
+  let attempts = 0;
+  const maxAttempts = Math.max(targetSamples * 50, 50000);
+  while (out.length < targetSamples && attempts < maxAttempts) {
+    attempts++;
+    if (attempts % 512 === 0 && Date.now() - start > budgetMs) break;
+    const k = minLegs + Math.floor(Math.random() * (maxLegs - minLegs + 1));
+    const order = shuffledIndices(n);
+    const idxs = [];
+    const gameCounts = new Map();
+    for (const i of order) {
+      if (idxs.length >= k) break;
+      const gk = pool[i].gameKey;
+      const cnt = gameCounts.get(gk) || 0;
+      if (!allowSGP && cnt >= 1) continue;
+      if (allowSGP && cnt >= maxPerGame) continue;
+      idxs.push(i);
+      gameCounts.set(gk, cnt + 1);
+    }
+    if (idxs.length < k) continue; // constraints too tight for this draw — retry
+    idxs.sort((a, b) => a - b);
+    const key = idxs.join(",");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(idxs);
+  }
+  return out;
+}
+function generateCombos(pool, minLegs, maxLegs, allowSGP, maxPerGame, budgetMs = 1800, capResults = 250000) {
+  const n = pool.length;
+  const exact = totalCombosCount(n, minLegs, maxLegs) <= capResults;
+  const combos = exact
+    ? exactCombos(pool, minLegs, maxLegs, allowSGP, maxPerGame, budgetMs, capResults)
+    : sampleCombos(pool, minLegs, maxLegs, allowSGP, maxPerGame, budgetMs, Math.min(capResults, 60000));
+  return { combos, exact };
 }
 
 /* ---------------------- persistence ---------------------- */
@@ -343,7 +414,7 @@ export default function ParlayBuilder() {
       setGenMsg(`Not enough legs in the filtered pool (have ${capped.length}, need at least ${minLegs}). Loosen the pool filters above, or raise "pool size (top edge)".`);
       setGenerated([]); return;
     }
-    const combos = generateCombos(capped, Number(minLegs), Number(maxLegs), allowSGP, Number(maxPerGame) || 2);
+    const { combos, exact } = generateCombos(capped, Number(minLegs), Number(maxLegs), allowSGP, Number(maxPerGame) || 2);
     if (combos.length === 0) {
       setGenMsg(`No valid ${minLegs}${maxLegs !== minLegs ? `–${maxLegs}` : ""}-leg combination exists among these ${capped.length} pooled legs${allowSGP ? ` once "max legs / game" (${maxPerGame || 2}) is applied` : " without allowing same-game legs"}. Try: raising pool size, lowering legs:min, or turning on "allow same-game legs (SGP)".`);
       setGenerated([]); return;
@@ -364,7 +435,7 @@ export default function ParlayBuilder() {
       return (b.ev - a.ev) || (b.edge - a.edge);
     });
     const wantN = Number(numResults) || 10;
-    let results;
+    let results, diversityStarved = false;
     if (allowDuplicateLegs) {
       results = scored.slice(0, wantN);
     } else {
@@ -377,10 +448,20 @@ export default function ParlayBuilder() {
         results.push(c);
         for (const k of keys) usedLegs.add(k);
       }
-      if (results.length === 0) results = scored.slice(0, wantN); // every +EV combo overlapped — fall back rather than show nothing
+      if (results.length < wantN && results.length < scored.length) {
+        // Couldn't find enough leg-disjoint combos among the scored candidates — top up with the
+        // next-best overlapping ones rather than quietly showing fewer than asked for.
+        diversityStarved = results.length < Math.min(wantN, 3);
+        for (const c of scored) {
+          if (results.length >= wantN) break;
+          if (!results.includes(c)) results.push(c);
+        }
+      }
     }
     setGenerated(results);
-    setGenMsg(`Explored ${combos.length.toLocaleString()} combination(s) from ${capped.length} pooled legs, ${scored.length.toLocaleString()} net +EV — showing ${results.length}${allowDuplicateLegs ? "" : " leg-independent"} parlay(s), ${RISK_LEVELS[riskLevel - 1].hint} (risk: ${RISK_LEVELS[riskLevel - 1].label}).`);
+    const spaceNote = exact ? "" : " (sampled — the full combination space was too large to enumerate exactly, so this is a random sample across the whole pool rather than a complete search)";
+    const starvedNote = diversityStarved ? " Very few leg-disjoint options were found, so some results below still share legs — a standout leg or two may be dominating this pool; consider excluding it manually to force more variety." : "";
+    setGenMsg(`Explored ${combos.length.toLocaleString()} combination(s)${spaceNote} from ${capped.length} pooled legs, ${scored.length.toLocaleString()} net +EV — showing ${results.length} parlay(s)${allowDuplicateLegs ? "" : ", leg-diversity preferred"}, ${RISK_LEVELS[riskLevel - 1].hint} (risk: ${RISK_LEVELS[riskLevel - 1].label}).${starvedNote}`);
   }
 
   /* ---- tracked parlays ---- */
