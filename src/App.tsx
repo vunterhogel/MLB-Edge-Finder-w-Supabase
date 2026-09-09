@@ -1702,6 +1702,21 @@ async function appendBoardLog(entries, modelVersion, date) {
   const existingIds = new Set(existing.map((e) => e.logId));
   const now = new Date().toISOString();
   const cutoffMs = Date.now() - BOARD_LOG_RETENTION_DAYS * 86400000;
+  const existingById = new Map(existing.map((e) => [e.logId, e]));
+
+  // logId is deterministic (date + game + player + market + line + side, no timestamp) BY
+  // DESIGN — once a bet is logged today, its model%/novig/edge/EV snapshot is meant to freeze
+  // at first-seen, not get overwritten on every board refresh (that's what makes it useful for
+  // calibration/CLV research later). But that means a field added AFTER a bet was already
+  // logged today (gameTimeIso, added for the Parlay Builder's kickoff filter) can never reach
+  // an already-logged row through the normal "new row" path below — it'd just get silently
+  // deduped away forever. Backfill ONLY that kind of previously-missing metadata in place,
+  // never the frozen calibration numbers.
+  let backfilled = 0;
+  for (const e of entries) {
+    const already = existingById.get(`${date}|${e.id}`);
+    if (already && !already.gameTimeIso && e.gameTimeIso) { already.gameTimeIso = e.gameTimeIso; backfilled++; }
+  }
 
   const newRows = entries
     .filter((e) => e.modelP != null && e.novig != null)
@@ -1739,7 +1754,7 @@ async function appendBoardLog(entries, modelVersion, date) {
     })
     .filter((e) => !existingIds.has(e.logId));
 
-  if (!newRows.length) return;
+  if (!newRows.length) { if (backfilled) saveBoardLog(existing); return; }
 
   // Merge, apply retention window, enforce row cap
   const merged = [...existing, ...newRows]
@@ -1899,6 +1914,7 @@ export default function App() {
   const [boardSort, setBoardSort] = useState("ev_desc");
   const [minEdge, setMinEdge] = useState("");
   const [minModel, setMinModel] = useState("");
+  const [minEV, setMinEV] = useState("");
   const [catFilter, setCatFilter] = useState("all");
   const [boardSearch, setBoardSearch] = useState("");
   const [showMoreBoard, setShowMoreBoard] = useState(false);
@@ -2200,6 +2216,7 @@ export default function App() {
   const grouped = useMemo(() => {
     const minE = parseFloat(minEdge);
     const minM = parseFloat(minModel);
+    const minEv = parseFloat(minEV);
     const minB = minOdds === "" || isNaN(Number(minOdds)) ? null : amToB(Number(minOdds));
     const maxB = maxOdds === "" || isNaN(Number(maxOdds)) ? null : amToB(Number(maxOdds));
     const minD = parseFloat(minDelta);
@@ -2210,6 +2227,7 @@ export default function App() {
       if (e.modelP >= 0.999 || e.modelP <= 0.001) return false; // already-decided live prop / blowout line: price is stale + unbettable, edge is fake
       if (!isNaN(minE) && !(e.edge != null && e.edge * 100 >= minE)) return false;
       if (!isNaN(minM) && !(e.modelP * 100 >= minM)) return false;
+      if (!isNaN(minEv) && !(e.ev != null && e.ev * 100 >= minEv)) return false;
       if (catFilter !== "all" && e.type !== catFilter) return false;
       if (gameFilter !== "all" && String(e.gamePk) !== gameFilter) return false;
       if (sideFilter !== "all" && e.side !== sideFilter) return false;
@@ -2232,9 +2250,9 @@ export default function App() {
     const out = {};
     for (const t of STAT_ORDER) { const arr = f.filter((e) => e.type === t).sort(cmp); if (arr.length) out[t] = arr; }
     return out;
-  }, [boardEntries, boardSort, minEdge, minModel, catFilter, classFilter, gameFilter, sideFilter, minOdds, maxOdds, minDelta, maxDelta, dirAligned, signalFilter, boardSearch]);
-  const filtersActive = classFilter !== "all" || catFilter !== "all" || gameFilter !== "all" || sideFilter !== "all" || minEdge !== "" || minModel !== "" || minOdds !== "" || maxOdds !== "" || minDelta !== "" || maxDelta !== "" || dirAligned || signalFilter !== "all" || boardSearch !== "";
-  function clearFilters() { setClassFilter("all"); setCatFilter("all"); setGameFilter("all"); setSideFilter("all"); setMinEdge(""); setMinModel(""); setMinOdds(""); setMaxOdds(""); setMinDelta(""); setMaxDelta(""); setDirAligned(false); setSignalFilter("all"); setBoardSearch(""); }
+  }, [boardEntries, boardSort, minEdge, minModel, minEV, catFilter, classFilter, gameFilter, sideFilter, minOdds, maxOdds, minDelta, maxDelta, dirAligned, signalFilter, boardSearch]);
+  const filtersActive = classFilter !== "all" || catFilter !== "all" || gameFilter !== "all" || sideFilter !== "all" || minEdge !== "" || minModel !== "" || minEV !== "" || minOdds !== "" || maxOdds !== "" || minDelta !== "" || maxDelta !== "" || dirAligned || signalFilter !== "all" || boardSearch !== "";
+  function clearFilters() { setClassFilter("all"); setCatFilter("all"); setGameFilter("all"); setSideFilter("all"); setMinEdge(""); setMinModel(""); setMinEV(""); setMinOdds(""); setMaxOdds(""); setMinDelta(""); setMaxDelta(""); setDirAligned(false); setSignalFilter("all"); setBoardSearch(""); }
 
   /* ---- my bets ---- */
   function trackBet(e) {
@@ -2775,7 +2793,7 @@ export default function App() {
               <Sel compact label="category" v={catFilter} opts={["all", ...CATEGORY_ORDER]} labels={{ all: "All categories" }} onChange={setCatFilter} />
               <Sel compact label="game" v={gameFilter} opts={["all", ...boardGames.map((x) => x.pk)]} labels={{ all: "All games", ...Object.fromEntries(boardGames.map((x) => [x.pk, x.label])) }} onChange={setGameFilter} />
               <Sel compact label="side" v={sideFilter} opts={["all", "over", "under"]} labels={{ all: "Both", over: "Over", under: "Under" }} onChange={setSideFilter} />
-              {(() => { const n = [minEdge, minModel, minOdds, maxOdds, minDelta, maxDelta].filter((x) => x !== "").length + (dirAligned ? 1 : 0) + (signalFilter !== "all" ? 1 : 0); return (
+              {(() => { const n = [minEdge, minModel, minEV, minOdds, maxOdds, minDelta, maxDelta].filter((x) => x !== "").length + (dirAligned ? 1 : 0) + (signalFilter !== "all" ? 1 : 0); return (
                 <button onClick={() => setShowMoreBoard((s) => !s)} className={`text-xs rounded px-2.5 py-1.5 border ${showMoreBoard || n ? "border-emerald-700 text-emerald-300" : "border-slate-700 text-slate-400 hover:text-slate-200"}`}>filters{n ? ` (${n})` : ""} {showMoreBoard ? "▴" : "▾"}</button>
               ); })()}
               <button onClick={() => setShowProjBar((s) => !s)} className={`text-xs rounded px-2.5 py-1.5 border ${showProjBar ? "border-sky-700 text-sky-300" : "border-slate-700 text-slate-500 hover:text-slate-300"}`} title="Toggle projection bar">proj bar {showProjBar ? "▪" : "▫"}</button>
@@ -2794,6 +2812,9 @@ export default function App() {
                 </label>
                 <label className="text-xs text-slate-400 flex flex-col gap-1">min model %
                   <input value={minModel} onChange={(e) => setMinModel(e.target.value)} placeholder="65" inputMode="decimal" className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-20 text-slate-100" />
+                </label>
+                <label className="text-xs text-slate-400 flex flex-col gap-1">min EV %
+                  <input value={minEV} onChange={(e) => setMinEV(e.target.value)} placeholder="any" inputMode="decimal" className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-20 text-slate-100" />
                 </label>
                 <label className="text-xs text-slate-400 flex flex-col gap-1">min proj Δ
                   <input value={minDelta} onChange={(e) => setMinDelta(e.target.value)} placeholder="e.g. 0.5" inputMode="decimal" className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-20 text-slate-100" />

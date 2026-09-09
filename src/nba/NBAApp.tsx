@@ -199,6 +199,7 @@ function probabilityOver(family, line, side, seed, params) {
 
 /* ---------------------- odds + format (verbatim from MLB/NFL — sport-agnostic) ---------------------- */
 const impliedProb = (o) => (o < 0 ? -o / (-o + 100) : 100 / (o + 100));
+const amToB = (o) => (o > 0 ? o / 100 : 100 / -o); // American odds -> decimal payout-per-$1, for comparing across the +/- boundary
 const probToAmerican = (p) => { if (p <= 0 || p >= 1) return "—"; return p > 0.5 ? `-${Math.round((p / (1 - p)) * 100)}` : `+${Math.round(((1 - p) / p) * 100)}`; };
 const evPerUnit = (p, o) => { const b = o > 0 ? o / 100 : 100 / -o; return p * b - (1 - p); };
 // per-market calibration: DAY-1 PRIOR. No settled-bet history for basketball yet, so every
@@ -920,6 +921,16 @@ async function appendBoardLog(entries, modelVersion, dateKeyStr) {
   const existingIds = new Set(existing.map((e) => e.logId));
   const now = new Date().toISOString();
   const cutoffMs = Date.now() - BOARD_LOG_RETENTION_DAYS * 86400000;
+  // logId has no timestamp component (it's deterministic per date+bet), so a bet already
+  // logged today is deliberately frozen at its first-seen snapshot rather than overwritten
+  // on every refresh. That means a field added AFTER a bet was already logged (gameTimeIso)
+  // can never reach an already-logged row via the "new row" path — backfill just that field.
+  const existingById = new Map(existing.map((e) => [e.logId, e]));
+  let backfilled = 0;
+  for (const e of entries) {
+    const already = existingById.get(`${dateKeyStr}|${e.id}`);
+    if (already && !already.gameTimeIso && e.gameTimeIso) { already.gameTimeIso = e.gameTimeIso; backfilled++; }
+  }
   const newRows = entries.filter((e) => e.modelP != null && e.novig != null).map((e) => {
     const logId = `${dateKeyStr}|${e.id}`;
     return {
@@ -930,7 +941,7 @@ async function appendBoardLog(entries, modelVersion, dateKeyStr) {
       settled: false, actualStat: null, result: null,
     };
   }).filter((e) => !existingIds.has(e.logId));
-  if (!newRows.length) return;
+  if (!newRows.length) { if (backfilled) saveBoardLog(existing); return; }
   const merged = [...existing, ...newRows].filter((e) => { try { return Date.parse(e.loggedAt) >= cutoffMs; } catch { return true; } });
   saveBoardLog(merged.length > BOARD_LOG_MAX_ROWS ? merged.slice(-BOARD_LOG_MAX_ROWS) : merged);
 }
@@ -1054,6 +1065,7 @@ export default function NBAApp() {
   const [boardSort, setBoardSort] = useState("ev_desc");
   const [minEdge, setMinEdge] = useState("");
   const [minModel, setMinModel] = useState("");
+  const [minEV, setMinEV] = useState("");
   const [minOdds, setMinOdds] = useState("");
   const [maxOdds, setMaxOdds] = useState("");
   const [minDelta, setMinDelta] = useState("");
@@ -1074,15 +1086,33 @@ export default function NBAApp() {
   const [analysisErr, setAnalysisErr] = useState("");
   const [betStatusFilter, setBetStatusFilter] = useState("all");
   const [betSort, setBetSort] = useState("recent");
+  const [betDateFilter, setBetDateFilter] = useState("all"); // all | a specific YYYY-MM-DD
+  const [betGameFilters, setBetGameFilters] = useState<string[]>([]);   // [] = all; multi-select games
+  const [betTypeFilters, setBetTypeFilters] = useState<string[]>([]);   // [] = all; multi-select categories
+  const [betBookFilters, setBetBookFilters] = useState<string[]>([]);   // [] = all; multi-select sportsbooks
+  const [betSideFilter, setBetSideFilter] = useState("all");  // all | over | under | home | away
   const [betSearch, setBetSearch] = useState("");
+  const [showMoreBets, setShowMoreBets] = useState(false);
+  const [betMinModel, setBetMinModel] = useState("");
+  const [betMinEdge, setBetMinEdge] = useState("");
+  const [betMaxEdge, setBetMaxEdge] = useState("");
+  const [betMinOdds, setBetMinOdds] = useState("");
+  const [betMaxOdds, setBetMaxOdds] = useState("");
+  const [betMinDelta, setBetMinDelta] = useState("");
+  const [betMaxDelta, setBetMaxDelta] = useState("");
+  const [betDirAligned, setBetDirAligned] = useState(false);
   const [stakeMode, setStakeMode] = useState("flat");
   const [myBets, setMyBets] = useState(loadBets());
   const [settleMsg, setSettleMsg] = useState("");
+  const [lineMsg, setLineMsg] = useState("");
+  const [refreshingLines, setRefreshingLines] = useState(false);
   const eventsRef = useRef({ sportKey: null, events: null });
   const inflight = useRef(new Set());
 
   useEffect(() => { saveBets(myBets); }, [myBets]);
   useEffect(() => { void settleBoardLog(myBets); }, [myBets]);
+  // Clear game multi-select when date changes — previously selected games may belong to a different date.
+  useEffect(() => { setBetGameFilters([]); }, [betDateFilter]);
   useEffect(() => { boardLogReady.then((rows) => setBoardLogCount(rows.length)); }, []);
   useEffect(() => { if (credits != null) { try { localStorage.setItem(LS_CREDITS, String(credits)); } catch {} } }, [credits]);
 
@@ -1297,6 +1327,7 @@ export default function NBAApp() {
   const grouped = useMemo(() => {
     const minE = parseFloat(minEdge);
     const minM = parseFloat(minModel);
+    const minEv = parseFloat(minEV);
     const minO = parseFloat(minOdds);
     const maxO = parseFloat(maxOdds);
     const minD = parseFloat(minDelta);
@@ -1306,6 +1337,7 @@ export default function NBAApp() {
       if (e.modelP >= 0.999 || e.modelP <= 0.001) return false;
       if (!isNaN(minE) && !(e.edge != null && e.edge * 100 >= minE)) return false;
       if (!isNaN(minM) && !(e.modelP * 100 >= minM)) return false;
+      if (!isNaN(minEv) && !(e.ev != null && e.ev * 100 >= minEv)) return false;
       if (!isNaN(minO) && !(e.odds != null && e.odds >= minO)) return false;
       if (!isNaN(maxO) && !(e.odds != null && e.odds <= maxO)) return false;
       if (!isNaN(minD) && getDelta(e) < minD) return false;
@@ -1328,16 +1360,18 @@ export default function NBAApp() {
     const out = {};
     for (const t of STAT_ORDER) { const arr = f.filter((e) => e.type === t).sort(cmp); if (arr.length) out[t] = arr; }
     return out;
-  }, [boardEntries, boardSort, minEdge, minModel, minOdds, maxOdds, minDelta, maxDelta, dirAligned, catFilter, classFilter, gameFilter, sideFilter, boardSearch]);
-  const filtersActive = classFilter !== "all" || catFilter !== "all" || gameFilter !== "all" || sideFilter !== "all" || minEdge !== "" || minModel !== "" || minOdds !== "" || maxOdds !== "" || minDelta !== "" || maxDelta !== "" || dirAligned || boardSearch !== "";
-  function clearFilters() { setClassFilter("all"); setCatFilter("all"); setGameFilter("all"); setSideFilter("all"); setMinEdge(""); setMinModel(""); setMinOdds(""); setMaxOdds(""); setMinDelta(""); setMaxDelta(""); setDirAligned(false); setBoardSearch(""); }
+  }, [boardEntries, boardSort, minEdge, minModel, minEV, minOdds, maxOdds, minDelta, maxDelta, dirAligned, catFilter, classFilter, gameFilter, sideFilter, boardSearch]);
+  const filtersActive = classFilter !== "all" || catFilter !== "all" || gameFilter !== "all" || sideFilter !== "all" || minEdge !== "" || minModel !== "" || minEV !== "" || minOdds !== "" || maxOdds !== "" || minDelta !== "" || maxDelta !== "" || dirAligned || boardSearch !== "";
+  function clearFilters() { setClassFilter("all"); setCatFilter("all"); setGameFilter("all"); setSideFilter("all"); setMinEdge(""); setMinModel(""); setMinEV(""); setMinOdds(""); setMaxOdds(""); setMinDelta(""); setMaxDelta(""); setDirAligned(false); setBoardSearch(""); }
 
   function trackBet(e) {
     const exists = myBets.some((b) => b.key === e.id);
     if (exists) return;
     const sug = suggestedUnits(e.modelP, Number(e.odds));
     const units = stakeMode === "kelly" ? (sug > 0 ? sug : 1) : 1;
-    const rec = { key: e.id, date: dKey, gamePk: e.gamePk, game: e.game, playerId: e.playerId, name: e.name, type: e.type, line: e.line, side: e.side, odds: e.odds, book: e.book, modelP: e.modelP, proj: e.proj, novig: e.novig, units, suggested: sug, status: "open", actual: null };
+    const gtrk = games.find((x) => x.pk === e.gamePk);
+    const liveBet = !!((e.calc && e.calc.live) || (gtrk && gtrk.status === "LIVE")); // was the game in progress when placed?
+    const rec = { key: e.id, date: dKey, gamePk: e.gamePk, game: e.game, playerId: e.playerId, name: e.name, type: e.type, line: e.line, side: e.side, odds: e.odds, book: e.book, modelP: e.modelP, proj: e.proj, novig: e.novig, units, suggested: sug, status: "open", actual: null, live: liveBet };
     setMyBets((p) => [rec, ...p]);
   }
   function updateBetOdds(key, odds) { setMyBets((p) => p.map((b) => b.key === key ? { ...b, odds: odds === "" ? "" : Number(odds) } : b)); }
@@ -1446,6 +1480,48 @@ export default function NBAApp() {
     setBoardLogSettleMsg("");
   }
 
+  // pull the current market price for each open tracked bet (line movement / CLV). ~9 credits per game with open bets.
+  async function refreshLines() {
+    const open = myBets.filter((b) => b.status === "open" && b.book && b.book !== "manual");
+    if (!open.length) { setLineMsg("No open tracked bets with a book to refresh (manual bets have no book to pull)."); return; }
+    const byGame = {};
+    for (const b of open) { (byGame[b.gamePk] = byGame[b.gamePk] || []).push(b); }
+    setRefreshingLines(true); setLineMsg("Refreshing lines…");
+    try {
+      let events = eventsRef.current.sportKey === ODDS_SPORT ? eventsRef.current.events : null;
+      if (!events) { const ev = await fetchOddsEvents(ODDS_SPORT); events = ev.events || []; eventsRef.current = { sportKey: ODDS_SPORT, events }; if (ev.remaining != null) setCredits(ev.remaining); }
+      const updates = {}; let matched = 0, missed = 0, games_ = 0, frozen = 0;
+      const at = new Date().toISOString();
+      for (const pkStr in byGame) {
+        const bets = byGame[pkStr]; const pk = pkStr;
+        const g = games.find((x) => String(x.pk) === pk);
+        const ev = g ? matchEvent(events, g) : null;
+        if (!ev) { for (const b of bets) { updates[b.key] = { oddsCheckedAt: at, currentOdds: null, lineMissing: true }; missed++; } continue; }
+        // has tip-off passed? prefer the book's commence_time; fall back to slate status
+        const started = ev.commence_time ? (Date.parse(ev.commence_time) <= Date.now()) : (g && (g.status === "LIVE" || g.status === "FINAL"));
+        // pregame bets freeze at the closing line once the game starts (live re-prices aren't comparable). live bets keep updating.
+        for (const b of bets) { if (!b.live && started && b.currentOdds != null && !b.closing) { updates[b.key] = { closing: true, oddsCheckedAt: at }; frozen++; } }
+        const toPull = bets.filter((b) => b.live || !started);
+        if (!toPull.length) continue; // nothing to fetch for this game (all pregame bets are frozen) -> saves credits
+        // ONE fetch per game covering every book we track on it.
+        const books = [...new Set(toPull.map((b) => b.book))];
+        const res = await fetchEventOdds(ODDS_SPORT, ev.id, books.join(",")); games_++;
+        if (res.remaining != null) setCredits(res.remaining);
+        const parsed = {};
+        for (const bk of books) parsed[bk] = { rows: parseEventOdds(res.data, bk), gl: parseGameOdds(res.data, bk, g) };
+        for (const b of toPull) {
+          const p = parsed[b.book];
+          const cur = p ? matchCurrentOdds(b, p.rows, p.gl) : null;
+          if (cur != null) { updates[b.key] = { currentOdds: cur, oddsCheckedAt: at, lineMissing: false, closing: false }; matched++; }
+          else { updates[b.key] = { oddsCheckedAt: at, currentOdds: null, lineMissing: true }; missed++; }
+        }
+      }
+      setMyBets((prev) => prev.map((b) => updates[b.key] ? { ...b, ...updates[b.key] } : b));
+      setLineMsg(`Updated ${matched} line(s) across ${games_} game(s)${frozen ? ` · ${frozen} frozen at close (game started)` : ""}${missed ? ` · ${missed} not found (scratched, settled, or line moved off your number)` : ""}.`);
+    } catch (e) { setLineMsg(`Line refresh failed: ${String((e && e.message) || e)}`); }
+    setRefreshingLines(false);
+  }
+
   const myBetsView = useMemo(() => {
     let arr = myBets.map((b, i) => {
       const odds = Number(b.odds);
@@ -1455,19 +1531,55 @@ export default function NBAApp() {
       const ev = (modelP != null && !isNaN(odds)) ? evPerUnit(modelP, odds) : null;
       const units = b.units != null ? b.units : 1;
       const suggested = b.suggested != null ? b.suggested : suggestedUnits(modelP, odds);
-      return { ...b, imp, edge, ev, units, suggested, _i: i };
+      // CLV: positive = market moved toward your side since you bet (your side's price shortened) = you beat the line
+      const clv = (b.currentOdds != null && !isNaN(odds)) ? impliedProb(b.currentOdds) - impliedProb(odds) : null;
+      return { ...b, imp, edge, ev, units, suggested, clv, _i: i };
     });
     if (betStatusFilter === "settled") arr = arr.filter((b) => b.status !== "open");
     else if (betStatusFilter !== "all") arr = arr.filter((b) => b.status === betStatusFilter);
+    if (betDateFilter !== "all") arr = arr.filter((b) => b.date === betDateFilter);
+    if (betGameFilters.length) arr = arr.filter((b) => betGameFilters.includes(b.game));
+    if (betTypeFilters.length) arr = arr.filter((b) => betTypeFilters.includes(b.type));
+    if (betBookFilters.length) arr = arr.filter((b) => betBookFilters.includes(b.book));
+    if (betSideFilter !== "all") arr = arr.filter((b) => b.side === betSideFilter);
     if (betSearch.trim()) arr = arr.filter((b) => matchesQuery(b, betSearch));
+    const bmM = parseFloat(betMinModel);
+    if (!isNaN(bmM)) arr = arr.filter((b) => b.modelP != null && b.modelP * 100 >= bmM);
+    const bmE = parseFloat(betMinEdge);
+    if (!isNaN(bmE)) arr = arr.filter((b) => b.edge != null && b.edge * 100 >= bmE);
+    const bxE = parseFloat(betMaxEdge);
+    if (!isNaN(bxE)) arr = arr.filter((b) => b.edge != null && b.edge * 100 <= bxE);
+    const minOB = betMinOdds === "" || isNaN(Number(betMinOdds)) ? null : amToB(Number(betMinOdds));
+    const maxOB = betMaxOdds === "" || isNaN(Number(betMaxOdds)) ? null : amToB(Number(betMaxOdds));
+    if (minOB != null || maxOB != null) arr = arr.filter((b) => { const bb = amToB(Number(b.odds)); if (isNaN(bb)) return false; if (minOB != null && bb < minOB) return false; if (maxOB != null && bb > maxOB) return false; return true; });
+    const getBetDelta = (b) => (b.proj ?? 0) - parseFloat(b.line ?? 0);
+    const bmD = parseFloat(betMinDelta);
+    const bxD = parseFloat(betMaxDelta);
+    if (!isNaN(bmD)) arr = arr.filter((b) => getBetDelta(b) >= bmD);
+    if (!isNaN(bxD)) arr = arr.filter((b) => getBetDelta(b) <= bxD);
+    if (betDirAligned) arr = arr.filter((b) => { const d = getBetDelta(b); return b.side === "over" ? d > 0 : d < 0; });
     const cmp = {
       recent: (a, b) => a._i - b._i,
-      model_desc: (a, b) => (b.modelP ?? -9) - (a.modelP ?? -9),
-      ev_desc: (a, b) => (b.ev ?? -9) - (a.ev ?? -9),
-      edge_desc: (a, b) => (b.edge ?? -9) - (a.edge ?? -9),
+      game: (a, b) => String(a.game || "").localeCompare(String(b.game || "")) || a._i - b._i,
+      model_desc: (a, b) => (b.modelP ?? -9) - (a.modelP ?? -9), model_asc: (a, b) => (a.modelP ?? 9) - (b.modelP ?? 9),
+      ev_desc: (a, b) => (b.ev ?? -9) - (a.ev ?? -9), ev_asc: (a, b) => (a.ev ?? 9) - (b.ev ?? 9),
+      edge_desc: (a, b) => (b.edge ?? -9) - (a.edge ?? -9), edge_asc: (a, b) => (a.edge ?? 9) - (b.edge ?? 9),
+      clv_desc: (a, b) => (b.clv ?? -9) - (a.clv ?? -9), clv_asc: (a, b) => (a.clv ?? 9) - (b.clv ?? 9),
+      delta_desc: (a, b) => getBetDelta(b) - getBetDelta(a), delta_asc: (a, b) => getBetDelta(a) - getBetDelta(b),
     }[betSort] || ((a, b) => a._i - b._i);
     return arr.sort(cmp);
-  }, [myBets, betStatusFilter, betSort, betSearch]);
+  }, [myBets, betStatusFilter, betSort, betDateFilter, betGameFilters, betTypeFilters, betBookFilters, betSideFilter, betMinModel, betMinEdge, betMaxEdge, betMinOdds, betMaxOdds, betMinDelta, betMaxDelta, betDirAligned, betSearch]);
+  const betDates = useMemo(() => [...new Set(myBets.map((b) => b.date).filter(Boolean))].sort().reverse(), [myBets]);
+  // Scope game list to the selected date so an earlier date's matchup doesn't appear when filtering to a later date.
+  const betGames = useMemo(() => {
+    const base = betDateFilter !== "all" ? myBets.filter((b) => b.date === betDateFilter) : myBets;
+    return [...new Set(base.map((b) => b.game).filter(Boolean))].sort();
+  }, [myBets, betDateFilter]);
+  const betTypes = useMemo(() => [...new Set(myBets.map((b) => b.type).filter(Boolean))].sort(), [myBets]);
+  const betBooks = useMemo(() => [...new Set(myBets.map((b) => b.book).filter(Boolean))].sort(), [myBets]);
+  const betSides = useMemo(() => [...new Set(myBets.map((b) => b.side).filter(Boolean))].sort(), [myBets]);
+  const betFiltersActive = betStatusFilter !== "all" || betGameFilters.length > 0 || betTypeFilters.length > 0 || betBookFilters.length > 0 || betSideFilter !== "all" || betDateFilter !== "all" || betMinModel !== "" || betMinEdge !== "" || betMaxEdge !== "" || betMinOdds !== "" || betMaxOdds !== "" || betMinDelta !== "" || betMaxDelta !== "" || betDirAligned || betSearch !== "";
+  function clearBetFilters() { setBetStatusFilter("all"); setBetGameFilters([]); setBetTypeFilters([]); setBetBookFilters([]); setBetSideFilter("all"); setBetDateFilter("all"); setBetMinModel(""); setBetMinEdge(""); setBetMaxEdge(""); setBetMinOdds(""); setBetMaxOdds(""); setBetMinDelta(""); setBetMaxDelta(""); setBetDirAligned(false); setBetSearch(""); }
 
   const stats = useMemo(() => {
     const settled = myBets.filter((b) => b.status === "won" || b.status === "lost" || b.status === "push" || b.status === "void");
@@ -1668,7 +1780,7 @@ export default function NBAApp() {
               <Sel compact label="category" v={catFilter} opts={["all", ...STAT_ORDER]} labels={{ all: "All categories" }} onChange={setCatFilter} />
               <Sel compact label="game" v={gameFilter} opts={["all", ...boardGames.map((g) => g.pk)]} labels={{ all: "All games", ...Object.fromEntries(boardGames.map((g) => [g.pk, g.label])) }} onChange={setGameFilter} />
               <Sel compact label="side" v={sideFilter} opts={["all", "over", "under", "home", "away"]} labels={{ all: "Both" }} onChange={setSideFilter} />
-              {(() => { const n = [minEdge, minModel, minOdds, maxOdds, minDelta, maxDelta].filter((x) => x !== "").length + (dirAligned ? 1 : 0); return (
+              {(() => { const n = [minEdge, minModel, minEV, minOdds, maxOdds, minDelta, maxDelta].filter((x) => x !== "").length + (dirAligned ? 1 : 0); return (
                 <button onClick={() => setShowMoreBoard((s) => !s)} className={`text-xs rounded px-2.5 py-1.5 border ${showMoreBoard || n ? "border-emerald-700 text-emerald-300" : "border-slate-700 text-slate-400 hover:text-slate-200"}`}>filters{n ? ` (${n})` : ""} {showMoreBoard ? "▴" : "▾"}</button>
               ); })()}
               <button onClick={() => setShowProjBar((s) => !s)} className={`text-xs rounded px-2.5 py-1.5 border ${showProjBar ? "border-sky-700 text-sky-300" : "border-slate-700 text-slate-500 hover:text-slate-300"}`} title="Toggle projection bar">proj bar {showProjBar ? "▪" : "▫"}</button>
@@ -1682,6 +1794,9 @@ export default function NBAApp() {
                 </label>
                 <label className="text-xs text-slate-400 flex flex-col gap-1">min model %
                   <input value={minModel} onChange={(e) => setMinModel(e.target.value)} placeholder="65" inputMode="decimal" className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-20 text-slate-100" />
+                </label>
+                <label className="text-xs text-slate-400 flex flex-col gap-1">min EV %
+                  <input value={minEV} onChange={(e) => setMinEV(e.target.value)} placeholder="any" inputMode="decimal" className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-20 text-slate-100" />
                 </label>
                 <label className="text-xs text-slate-400 flex flex-col gap-1">min proj Δ
                   <input value={minDelta} onChange={(e) => setMinDelta(e.target.value)} placeholder="e.g. 0.5" inputMode="decimal" className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-20 text-slate-100" />
@@ -1786,20 +1901,63 @@ export default function NBAApp() {
         {/* ---------------- MY BETS ---------------- */}
         {tab === "bets" && (
           <div className="mt-3">
-            <div className="flex flex-wrap gap-2 mb-3 items-end">
-              <Sel label="status" v={betStatusFilter} opts={["all", "open", "won", "lost", "push", "void", "settled"]} onChange={setBetStatusFilter} compact />
-              <Sel label="sort" v={betSort} opts={["recent", "model_desc", "ev_desc", "edge_desc"]} labels={{ recent: "Recent", model_desc: "Model %", ev_desc: "EV", edge_desc: "Edge" }} onChange={setBetSort} compact />
-              <input value={betSearch} onChange={(e) => setBetSearch(e.target.value)} placeholder="search" className="bg-slate-950 border border-slate-700 rounded px-2.5 py-1.5 text-sm text-slate-100" />
-              <Sel label="stake mode (new bets)" v={stakeMode} opts={["flat", "kelly"]} onChange={setStakeMode} compact />
-              <button onClick={settleBets} className="bg-emerald-700 hover:bg-emerald-600 text-white font-bold text-xs rounded-lg px-3 py-1.5">Settle open bets</button>
-              <button onClick={exportCSV} className="border border-slate-700 text-slate-300 hover:text-slate-100 text-xs rounded-lg px-3 py-1.5">Export CSV</button>
-              <button onClick={backupBets} disabled={myBets.length === 0} className="border border-slate-700 text-slate-300 hover:text-slate-100 disabled:opacity-40 text-xs rounded-lg px-3 py-1.5" title="Save a .json backup you can restore later or on another device">Backup</button>
-              <label className="border border-slate-700 text-slate-300 hover:text-slate-100 text-xs rounded-lg px-3 py-1.5 cursor-pointer" title="Restore bets from a .json backup">Restore
-                <input type="file" accept="application/json,.json" className="hidden" onChange={(e) => { restoreBets(e.target.files && e.target.files[0]); e.target.value = ""; }} />
-              </label>
-              <button onClick={resetStats} className="border border-rose-900 text-rose-400 hover:text-rose-300 text-xs rounded-lg px-3 py-1.5">Clear all</button>
-              {settleMsg ? <span className="text-[11px] text-slate-500">{settleMsg}</span> : null}
+            <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
+              <div className="flex items-center gap-2 flex-wrap">
+                <input value={betSearch} onChange={(e) => setBetSearch(e.target.value)} placeholder="search player or team" className="bg-slate-950 border border-slate-700 rounded px-2.5 py-1.5 text-sm w-44 text-slate-100" />
+                <Sel compact label="show" v={betStatusFilter} opts={["all", "open", "settled", "won", "lost", "push", "void"]} labels={{ all: "All", open: "Open", settled: "Settled", won: "Won", lost: "Lost", push: "Push", void: "Void" }} onChange={setBetStatusFilter} />
+                <Sel compact label="date" v={betDateFilter} opts={["all", ...betDates]} labels={{ all: "All dates" }} onChange={setBetDateFilter} />
+                <MultiSel compact label="game" selected={betGameFilters} opts={betGames} onChange={setBetGameFilters} />
+                <MultiSel compact label="category" selected={betTypeFilters} opts={betTypes} onChange={setBetTypeFilters} />
+                <MultiSel compact label="book" selected={betBookFilters} opts={betBooks} labels={BOOK_LABELS} onChange={setBetBookFilters} />
+                <Sel compact label="side" v={betSideFilter} opts={["all", ...betSides]} labels={{ all: "All sides" }} onChange={setBetSideFilter} />
+                <Sel compact label="sort" v={betSort} opts={["recent", "game", "model_desc", "model_asc", "ev_desc", "ev_asc", "edge_desc", "edge_asc", "clv_desc", "clv_asc", "delta_desc", "delta_asc"]} labels={{ recent: "Most recent", game: "Game", model_desc: "Model % ↓", model_asc: "Model % ↑", ev_desc: "EV ↓", ev_asc: "EV ↑", edge_desc: "Edge ↓", edge_asc: "Edge ↑", clv_desc: "Line move ↓", clv_asc: "Line move ↑", delta_desc: "Proj Δ ↓", delta_asc: "Proj Δ ↑" }} onChange={setBetSort} />
+                <Sel compact label="stake mode (new bets)" v={stakeMode} opts={["flat", "kelly"]} onChange={setStakeMode} />
+                {(() => { const n = (betMinModel !== "" ? 1 : 0) + (betMinEdge !== "" ? 1 : 0) + (betMaxEdge !== "" ? 1 : 0) + (betMinOdds !== "" ? 1 : 0) + (betMaxOdds !== "" ? 1 : 0) + (betMinDelta !== "" ? 1 : 0) + (betMaxDelta !== "" ? 1 : 0) + (betDirAligned ? 1 : 0); return (
+                  <button onClick={() => setShowMoreBets((s) => !s)} className={`text-xs rounded px-2.5 py-1.5 border ${showMoreBets || n ? "border-emerald-700 text-emerald-300" : "border-slate-700 text-slate-400 hover:text-slate-200"}`}>more{n ? ` (${n})` : ""} {showMoreBets ? "▴" : "▾"}</button>
+                ); })()}
+                {betFiltersActive && <button onClick={clearBetFilters} className="text-[11px] text-slate-400 hover:text-rose-300 border border-slate-700 rounded px-2.5 py-1.5">clear</button>}
+              </div>
+              <div className="flex items-center gap-2 self-end">
+                <button onClick={exportCSV} className="bg-sky-600 hover:bg-sky-500 disabled:opacity-40 text-white font-bold text-sm rounded-lg px-3 py-1.5">Download CSV</button>
+                <button onClick={backupBets} disabled={myBets.length === 0} className="bg-slate-700 hover:bg-slate-600 disabled:opacity-40 text-white font-bold text-sm rounded-lg px-3 py-1.5" title="Save a .json backup you can restore later or on another device">Backup</button>
+                <label className="bg-slate-700 hover:bg-slate-600 text-white font-bold text-sm rounded-lg px-3 py-1.5 cursor-pointer" title="Restore bets from a .json backup">Restore
+                  <input type="file" accept="application/json,.json" className="hidden" onChange={(e) => { restoreBets(e.target.files && e.target.files[0]); e.target.value = ""; }} />
+                </label>
+                <button onClick={refreshLines} disabled={refreshingLines} className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white font-bold text-sm rounded-lg px-3 py-1.5" title="Pull the current price for each open tracked bet (line movement / CLV). ~9 credits per game.">{refreshingLines ? "…" : "Refresh lines"}</button>
+                <button onClick={settleBets} className="bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-sm rounded-lg px-3 py-1.5">Settle finished</button>
+                <button onClick={resetStats} className="border border-rose-900 text-rose-400 hover:text-rose-300 text-xs rounded-lg px-3 py-1.5">Clear all</button>
+              </div>
             </div>
+            {showMoreBets && (
+              <div className="flex items-end gap-3 flex-wrap mb-3 p-2.5 rounded-lg bg-slate-900/40 border border-slate-800">
+                <label className="text-xs text-slate-400 flex flex-col gap-1">min model %
+                  <input value={betMinModel} onChange={(e) => setBetMinModel(e.target.value)} placeholder="any" inputMode="decimal" className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-20 text-slate-100" />
+                </label>
+                <label className="text-xs text-slate-400 flex flex-col gap-1">min edge %
+                  <input value={betMinEdge} onChange={(e) => setBetMinEdge(e.target.value)} placeholder="any" inputMode="decimal" className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-20 text-slate-100" />
+                </label>
+                <label className="text-xs text-slate-400 flex flex-col gap-1">max edge %
+                  <input value={betMaxEdge} onChange={(e) => setBetMaxEdge(e.target.value)} placeholder="any" inputMode="decimal" className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-20 text-slate-100" />
+                </label>
+                <label className="text-xs text-slate-400 flex flex-col gap-1">min proj Δ
+                  <input value={betMinDelta} onChange={(e) => setBetMinDelta(e.target.value)} placeholder="e.g. 0.5" inputMode="decimal" className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-20 text-slate-100" />
+                </label>
+                <label className="text-xs text-slate-400 flex flex-col gap-1">max proj Δ
+                  <input value={betMaxDelta} onChange={(e) => setBetMaxDelta(e.target.value)} placeholder="e.g. 2.0" inputMode="decimal" className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-20 text-slate-100" />
+                </label>
+                <label className="text-xs text-slate-400 flex flex-col gap-1">min odds
+                  <input value={betMinOdds} onChange={(e) => setBetMinOdds(e.target.value)} placeholder="-300" inputMode="numeric" className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-20 text-slate-100" />
+                </label>
+                <label className="text-xs text-slate-400 flex flex-col gap-1">max odds
+                  <input value={betMaxOdds} onChange={(e) => setBetMaxOdds(e.target.value)} placeholder="+300" inputMode="numeric" className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-20 text-slate-100" />
+                </label>
+                <label className="text-xs text-slate-400 flex flex-col gap-1">proj aligned
+                  <button onClick={() => setBetDirAligned((s) => !s)} className={`text-xs rounded px-3 py-1.5 border font-medium ${betDirAligned ? "border-sky-600 bg-sky-950 text-sky-300" : "border-slate-700 text-slate-500 hover:text-slate-300"}`} title="Only show bets where proj direction matched the bet side">{betDirAligned ? "on" : "off"}</button>
+                </label>
+              </div>
+            )}
+            {settleMsg && <div className="text-[11px] text-slate-400 mb-2">{settleMsg}</div>}
+            {lineMsg && <div className="text-[11px] text-indigo-300 mb-2">{lineMsg}</div>}
             {myBets.length > 0 && (
               <div className="text-[11px] text-slate-400 mb-2 flex items-center gap-x-3 gap-y-1 flex-wrap">
                 <span>showing <b className="text-slate-200">{myBetsView.length}</b> of {myBets.length} bets</span>
@@ -1906,6 +2064,34 @@ function Sel({ label, v, opts, labels, onChange, compact }) {
         {opts.map((o) => <option key={o} value={o}>{(labels && labels[o]) || o}</option>)}
       </select>
     </label>
+  );
+}
+function MultiSel({ label, selected, opts, labels, onChange, compact }) {
+  const [open, setOpen] = useState(false);
+  const toggle = (o) => onChange(selected.includes(o) ? selected.filter((x) => x !== o) : [...selected, o]);
+  const lab = (o) => (labels && labels[o] != null ? labels[o] : o);
+  const summary = selected.length === 0 ? "All" : selected.length === 1 ? lab(selected[0]) : `${selected.length} selected`;
+  return (
+    <div className="relative inline-block">
+      <button onClick={() => setOpen((o) => !o)} className={`bg-slate-950 border rounded px-2 ${compact ? "py-1" : "py-1.5"} text-xs whitespace-nowrap ${selected.length ? "border-emerald-700 text-emerald-300" : "border-slate-700 text-slate-100"}`}>
+        <span className="text-slate-400">{label}</span> {summary} ▾
+      </button>
+      {open && (
+        <>
+          <div className="fixed inset-0 z-30" onClick={() => setOpen(false)} />
+          <div className="absolute z-40 mt-1 left-0 bg-slate-900 border border-slate-700 rounded-lg p-2 max-h-64 overflow-auto min-w-[170px] shadow-xl">
+            {opts.length === 0 && <div className="text-[11px] text-slate-500 px-1 py-1">none yet</div>}
+            {opts.map((o) => (
+              <label key={o} className="flex items-center gap-2 px-1.5 py-1 text-sm cursor-pointer hover:bg-slate-800 rounded text-slate-200">
+                <input type="checkbox" checked={selected.includes(o)} onChange={() => toggle(o)} className="accent-emerald-500" />
+                <span className="truncate">{lab(o)}</span>
+              </label>
+            ))}
+            {selected.length > 0 && <button onClick={() => onChange([])} className="mt-1 w-full text-[11px] text-slate-400 hover:text-rose-300 border-t border-slate-800 pt-1">clear</button>}
+          </div>
+        </>
+      )}
+    </div>
   );
 }
 function StatCard({ label, v, good }) {
@@ -2027,19 +2213,44 @@ function BoardRow({ e, tracked, onTrack, showProjBar = true }) {
 }
 function MyBetRow({ b, onOdds, onUnits, onRemove }) {
   const statusColor = { open: "bg-slate-700 text-slate-300", won: "bg-emerald-600 text-white", lost: "bg-rose-600 text-white", push: "bg-amber-600 text-slate-950", void: "bg-slate-600 text-slate-200" }[b.status] || "bg-slate-700 text-slate-300";
+  const profit = (b.status === "won" || b.status === "lost") ? profitUnits(b.status, Number(b.odds), b.units) : null;
   return (
-    <div className="flex items-center gap-3 bg-slate-900/70 border border-slate-800 rounded-xl px-4 py-3 flex-wrap">
-      <div className="flex-1 min-w-[160px]">
-        <div className="font-semibold truncate">{b.name}</div>
-        <div className="text-[11px] text-slate-500 truncate" style={mono}>{b.game} · {b.book}</div>
+    <div className="flex items-center gap-3 bg-slate-900/70 border border-slate-800 rounded-xl px-4 py-3">
+      <div className="flex-1 min-w-0">
+        <div className="font-semibold truncate">{b.name} <span className="text-slate-500 text-xs">{b.game} · {b.book}</span></div>
+        <div className="text-[11px] text-slate-400" style={mono}>
+          {b.side} {b.line} {b.type}
+          {b.proj != null ? <> · <span className="text-sky-300">proj {Number(b.proj).toFixed(2)}</span></> : ""}
+          {(() => { const pm = !isLineType(b.type) && b.proj != null ? projMeta(b.proj, b.line, b.side) : null; if (!pm) return null; return <span className={`ml-1.5 font-bold ${pm.color}`}>{pm.delta >= 0 ? "+" : "−"}{Math.abs(pm.delta).toFixed(2)}</span>; })()}
+          {b.actual != null ? <> · <span className="text-slate-300">actual {b.actual}</span></> : ""}
+        </div>
+        {b.currentOdds != null && (
+          <div className="text-[11px]" style={mono} title={b.oddsCheckedAt ? `checked ${new Date(b.oddsCheckedAt).toLocaleTimeString()}` : ""}>
+            <span className="text-slate-500">took {fmtOdds(Number(b.odds))} → {b.closing ? "close " : "now "}</span>
+            <span className={b.clv != null && b.clv >= 0 ? "text-emerald-400 font-bold" : "text-rose-400 font-bold"}>{fmtOdds(b.currentOdds)}</span>
+            {b.clv != null && <span className={b.clv >= 0 ? "text-emerald-500" : "text-rose-500"}> ({b.clv >= 0 ? "+" : ""}{(b.clv * 100).toFixed(1)} {b.live ? "mov" : "CLV"})</span>}
+          </div>
+        )}
+        {b.currentOdds == null && b.lineMissing && (
+          <div className="text-[11px] text-amber-500/80" style={mono} title={b.oddsCheckedAt ? `checked ${new Date(b.oddsCheckedAt).toLocaleTimeString()}` : ""}>line not found (scratched, settled, or moved off your number)</div>
+        )}
       </div>
-      <div className="text-[11px] text-slate-300" style={mono}>{b.type} {b.side} {b.line}</div>
-      <input value={b.odds} onChange={(e) => onOdds(b.key, e.target.value)} className="w-16 bg-slate-950 border border-slate-700 rounded px-1.5 py-1 text-[11px] text-slate-100" style={mono} />
-      <input value={b.units} onChange={(e) => onUnits(b.key, e.target.value)} className="w-14 bg-slate-950 border border-slate-700 rounded px-1.5 py-1 text-[11px] text-slate-100" title="units" />
-      <div className="text-[11px] text-slate-400" style={mono}>model {pct(b.modelP)}</div>
-      <div className={`text-[11px] font-bold ${b.edge > 0 ? "text-emerald-400" : "text-rose-400"}`} style={mono}>{b.edge != null ? `${(b.edge * 100).toFixed(1)}%` : "—"}</div>
-      <span className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase ${statusColor}`}>{b.status}</span>
-      <button onClick={() => onRemove(b.key)} className="text-[11px] text-slate-500 hover:text-rose-400 border border-slate-700 rounded px-2 py-1">✕</button>
+      <label className="text-[10px] text-slate-500 flex flex-col items-end gap-0.5">odds
+        <input value={b.odds} onChange={(e) => onOdds(b.key, e.target.value)} inputMode="numeric" className="w-16 bg-slate-950 border border-slate-700 rounded px-1.5 py-1 text-sm text-slate-100 text-right" />
+      </label>
+      <label className="text-[10px] text-slate-500 flex flex-col items-end gap-0.5">units
+        <input value={b.units} onChange={(e) => onUnits(b.key, e.target.value)} inputMode="decimal" className="w-14 bg-slate-950 border border-slate-700 rounded px-1.5 py-1 text-sm text-slate-100 text-right" />
+        {b.suggested > 0 && <span className="text-[9px] text-slate-600">sug {b.suggested}u</span>}
+      </label>
+      <div className="text-right text-[11px] w-28" style={mono}>
+        {b.modelP != null ? <>
+          <div className="text-slate-400">model {pct(b.modelP)}</div>
+          <div className={b.ev >= 0 ? "text-emerald-400 font-bold" : "text-rose-400 font-bold"}>EV {b.ev != null ? `${b.ev >= 0 ? "+" : ""}${(b.ev * 100).toFixed(1)}%` : "—"} · edge {b.edge != null ? `${b.edge >= 0 ? "+" : ""}${(b.edge * 100).toFixed(1)}%` : "—"}</div>
+        </> : <div className="text-slate-600">manual</div>}
+        {profit != null && <div className={profit >= 0 ? "text-emerald-400" : "text-rose-400"}>{profit >= 0 ? "+" : ""}{profit.toFixed(2)}u</div>}
+      </div>
+      <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${statusColor}`}>{b.status}</span>
+      <button onClick={() => onRemove(b.key)} className="text-slate-600 hover:text-rose-400 text-lg leading-none">×</button>
     </div>
   );
 }
