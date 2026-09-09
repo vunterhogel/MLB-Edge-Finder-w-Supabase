@@ -338,10 +338,24 @@ export default function ParlayBuilder() {
         if (!existing || String(leg.loggedAt || "") >= String(existing.loggedAt || "")) merged.set(leg.poolId, leg);
       }
     }
-    const next = [...merged.values()];
+    let next = [...merged.values()];
+    // Backfill missing gameTimeIso from a sibling leg of the SAME game that does have one.
+    // Every leg logged for a given game shares one kickoff time, but this pool mixes rows
+    // logged at different times — some possibly from before a sport app started recording
+    // gameTimeIso (older cached board-log entries), some from after. If ANY row for a game
+    // carries the timestamp, every leg of that game can use it, rather than each leg only
+    // getting it if ITS OWN most-recent snapshot happened to be logged post-upgrade.
+    const timeByGame = new Map(); // gameKey -> gameTimeIso
+    for (const l of next) if (l.gameTimeIso && !timeByGame.has(l.gameKey)) timeByGame.set(l.gameKey, l.gameTimeIso);
+    let backfilled = 0;
+    next = next.map((l) => {
+      if (l.gameTimeIso || !timeByGame.has(l.gameKey)) return l;
+      backfilled++;
+      return { ...l, gameTimeIso: timeByGame.get(l.gameKey) };
+    });
     const collapsed = parsedRows - next.length + pool.length;
     setPool(next);
-    setPoolMsg(`Parsed ${parsedRows} row(s) → ${next.length} unique bet(s) in the pool${collapsed > 0 ? ` (collapsed ${collapsed} repeated board-refresh snapshot(s) of the same bet, kept the most recent each)` : ""}${blank ? `; ${blank} blank row(s) skipped` : ""}.`);
+    setPoolMsg(`Parsed ${parsedRows} row(s) → ${next.length} unique bet(s) in the pool${collapsed > 0 ? ` (collapsed ${collapsed} repeated board-refresh snapshot(s) of the same bet, kept the most recent each)` : ""}${blank ? `; ${blank} blank row(s) skipped` : ""}${backfilled ? `; ${backfilled} leg(s) had their kickoff time backfilled from a sibling leg of the same game` : ""}.`);
   }
   function clearPool() { if (window.confirm("Clear the entire candidate pool?")) { setPool([]); setSelectedIds(new Set()); setPoolMsg(""); } }
 
