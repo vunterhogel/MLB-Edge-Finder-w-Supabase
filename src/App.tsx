@@ -811,6 +811,7 @@ function mapGame(g) {
     awayName: (TEAMS[awayId] && TEAMS[awayId].name) || g.teams.away.team.name || "",
     homeRec: rec(g.teams.home), awayRec: rec(g.teams.away),
     time: g.gameDate ? new Date(g.gameDate).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "TBD",
+    gameTimeIso: g.gameDate || null, // raw scheduled first-pitch timestamp — carried through to board log rows so the Parlay Builder can tell upcoming games from live/started ones
     venue: (g.venue && g.venue.name) || "",
     status: classify(g),
     homeScore: num(g.teams.home.score) ?? num(ls.teams && ls.teams.home && ls.teams.home.runs),
@@ -1534,7 +1535,7 @@ function buildGameLineEntries(g, d, gl, book) {
     const modelP = calibrateToMarket(modelP0, novig, type);
     const bm = odds > 0 ? odds / 100 : 100 / -odds;
     return {
-      id: `${g.pk}-line-${type}-${side}`, gamePk: g.pk, game: `${g.away}@${g.home}`, name, type, line: String(line), side, odds, overOdds: null, underOdds: null, book,
+      id: `${g.pk}-line-${type}-${side}`, gamePk: g.pk, game: `${g.away}@${g.home}`, gameTimeIso: g.gameTimeIso || null, name, type, line: String(line), side, odds, overOdds: null, underOdds: null, book,
       modelP, rawModelP: modelP0, proj, calc: { dist: isLive ? "Two-Poisson · live" : "Two-Poisson", params, proj, baseStr: base, mults: [], live: null },
       imp, novig, edge: modelP - novig, ev: evPerUnit(modelP, odds), b: bm, fair: probToAmerican(modelP), devigged: oppOdds != null,
     };
@@ -1581,6 +1582,9 @@ function loadBets() { try { return JSON.parse(localStorage.getItem(LS_BETS)) || 
 function saveBets(b) { try { localStorage.setItem(LS_BETS, JSON.stringify(b)); } catch { /* storage unavailable */ } }
 const LS_CREDITS = "mlbef_credits_v1";
 function loadCredits() { try { const v = localStorage.getItem(LS_CREDITS); return v == null || v === "" ? null : +v; } catch { return null; } }
+const LS_SHOW_COVERAGE = "mlbef_showcoverage_v1";
+function loadShowCoverage() { try { const v = localStorage.getItem(LS_SHOW_COVERAGE); return v == null ? false : v === "1"; } catch { return false; } }
+function saveShowCoverage(v) { try { localStorage.setItem(LS_SHOW_COVERAGE, v ? "1" : "0"); } catch { /* storage unavailable */ } }
 // per-market book overrides: some books (DraftKings, notably) frequently omit
 // specific prop markets from the-odds-api's feed — Home Run is the recurring
 // offender. Rather than switching the WHOLE board to another book just to see
@@ -1710,6 +1714,7 @@ async function appendBoardLog(entries, modelVersion, date) {
         date,
         // market
         game: e.game,
+        gameTimeIso: e.gameTimeIso || null,
         gamePk: String(e.gamePk),
         playerId: String(e.playerId ?? ""),
         name: e.name,
@@ -1874,6 +1879,8 @@ export default function App() {
   const [book, setBook] = useState("draftkings");
   const [bookOverrides, setBookOverrides] = useState(() => loadBookOverrides());
   const [showBookPanel, setShowBookPanel] = useState(false);
+  const [showCoverage, setShowCoverage] = useState(() => loadShowCoverage());
+  function toggleShowCoverage() { setShowCoverage((v) => { const n = !v; saveShowCoverage(n); return n; }); }
   function setBookOverride(type, bk) {
     setBookOverrides((prev) => {
       const next = { ...prev };
@@ -2117,7 +2124,7 @@ export default function App() {
           const odds = side === "over" ? row.over : row.under;
           if (odds == null) continue;
           const rowBook = row.srcBook || book;
-          const bet = { gamePk: g.pk, game: `${g.away}@${g.home}`, playerId: found.id, name: found.name, type: row.type, line: String(row.point), side, odds, overOdds: row.over, underOdds: row.under, ctx: found.ctx, book: rowBook };
+          const bet = { gamePk: g.pk, game: `${g.away}@${g.home}`, gameTimeIso: g.gameTimeIso || null, playerId: found.id, name: found.name, type: row.type, line: String(row.point), side, odds, overOdds: row.over, underOdds: row.under, ctx: found.ctx, book: rowBook };
           const ev2 = evalBet(bet, pre);
           entries.push({ id: `${g.pk}-${found.id}-${row.type}-${row.point}-${side}`, ...bet, ...ev2 });
         }
@@ -2557,12 +2564,12 @@ export default function App() {
     const log = loadBoardLog();
     if (!log.length) { alert("No board log entries yet. Load a game to start logging."); return; }
     const esc = (v) => { if (v == null) return ""; const s = String(v); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
-    const headers = ["logId","loggedAt","modelVersion","date","game","gamePk","playerId","name","type","line","side","odds","novig","rawModelP","calibratedP","edge","ev","proj","settled","actualStat","result","closingNovig","clv"];
+    const headers = ["logId","loggedAt","modelVersion","date","game","gameTimeIso","gamePk","playerId","name","type","line","side","odds","novig","rawModelP","calibratedP","edge","ev","proj","settled","actualStat","result","closingNovig","clv"];
     const rows = [headers.join(",")];
     for (const e of log) {
       rows.push([
         esc(e.logId), esc(e.loggedAt), esc(e.modelVersion), esc(e.date),
-        esc(e.game), esc(e.gamePk), esc(e.playerId), esc(e.name),
+        esc(e.game), esc(e.gameTimeIso), esc(e.gamePk), esc(e.playerId), esc(e.name),
         esc(e.type), esc(e.line), esc(e.side), esc(e.odds),
         e.novig ?? "", e.rawModelP ?? "", e.calibratedP ?? "",
         e.edge ?? "", e.ev ?? "", e.proj ?? "",
@@ -2772,6 +2779,11 @@ export default function App() {
                 <button onClick={() => setShowMoreBoard((s) => !s)} className={`text-xs rounded px-2.5 py-1.5 border ${showMoreBoard || n ? "border-emerald-700 text-emerald-300" : "border-slate-700 text-slate-400 hover:text-slate-200"}`}>filters{n ? ` (${n})` : ""} {showMoreBoard ? "▴" : "▾"}</button>
               ); })()}
               <button onClick={() => setShowProjBar((s) => !s)} className={`text-xs rounded px-2.5 py-1.5 border ${showProjBar ? "border-sky-700 text-sky-300" : "border-slate-700 text-slate-500 hover:text-slate-300"}`} title="Toggle projection bar">proj bar {showProjBar ? "▪" : "▫"}</button>
+              {Object.keys(coverage).length > 0 && (
+                <button onClick={toggleShowCoverage} className={`text-xs rounded px-2.5 py-1.5 border ${showCoverage ? "border-sky-700 text-sky-300" : "border-slate-700 text-slate-500 hover:text-slate-300"}`} title="Per-game odds-feed diagnostics (raw markets returned, HR coverage, statcast source) — collapsed by default since it's mostly for debugging">
+                  diagnostics ({Object.keys(coverage).length}) {showCoverage ? "▴" : "▾"}
+                </button>
+              )}
               {filtersActive && <button onClick={clearFilters} className="text-[11px] text-slate-400 hover:text-rose-300 border border-slate-700 rounded px-2.5 py-1.5">clear</button>}
               <div className="ml-auto text-[11px] text-slate-500" style={mono}>{Object.values(grouped).reduce((n, a) => n + a.length, 0)} plays</div>
             </div>
@@ -2807,7 +2819,7 @@ export default function App() {
                 </label>
               </div>
             )}
-            {Object.keys(coverage).length > 0 && (
+            {showCoverage && Object.keys(coverage).length > 0 && (
               <div className="mb-3 text-[10px] text-slate-500 space-y-1.5" style={mono}>
                 {Object.values(coverage).map((c, i) => (
                   <div key={i} className="border border-slate-800 rounded-lg px-2.5 py-1.5">

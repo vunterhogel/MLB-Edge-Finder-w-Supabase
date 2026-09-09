@@ -97,6 +97,10 @@ function normalizeLeg(row, sport) {
     sport,
     dateLabel: row.date || (row.week ? `Wk ${row.week}` : ""),
     game: row.game || "",
+    // scheduled first-pitch/kickoff/tip-off timestamp, when the sport app logged one (older
+    // board log exports won't have this column — those legs just won't be filterable by
+    // kickoff status below, and are treated as "unknown" rather than excluded).
+    gameTimeIso: row.gameTimeIso || null,
     gamePk,
     gameKey: `${sport}:${gamePk}`,
     // groups the two sides (and any alternate lines) of the SAME market together, so the "best
@@ -359,6 +363,12 @@ export default function ParlayBuilder() {
   // that special case, let the user turn any side off pool-wide. Set of EXCLUDED sides; empty =
   // nothing excluded (all sides shown), matching the chips' default "all on" appearance.
   const [fSideExclude, setFSideExclude] = useState(new Set());
+  // "settled/unsettled" (fOnlyOpen above) is a totally different axis from "has the game
+  // itself started yet" — a leg can be unsettled AND mid-game. The board log doesn't carry a
+  // live/not-started flag (it's a point-in-time CSV snapshot), but it DOES now carry each
+  // leg's scheduled game start time (gameTimeIso, when the sport app logged one), so kickoff
+  // status can be derived at filter-time by comparing that to the current clock instead.
+  const [fKickoff, setFKickoff] = useState("any"); // "any" | "upcoming" | "started"
 
   const allTypes = useMemo(() => [...new Set(pool.map((l) => l.type).filter(Boolean))].sort(), [pool]);
   const allSides = useMemo(() => [...new Set(pool.map((l) => l.side).filter(Boolean))].sort(), [pool]);
@@ -372,6 +382,17 @@ export default function ParlayBuilder() {
       .filter((l) => fTypes.size === 0 || fTypes.has(l.type))
       .filter((l) => !fSideExclude.has(l.side))
       .filter((l) => (fOnlyOpen ? !l.settled : true))
+      .filter((l) => {
+        if (fKickoff === "any") return true;
+        // legs with no logged kickoff time (older CSV exports predate the gameTimeIso column,
+        // or a sport app couldn't resolve one) are left in rather than silently dropped — we
+        // just can't tell for those, so don't pretend otherwise.
+        if (!l.gameTimeIso) return true;
+        const t = Date.parse(l.gameTimeIso);
+        if (isNaN(t)) return true;
+        const started = t <= Date.now();
+        return fKickoff === "upcoming" ? !started : started;
+      })
       .filter((l) => (minEdge == null || (l.edge != null && l.edge >= minEdge)))
       .filter((l) => (minEV == null || (l.ev != null && l.ev >= minEV)))
       .filter((l) => !q || l.name.toLowerCase().includes(q) || l.game.toLowerCase().includes(q));
@@ -386,7 +407,7 @@ export default function ParlayBuilder() {
       rows = [...best.values()];
     }
     return rows.sort((a, b) => (b.edge ?? -99) - (a.edge ?? -99));
-  }, [pool, fSports, fTypes, fSideExclude, fMinEdge, fMinEV, fSearch, fOnlyOpen, fBestSide]);
+  }, [pool, fSports, fTypes, fSideExclude, fMinEdge, fMinEV, fSearch, fOnlyOpen, fBestSide, fKickoff]);
 
   function toggleSet(setFn, val) { setFn((prev) => { const n = new Set(prev); if (n.has(val)) n.delete(val); else n.add(val); return n; }); }
 
@@ -633,6 +654,14 @@ export default function ParlayBuilder() {
               </label>
               <label className="text-xs text-slate-400 flex items-center gap-1.5 pb-1.5" title="The board log carries both sides of every market (over/under, alt lines) as separate rows. This keeps only the single highest-EV side per game+player+market+line.">
                 <input type="checkbox" checked={fBestSide} onChange={(e) => setFBestSide(e.target.checked)} /> best side only (collapse over/under)
+              </label>
+              <label className="text-xs text-slate-400 flex flex-col gap-1" title="Separate from settled/unsettled — this is whether the GAME has started. Derived from each leg's logged scheduled start time vs. right now (the board log is a point-in-time CSV, not a live feed, so this is only as fresh as when the CSV was last exported). Legs from older CSV exports with no logged start time are always shown.">
+                kickoff
+                <select value={fKickoff} onChange={(e) => setFKickoff(e.target.value)} className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm">
+                  <option value="any">any</option>
+                  <option value="upcoming">not started only</option>
+                  <option value="started">live/started only</option>
+                </select>
               </label>
             </div>
             <div className="overflow-x-auto max-h-80 overflow-y-auto border border-slate-800 rounded">

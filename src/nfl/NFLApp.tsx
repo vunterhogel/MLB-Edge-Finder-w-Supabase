@@ -669,6 +669,7 @@ function mapGame(ev) {
     homeName: (home.team && home.team.displayName) || "", awayName: (away.team && away.team.displayName) || "",
     homeRec: rec(home), awayRec: rec(away),
     time: ev.date ? new Date(ev.date).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "TBD",
+    gameTimeIso: ev.date || null, // raw scheduled kickoff timestamp — carried through to board log rows so the Parlay Builder can tell upcoming games from live/started ones
     // NFL weeks aren't confined to Thu/Sun/Mon (Saturday, international Friday,
     // Thanksgiving/Black-Friday/Christmas games all exist) — surface the actual
     // day so a card never implies a game is "this weekend" when it isn't.
@@ -1090,7 +1091,7 @@ function buildGameLineEntries(g, d, gl, book) {
     const modelP = calibrateToMarket(modelP0, novig, type);
     const bm = odds > 0 ? odds / 100 : 100 / -odds;
     return {
-      id: `${g.pk}-line-${type}-${side}`, gamePk: g.pk, game: `${g.away}@${g.home}`, name, type, line: String(line), side, odds, overOdds: null, underOdds: null, book,
+      id: `${g.pk}-line-${type}-${side}`, gamePk: g.pk, game: `${g.away}@${g.home}`, gameTimeIso: g.gameTimeIso || null, name, type, line: String(line), side, odds, overOdds: null, underOdds: null, book,
       modelP, rawModelP: modelP0, proj, calc: { dist: "Two-NegBin", params, proj, baseStr: base, mults: [], live: null },
       imp, novig, edge: modelP - novig, ev: evPerUnit(modelP, odds), b: bm, fair: probToAmerican(modelP), devigged: oppOdds != null,
     };
@@ -1163,7 +1164,7 @@ async function appendBoardLog(entries, modelVersion, weekKey) {
     const logId = `${weekKey}|${e.id}`;
     return {
       logId, loggedAt: now, modelVersion, week: weekKey,
-      game: e.game, gamePk: String(e.gamePk), playerId: String(e.playerId ?? ""), name: e.name, type: e.type, line: e.line, side: e.side, odds: e.odds,
+      game: e.game, gameTimeIso: e.gameTimeIso || null, gamePk: String(e.gamePk), playerId: String(e.playerId ?? ""), name: e.name, type: e.type, line: e.line, side: e.side, odds: e.odds,
       novig: e.novig != null ? +e.novig.toFixed(4) : null, rawModelP: e.rawModelP != null ? +e.rawModelP.toFixed(4) : null,
       calibratedP: e.modelP != null ? +e.modelP.toFixed(4) : null, edge: e.edge != null ? +e.edge.toFixed(4) : null, ev: e.ev != null ? +e.ev.toFixed(4) : null, proj: e.proj != null ? +e.proj.toFixed(3) : null,
       settled: false, actualStat: null, result: null,
@@ -1589,7 +1590,7 @@ export default function NFLApp() {
         for (const side of ["over", "under"]) {
           const odds = side === "over" ? row.over : row.under;
           if (odds == null) continue;
-          const bet = { gamePk: g.pk, game: `${g.away}@${g.home}`, playerId: found.id, name: found.name, type: row.type, line: String(row.point), side, odds, overOdds: row.over, underOdds: row.under, ctx: found.ctx, book };
+          const bet = { gamePk: g.pk, game: `${g.away}@${g.home}`, gameTimeIso: g.gameTimeIso || null, playerId: found.id, name: found.name, type: row.type, line: String(row.point), side, odds, overOdds: row.over, underOdds: row.under, ctx: found.ctx, book };
           const ev2 = evalBet(bet, pre);
           entries.push({ id: `${g.pk}-${found.id}-${row.type}-${row.point}-${side}`, ...bet, ...ev2 });
         }
@@ -1753,12 +1754,12 @@ export default function NFLApp() {
     const log = loadBoardLog();
     if (!log.length) { alert("No board log entries yet. Load a game to start logging."); return; }
     const esc = (v) => { if (v == null) return ""; const s = String(v); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
-    const headers = ["logId", "loggedAt", "modelVersion", "week", "game", "gamePk", "playerId", "name", "type", "line", "side", "odds", "novig", "rawModelP", "calibratedP", "edge", "ev", "proj", "settled", "actualStat", "result"];
+    const headers = ["logId", "loggedAt", "modelVersion", "week", "game", "gameTimeIso", "gamePk", "playerId", "name", "type", "line", "side", "odds", "novig", "rawModelP", "calibratedP", "edge", "ev", "proj", "settled", "actualStat", "result"];
     const rows = [headers.join(",")];
     for (const e of log) {
       rows.push([
         esc(e.logId), esc(e.loggedAt), esc(e.modelVersion), esc(e.week),
-        esc(e.game), esc(e.gamePk), esc(e.playerId), esc(e.name),
+        esc(e.game), esc(e.gameTimeIso), esc(e.gamePk), esc(e.playerId), esc(e.name),
         esc(e.type), esc(e.line), esc(e.side), esc(e.odds),
         e.novig ?? "", e.rawModelP ?? "", e.calibratedP ?? "",
         e.edge ?? "", e.ev ?? "", e.proj ?? "",
