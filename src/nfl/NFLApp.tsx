@@ -1913,6 +1913,7 @@ export default function NFLApp() {
   const betTypes = useMemo(() => [...new Set(myBets.map((b) => b.type).filter(Boolean))].sort(), [myBets]);
   const betBooks = useMemo(() => [...new Set(myBets.map((b) => b.book).filter(Boolean))].sort(), [myBets]);
   const betSides = useMemo(() => [...new Set(myBets.map((b) => b.side).filter(Boolean))].sort(), [myBets]);
+  const trackedByGame = useMemo(() => { const m = {}; for (const b of myBets) if (b.status === "open") m[b.gamePk] = (m[b.gamePk] || 0) + 1; return m; }, [myBets]);
   const betFiltersActive = betStatusFilter !== "all" || betGameFilters.length > 0 || betTypeFilters.length > 0 || betBookFilters.length > 0 || betSideFilter !== "all" || betWeekFilter !== "all" || betMinModel !== "" || betMinEdge !== "" || betMaxEdge !== "" || betMinOdds !== "" || betMaxOdds !== "" || betMinDelta !== "" || betMaxDelta !== "" || betDirAligned || betSearch !== "";
   function clearBetFilters() { setBetStatusFilter("all"); setBetGameFilters([]); setBetTypeFilters([]); setBetBookFilters([]); setBetSideFilter("all"); setBetWeekFilter("all"); setBetMinModel(""); setBetMinEdge(""); setBetMaxEdge(""); setBetMinOdds(""); setBetMaxOdds(""); setBetMinDelta(""); setBetMaxDelta(""); setBetDirAligned(false); setBetSearch(""); }
 
@@ -2053,7 +2054,7 @@ export default function NFLApp() {
                       </div>
                       <Chip s={g.status} />
                     </button>
-                    {hasOdds ? <span className="shrink-0 text-[10px] font-bold text-emerald-300 bg-emerald-900/40 border border-emerald-800 rounded-full px-1.5 py-0.5" style={mono}>● {hasOdds}</span> : null}
+                    {trackedByGame[g.pk] ? <span title={`${trackedByGame[g.pk]} open tracked bet(s) on this game`} className="shrink-0 text-[10px] font-bold text-emerald-300 bg-emerald-900/40 border border-emerald-800 rounded-full px-1.5 py-0.5" style={mono}>● {trackedByGame[g.pk]}</span> : null}
                     {g.status !== "FINAL" && (
                       <button onClick={() => getOdds(g)} disabled={oddsLoading === g.pk}
                         className={`text-[11px] font-bold rounded px-2 py-1 shrink-0 ${hasOdds ? "bg-slate-700 text-slate-200" : "bg-sky-600 hover:bg-sky-500 text-white"}`}>
