@@ -863,15 +863,6 @@ async function fetchDepthChart(teamId, year) {
 }
 
 /* ---- athlete gamelog: season + recent-N aggregate, column-tolerant ---- */
-function findStatArrays(node, names, depth, out) {
-  if (depth > 8 || node == null) return;
-  if (Array.isArray(node)) {
-    if (node.length === names.length && node.every((x) => typeof x === "string" || typeof x === "number" || x === "")) out.push(node);
-    else node.forEach((c) => findStatArrays(c, names, depth + 1, out));
-  } else if (typeof node === "object") {
-    for (const k in node) findStatArrays(node[k], names, depth + 1, out);
-  }
-}
 function num(v) { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; }
 // stat-name aliases: ESPN's `names` array wording drifts by season; match tolerantly.
 const STAT_ALIASES = {
@@ -899,18 +890,55 @@ function pickAlias(names, key) {
   return -1;
 }
 const GAMELOG_ROWS = 8; // cap for the "Last N Games" log table (5-10 games, per product ask)
+// Pulls the { eventId -> {statKey: number} } map of REAL per-game stat values out of a gamelog
+// response. Verified live against ESPN (Sept 2026): the per-game numbers do NOT live under
+// `d.events` at all — that dict is metadata-only (week/date/opponent/score/team, no numbers
+// whatsoever). The actual values live under `d.seasonTypes[].categories[].events[eventId].stats`,
+// a parallel dict keyed by the SAME event ids, indexed positionally against `d.names` (so
+// `stats[idx["longCmp"]]` is that game's longest completion, etc). A player can in principle carry
+// more than one category (e.g. separate splits) — merge them per event rather than assuming one.
+// This replaces an earlier version of this function that searched `d.events` for stat arrays;
+// that search always came up empty against the real API shape, so every player's season/recent
+// stats were silently falling back to the league-average prior for everyone, and settlement
+// look-ups (below) always returned null.
+function statsByEventFromGamelog(d, idx) {
+  const out = {};
+  for (const st of d.seasonTypes || []) {
+    for (const cat of st.categories || []) {
+      const ev = cat.events;
+      if (!ev || typeof ev !== "object") continue;
+      for (const eid in ev) {
+        const row = ev[eid];
+        if (!row || !row.stats) continue;
+        const rec = (out[eid] = out[eid] || {});
+        for (const k in idx) if (idx[k] >= 0 && row.stats[idx[k]] != null) rec[k] = num(row.stats[idx[k]]);
+      }
+    }
+  }
+  return out;
+}
 async function fetchAthleteGamelog(athleteId, n = 4, season = null) {
   try {
     const url = `${ESPN_WEB}/athletes/${athleteId}/gamelog` + (season ? `?season=${season}` : "");
     const d = await jget(url);
     const names = d.names || [];
     if (!names.length) return null;
-    const rows = [];
-    findStatArrays(d.events || d, names, 0, rows);
     const idx = {};
     for (const k in STAT_ALIASES) idx[k] = pickAlias(names, k);
-    const toRec = (row) => { const r = {}; for (const k in idx) if (idx[k] >= 0) r[k] = num(row[idx[k]]); return r; };
-    const all = rows.map(toRec);
+    const statsByEvent = statsByEventFromGamelog(d, idx);
+
+    // Chronological order by the metadata's own week/date — NOT by object-key enumeration
+    // order, which is an assumption about JS engine behavior this file no longer relies on.
+    const eventsObj = (d.events && typeof d.events === "object" && !Array.isArray(d.events)) ? d.events : {};
+    const eventIds = Object.keys(eventsObj).sort((a, b) => {
+      const ea = eventsObj[a] || {}, eb = eventsObj[b] || {};
+      const wa = ea.week != null ? ea.week : 0, wb = eb.week != null ? eb.week : 0;
+      if (wa !== wb) return wa - wb;
+      const da = ea.gameDate ? Date.parse(ea.gameDate) : 0, db = eb.gameDate ? Date.parse(eb.gameDate) : 0;
+      return da - db;
+    });
+    const all = eventIds.map((eid) => statsByEvent[eid] || {});
+
     // "long*" stats are a per-game max, not additive — summing them across games is meaningless.
     // Average instead, gated to games where the player actually had a qualifying play (a catch,
     // a carry, a completion) so a bye/DNP/zero-target game doesn't drag the average toward 0.
@@ -920,40 +948,29 @@ async function fetchAthleteGamelog(athleteId, n = 4, season = null) {
       const vals = arr.filter((r) => (!gate || r[gate] > 0) && r[key] > 0).map((r) => r[key]);
       return vals.length ? { avg: vals.reduce((a, b) => a + b, 0) / vals.length, n: vals.length } : { avg: null, n: 0 };
     };
-    const sum = (arr) => arr.reduce((acc, r) => { for (const k in r) if (!LONG_KEYS.includes(k)) acc[k] = (acc[k] || 0) + r[k]; return acc; }, { g: arr.length });
+    const sum = (arr) => arr.reduce((acc, r) => { for (const k in r) if (!LONG_KEYS.includes(k)) acc[k] = (acc[k] || 0) + (r[k] || 0); return acc; }, { g: arr.length });
     const season = sum(all); season.g = all.length;
     for (const k of LONG_KEYS) { const { avg, n: cnt } = avgLong(all, k); season[`${k}Avg`] = avg; season[`${k}N`] = cnt; }
     const recentSlice = all.slice(-n);
     const recent = sum(recentSlice); recent.games = recentSlice.length;
     for (const k of LONG_KEYS) { const { avg, n: cnt } = avgLong(recentSlice, k); recent[`${k}Avg`] = avg; recent[`${k}N`] = cnt; }
 
-    // Per-game log rows (week/date/opponent) for the "Last N Games" table. ESPN's `events`
-    // is a dict keyed by numeric event-id strings; JS enumerates integer-like string keys in
-    // ascending order, which is the same order findStatArrays walked to build `rows` above —
-    // so we zip event metadata onto stat rows by position. If the counts don't line up (a
-    // response shape we haven't verified live), we degrade to an empty log instead of
-    // mis-pairing games to stats.
-    let games = [];
-    const eventsObj = (d.events && typeof d.events === "object" && !Array.isArray(d.events)) ? d.events : null;
-    if (eventsObj) {
-      const eventIds = Object.keys(eventsObj);
-      if (eventIds.length && eventIds.length === all.length) {
-        games = eventIds.map((eid, i) => {
-          const ev = eventsObj[eid] || {};
-          const opp = (ev.opponent && (ev.opponent.abbreviation || ev.opponent.displayName)) || null;
-          return {
-            eventId: eid,
-            week: ev.week != null ? ev.week : null,
-            date: ev.gameDate || ev.date || null,
-            atVs: ev.atVs || null,
-            opp,
-            score: ev.score || null,
-            result: ev.gameResult || null,
-            ...all[i],
-          };
-        });
-      }
-    }
+    // Per-game log rows (week/date/opponent) for the "Last N Games" table — metadata and stats
+    // are joined by event id directly now, so there's no positional-pairing risk left.
+    let games = eventIds.map((eid) => {
+      const ev = eventsObj[eid] || {};
+      const opp = (ev.opponent && (ev.opponent.abbreviation || ev.opponent.displayName)) || null;
+      return {
+        eventId: eid,
+        week: ev.week != null ? ev.week : null,
+        date: ev.gameDate || ev.date || null,
+        atVs: ev.atVs || null,
+        opp,
+        score: ev.score || null,
+        result: ev.gameResult || null,
+        ...(statsByEvent[eid] || {}),
+      };
+    });
     games = games.slice(-GAMELOG_ROWS).reverse(); // most-recent-first, capped
 
     return { season, recent, games };
@@ -965,29 +982,21 @@ async function fetchAthleteGamelog(athleteId, n = 4, season = null) {
 // (passing box scores expose C/ATT/YDS/TD/INT/SACKS/QBR/RTG — no LONG column; only rushing and
 // receiving box scores have one), which is why BOX_STAT_FOR has no entry for this market. Without
 // this fallback, actualFor() returns null forever and these bets never leave "open". The gamelog
-// endpoint (same one the projection engine already uses) DOES carry it per game, so look the one
-// game up directly instead of guessing. Deliberately returns null (not 0) on any lookup failure —
-// leaving the bet open is safer than mis-grading it from a network hiccup or a shape mismatch.
+// endpoint (same one the projection engine already uses) DOES carry it per game — see
+// statsByEventFromGamelog() for where it actually lives — so look the one game up directly
+// instead of guessing. Deliberately returns null (not 0) on any lookup failure — leaving the bet
+// open is safer than mis-grading it from a network hiccup or a shape mismatch.
 async function fetchLongCmpForEvent(athleteId, eventId, season = null) {
   try {
     const url = `${ESPN_WEB}/athletes/${athleteId}/gamelog` + (season ? `?season=${season}` : "");
     const d = await jget(url);
     const names = d.names || [];
     if (!names.length) return null;
-    const idx = pickAlias(names, "longCmp");
-    if (idx < 0) return null;
-    const eventsObj = (d.events && typeof d.events === "object" && !Array.isArray(d.events)) ? d.events : null;
-    if (!eventsObj) return null;
-    const eventIds = Object.keys(eventsObj);
-    if (!eventIds.includes(String(eventId))) return null;
-    const rows = [];
-    findStatArrays(d.events || d, names, 0, rows);
-    // same "parallel arrays, only trustworthy when the counts line up" guard used in
-    // fetchAthleteGamelog's per-game log construction — degrade to unknown rather than mis-pair.
-    if (rows.length !== eventIds.length) return null;
-    const i = eventIds.indexOf(String(eventId));
-    const raw = rows[i][idx];
-    return raw != null ? num(raw) : null;
+    const idx = { longCmp: pickAlias(names, "longCmp") };
+    if (idx.longCmp < 0) return null;
+    const statsByEvent = statsByEventFromGamelog(d, idx);
+    const row = statsByEvent[String(eventId)];
+    return row && row.longCmp != null ? row.longCmp : null;
   } catch { return null; }
 }
 
