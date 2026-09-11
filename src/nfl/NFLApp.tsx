@@ -960,6 +960,37 @@ async function fetchAthleteGamelog(athleteId, n = 4, season = null) {
   } catch { return null; }
 }
 
+// ---- settlement-only: pull ONE game's "longest completion" value out of a QB's gamelog.
+// ESPN's box score summary (fetchGameSummary) never carries a longest-completion field at all
+// (passing box scores expose C/ATT/YDS/TD/INT/SACKS/QBR/RTG — no LONG column; only rushing and
+// receiving box scores have one), which is why BOX_STAT_FOR has no entry for this market. Without
+// this fallback, actualFor() returns null forever and these bets never leave "open". The gamelog
+// endpoint (same one the projection engine already uses) DOES carry it per game, so look the one
+// game up directly instead of guessing. Deliberately returns null (not 0) on any lookup failure —
+// leaving the bet open is safer than mis-grading it from a network hiccup or a shape mismatch.
+async function fetchLongCmpForEvent(athleteId, eventId, season = null) {
+  try {
+    const url = `${ESPN_WEB}/athletes/${athleteId}/gamelog` + (season ? `?season=${season}` : "");
+    const d = await jget(url);
+    const names = d.names || [];
+    if (!names.length) return null;
+    const idx = pickAlias(names, "longCmp");
+    if (idx < 0) return null;
+    const eventsObj = (d.events && typeof d.events === "object" && !Array.isArray(d.events)) ? d.events : null;
+    if (!eventsObj) return null;
+    const eventIds = Object.keys(eventsObj);
+    if (!eventIds.includes(String(eventId))) return null;
+    const rows = [];
+    findStatArrays(d.events || d, names, 0, rows);
+    // same "parallel arrays, only trustworthy when the counts line up" guard used in
+    // fetchAthleteGamelog's per-game log construction — degrade to unknown rather than mis-pair.
+    if (rows.length !== eventIds.length) return null;
+    const i = eventIds.indexOf(String(eventId));
+    const raw = rows[i][idx];
+    return raw != null ? num(raw) : null;
+  } catch { return null; }
+}
+
 /* ---- team season stats: offense (own production) + defense (allowed) ---- */
 function pickCat(categories, wantNames) {
   const out = {};
@@ -1325,7 +1356,9 @@ const BOX_STAT_FOR = {
   "Sacks": [["defensive", "sacks"], ["defensive", "SACKS"]],
   "Def. Interceptions": [["interceptions", "interceptions"], ["interceptions", "INT"]],
   // no "Longest Completion" here: ESPN's box score summary doesn't carry that field at all
-  // (only longest rush / longest reception) — left ungraded (stays open) rather than guessing.
+  // (only longest rush / longest reception). actualFor() returns null for it and the two
+  // settlement functions (settleBets/settleFullBoardLog) fall back to fetchLongCmpForEvent(),
+  // which pulls it from the player's gamelog instead — see that function for why.
 };
 function actualFor(type, ps) {
   if (!ps) return null; // handled upstream: player never appeared anywhere in the box score -> void/DNP
@@ -1841,6 +1874,17 @@ export default function NFLApp() {
     setSettleMsg("Settling…");
     const results = {};
     for (const pk of pks) { results[pk] = await fetchGameSummary(pk); }
+    // "Longest Completion" isn't in ESPN's box score summary at all (see fetchLongCmpForEvent) —
+    // pull it from the player's gamelog instead, one targeted fetch per player/game that needs it.
+    const longCmpActuals = {};
+    for (const b of myBets) {
+      if (b.status !== "open" || b.type !== "Longest Completion") continue;
+      const res = results[b.gamePk];
+      if (!res || !res.final || res.canceled) continue;
+      const key = `${b.playerId}:${b.gamePk}`;
+      if (key in longCmpActuals) continue;
+      longCmpActuals[key] = await fetchLongCmpForEvent(b.playerId, b.gamePk);
+    }
     let graded = 0;
     setMyBets((prev) => prev.map((b) => {
       if (b.status !== "open") return b;
@@ -1855,7 +1899,8 @@ export default function NFLApp() {
       }
       const ps = res.players[b.playerId];
       if (!ps) { graded++; return { ...b, status: "void", actual: "DNP" }; }
-      const actual = actualFor(b.type, ps);
+      let actual = actualFor(b.type, ps);
+      if (actual == null && b.type === "Longest Completion") actual = longCmpActuals[`${b.playerId}:${b.gamePk}`] ?? null;
       const st = gradeBet(b.side, parseFloat(b.line), actual);
       if (st == null) return b;
       graded++; return { ...b, status: st, actual };
@@ -1878,6 +1923,17 @@ export default function NFLApp() {
     try {
       const results = {};
       for (const pk of pks) results[pk] = await fetchGameSummary(pk);
+      // Same gamelog fallback as settleBets() — ESPN's box score summary has no field for
+      // "Longest Completion" at all, so these would otherwise never settle out of the log.
+      const longCmpActuals = {};
+      for (const e of unsettled) {
+        if (e.type !== "Longest Completion") continue;
+        const res = results[e.gamePk];
+        if (!res || !res.final || res.canceled) continue;
+        const key = `${e.playerId}:${e.gamePk}`;
+        if (key in longCmpActuals) continue;
+        longCmpActuals[key] = await fetchLongCmpForEvent(e.playerId, e.gamePk);
+      }
       let graded = 0;
       const updated = log.map((e) => {
         if (e.settled) return e;
@@ -1892,7 +1948,8 @@ export default function NFLApp() {
         }
         const ps = res.players[e.playerId];
         if (!ps) { graded++; return { ...e, settled: true, actualStat: "DNP", result: "void" }; }
-        const actual = actualFor(e.type, ps);
+        let actual = actualFor(e.type, ps);
+        if (actual == null && e.type === "Longest Completion") actual = longCmpActuals[`${e.playerId}:${e.gamePk}`] ?? null;
         const status = gradeBet(e.side, parseFloat(String(e.line)), actual);
         if (status == null) return e;
         graded++; return { ...e, settled: true, actualStat: actual, result: status };
