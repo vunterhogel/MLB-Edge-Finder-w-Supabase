@@ -893,23 +893,28 @@ const GAMELOG_ROWS = 8; // cap for the "Last N Games" log table (5-10 games, per
 // Pulls the { eventId -> {statKey: number} } map of REAL per-game stat values out of a gamelog
 // response. Verified live against ESPN (Sept 2026): the per-game numbers do NOT live under
 // `d.events` at all — that dict is metadata-only (week/date/opponent/score/team, no numbers
-// whatsoever). The actual values live under `d.seasonTypes[].categories[].events[eventId].stats`,
-// a parallel dict keyed by the SAME event ids, indexed positionally against `d.names` (so
-// `stats[idx["longCmp"]]` is that game's longest completion, etc). A player can in principle carry
-// more than one category (e.g. separate splits) — merge them per event rather than assuming one.
-// This replaces an earlier version of this function that searched `d.events` for stat arrays;
-// that search always came up empty against the real API shape, so every player's season/recent
-// stats were silently falling back to the league-average prior for everyone, and settlement
-// look-ups (below) always returned null.
+// whatsoever). The actual values live under `d.seasonTypes[].categories[].events`, indexed
+// positionally against `d.names` (so `stats[idx["longCmp"]]` is that game's longest completion).
+// IMPORTANT, and the reason this needed a second pass after the first "fix": that `events` value
+// is an ARRAY of `{eventId, stats}` rows, not an object keyed by event id the way `d.events` (the
+// metadata dict) is — the two are shaped differently despite the same field name. The first
+// version of this function did `for (const eid in ev)` and used the loop's enumeration key
+// (an array INDEX — "0", "1", ...) as the output key instead of the row's own `.eventId` field,
+// so every lookup was keyed wrong and silently never matched a real event id. Live-confirmed via
+// raw JSON dump: `categories[0].events` = `[{"eventId":"401872657","stats":[...]}]`. Handle both
+// an array and an (in case ESPN ever changes this back) object defensively, but always key by
+// `row.eventId` — never by the loop variable.
 function statsByEventFromGamelog(d, idx) {
   const out = {};
   for (const st of d.seasonTypes || []) {
     for (const cat of st.categories || []) {
       const ev = cat.events;
-      if (!ev || typeof ev !== "object") continue;
-      for (const eid in ev) {
-        const row = ev[eid];
+      if (!ev) continue;
+      const rows = Array.isArray(ev) ? ev : (typeof ev === "object" ? Object.values(ev) : []);
+      for (const row of rows) {
         if (!row || !row.stats) continue;
+        const eid = row.eventId != null ? String(row.eventId) : null;
+        if (!eid) continue;
         const rec = (out[eid] = out[eid] || {});
         for (const k in idx) if (idx[k] >= 0 && row.stats[idx[k]] != null) rec[k] = num(row.stats[idx[k]]);
       }
@@ -1001,11 +1006,36 @@ async function fetchLongCmpForEvent(athleteId, eventId, season = null) {
     const statsByEvent = statsByEventFromGamelog(d, idx);
     const row = statsByEvent[String(eventId)];
     if (!row || row.longCmp == null) {
-      console.warn(tag, "event id not found in seasonTypes[].categories[].events — known event ids:", Object.keys(statsByEvent));
+      // JSON.stringify, not the bare array — a bare array/object argument to console.warn
+      // collapses to "Array(1)" when the log line is copy-pasted instead of expanded in
+      // DevTools, which is exactly what made the first round of this diagnostic useless.
+      console.warn(tag, `event id not found in seasonTypes[].categories[].events (season=${season || "default"}) — known event ids: ${JSON.stringify(Object.keys(statsByEvent))}`);
       return null;
     }
     return row.longCmp;
   } catch (err) { console.warn(tag, "fetch/parse threw:", err); return null; }
+}
+// Pulls the season YEAR back out of a tracked bet/board-log row's own `week` field, which is
+// stamped as `${year}-${seasonType}-${week}` at trackBet() time — e.g. "2026-2-1" -> 2026. This
+// is the season the bet was actually placed under, straight from data already on the row, rather
+// than guessing at "today's" season from the current calendar date.
+function weekYear(weekKey) {
+  if (!weekKey) return null;
+  const y = parseInt(String(weekKey).split("-")[0], 10);
+  return Number.isFinite(y) ? y : null;
+}
+// Live-verified (Sept 2026) that ESPN's gamelog endpoint's default "no season param" response can
+// resolve to a stale/minimal season — as few as ONE known game, and not necessarily the current
+// one — rather than reliably tracking the athlete's actual current season the way the rest of
+// this file assumed. So for settlement (where mis-grading a real bet is the risk we're avoiding)
+// try the bet's own season year explicitly FIRST, and only fall back to the ambiguous default if
+// that specific season lookup comes up empty (e.g. the bet's week field is missing/malformed).
+async function fetchLongCmpForEventTrySeasons(athleteId, eventId, season) {
+  if (season) {
+    const v = await fetchLongCmpForEvent(athleteId, eventId, season);
+    if (v != null) return v;
+  }
+  return fetchLongCmpForEvent(athleteId, eventId, null);
 }
 
 /* ---- team season stats: offense (own production) + defense (allowed) ---- */
@@ -1902,7 +1932,7 @@ export default function NFLApp() {
       const key = `${b.playerId}:${b.gamePk}`;
       if (key in longCmpActuals) continue;
       longCmpAttempted++;
-      longCmpActuals[key] = await fetchLongCmpForEvent(b.playerId, b.gamePk);
+      longCmpActuals[key] = await fetchLongCmpForEventTrySeasons(b.playerId, b.gamePk, weekYear(b.week));
       if (longCmpActuals[key] != null) longCmpFound++;
     }
     let graded = 0;
@@ -1955,7 +1985,7 @@ export default function NFLApp() {
         const key = `${e.playerId}:${e.gamePk}`;
         if (key in longCmpActuals) continue;
         longCmpAttempted++;
-        longCmpActuals[key] = await fetchLongCmpForEvent(e.playerId, e.gamePk);
+        longCmpActuals[key] = await fetchLongCmpForEventTrySeasons(e.playerId, e.gamePk, weekYear(e.week));
         if (longCmpActuals[key] != null) longCmpFound++;
       }
       let graded = 0;
