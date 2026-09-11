@@ -987,17 +987,25 @@ async function fetchAthleteGamelog(athleteId, n = 4, season = null) {
 // instead of guessing. Deliberately returns null (not 0) on any lookup failure — leaving the bet
 // open is safer than mis-grading it from a network hiccup or a shape mismatch.
 async function fetchLongCmpForEvent(athleteId, eventId, season = null) {
+  // Every early-return below is logged with WHY, not just swallowed — this lookup has already
+  // failed once against a wrong assumption about the response shape, so if it fails again we
+  // want to know from the browser console which branch it hit instead of guessing blind again.
+  const tag = `[fetchLongCmpForEvent athlete=${athleteId} event=${eventId}]`;
   try {
     const url = `${ESPN_WEB}/athletes/${athleteId}/gamelog` + (season ? `?season=${season}` : "");
     const d = await jget(url);
     const names = d.names || [];
-    if (!names.length) return null;
+    if (!names.length) { console.warn(tag, "no names[] in response — empty/unexpected payload", d); return null; }
     const idx = { longCmp: pickAlias(names, "longCmp") };
-    if (idx.longCmp < 0) return null;
+    if (idx.longCmp < 0) { console.warn(tag, "longPassing/passingLong not found in names[]", names); return null; }
     const statsByEvent = statsByEventFromGamelog(d, idx);
     const row = statsByEvent[String(eventId)];
-    return row && row.longCmp != null ? row.longCmp : null;
-  } catch { return null; }
+    if (!row || row.longCmp == null) {
+      console.warn(tag, "event id not found in seasonTypes[].categories[].events — known event ids:", Object.keys(statsByEvent));
+      return null;
+    }
+    return row.longCmp;
+  } catch (err) { console.warn(tag, "fetch/parse threw:", err); return null; }
 }
 
 /* ---- team season stats: offense (own production) + defense (allowed) ---- */
@@ -1886,13 +1894,16 @@ export default function NFLApp() {
     // "Longest Completion" isn't in ESPN's box score summary at all (see fetchLongCmpForEvent) —
     // pull it from the player's gamelog instead, one targeted fetch per player/game that needs it.
     const longCmpActuals = {};
+    let longCmpAttempted = 0, longCmpFound = 0;
     for (const b of myBets) {
       if (b.status !== "open" || b.type !== "Longest Completion") continue;
       const res = results[b.gamePk];
       if (!res || !res.final || res.canceled) continue;
       const key = `${b.playerId}:${b.gamePk}`;
       if (key in longCmpActuals) continue;
+      longCmpAttempted++;
       longCmpActuals[key] = await fetchLongCmpForEvent(b.playerId, b.gamePk);
+      if (longCmpActuals[key] != null) longCmpFound++;
     }
     let graded = 0;
     setMyBets((prev) => prev.map((b) => {
@@ -1914,7 +1925,8 @@ export default function NFLApp() {
       if (st == null) return b;
       graded++; return { ...b, status: st, actual };
     }));
-    setSettleMsg(`Settled ${graded} bet(s). Unsettled games are still in progress.`);
+    const longCmpNote = longCmpAttempted ? ` Longest Completion lookups: ${longCmpFound}/${longCmpAttempted} found (see console for misses).` : "";
+    setSettleMsg(`Settled ${graded} bet(s). Unsettled games are still in progress.${longCmpNote}`);
   }
 
   // ── Full Board Log Settlement (mirrors MLB's settleFullBoardLog) ───────────────────────
@@ -1935,13 +1947,16 @@ export default function NFLApp() {
       // Same gamelog fallback as settleBets() — ESPN's box score summary has no field for
       // "Longest Completion" at all, so these would otherwise never settle out of the log.
       const longCmpActuals = {};
+      let longCmpAttempted = 0, longCmpFound = 0;
       for (const e of unsettled) {
         if (e.type !== "Longest Completion") continue;
         const res = results[e.gamePk];
         if (!res || !res.final || res.canceled) continue;
         const key = `${e.playerId}:${e.gamePk}`;
         if (key in longCmpActuals) continue;
+        longCmpAttempted++;
         longCmpActuals[key] = await fetchLongCmpForEvent(e.playerId, e.gamePk);
+        if (longCmpActuals[key] != null) longCmpFound++;
       }
       let graded = 0;
       const updated = log.map((e) => {
@@ -1966,7 +1981,8 @@ export default function NFLApp() {
       saveBoardLog(updated);
       const totalSettled = updated.filter((e) => e.settled).length;
       setBoardLogCount(updated.length);
-      setBoardLogSettleMsg(`Graded ${graded} board log entr${graded === 1 ? "y" : "ies"} across ${pks.length} game(s). ${totalSettled.toLocaleString()} / ${updated.length.toLocaleString()} total entries now settled.`);
+      const longCmpNote = longCmpAttempted ? ` Longest Completion lookups: ${longCmpFound}/${longCmpAttempted} found (see console for misses).` : "";
+      setBoardLogSettleMsg(`Graded ${graded} board log entr${graded === 1 ? "y" : "ies"} across ${pks.length} game(s). ${totalSettled.toLocaleString()} / ${updated.length.toLocaleString()} total entries now settled.${longCmpNote}`);
     } catch (err) {
       setBoardLogSettleMsg(`Settlement failed: ${String((err && err.message) || err)}`);
     } finally {
