@@ -1071,6 +1071,7 @@ export default function NBAApp() {
   const [minDelta, setMinDelta] = useState("");
   const [maxDelta, setMaxDelta] = useState("");
   const [dirAligned, setDirAligned] = useState(false);
+  const [trackAllMsg, setTrackAllMsg] = useState(""); // feedback line under the Board's "track all filtered" button
   const [showMoreBoard, setShowMoreBoard] = useState(false);
   const [catFilter, setCatFilter] = useState("all");
   const [boardSearch, setBoardSearch] = useState("");
@@ -1373,6 +1374,29 @@ export default function NBAApp() {
     const liveBet = !!((e.calc && e.calc.live) || (gtrk && gtrk.status === "LIVE")); // was the game in progress when placed?
     const rec = { key: e.id, date: dKey, gamePk: e.gamePk, game: e.game, playerId: e.playerId, name: e.name, type: e.type, line: e.line, side: e.side, odds: e.odds, book: e.book, modelP: e.modelP, proj: e.proj, novig: e.novig, units, suggested: sug, status: "open", actual: null, live: liveBet };
     setMyBets((p) => [rec, ...p]);
+  }
+  // Bulk-tracks every play currently passing the Board's filters — one click instead of tapping
+  // "track" on each row one at a time. Mirrors trackBet()'s own record shape exactly, but batches
+  // into a single setMyBets call (and dedupes against `prev`, not a stale outer `myBets`) so N
+  // additions don't turn into N separate re-renders or risk a stale-closure duplicate.
+  function trackAllFiltered() {
+    const all = Object.values(grouped).flat();
+    if (!all.length) { setTrackAllMsg("No plays match the current filters."); return; }
+    setMyBets((prev) => {
+      const seen = new Set(prev.map((b) => b.key));
+      const additions = [];
+      for (const e of all) {
+        if (seen.has(e.id)) continue;
+        seen.add(e.id);
+        const sug = suggestedUnits(e.modelP, Number(e.odds));
+        const units = stakeMode === "kelly" ? (sug > 0 ? sug : 1) : 1;
+        const gtrk = games.find((x) => x.pk === e.gamePk);
+        const liveBet = !!((e.calc && e.calc.live) || (gtrk && gtrk.status === "LIVE"));
+        additions.push({ key: e.id, date: dKey, gamePk: e.gamePk, game: e.game, playerId: e.playerId, name: e.name, type: e.type, line: e.line, side: e.side, odds: e.odds, book: e.book, modelP: e.modelP, proj: e.proj, novig: e.novig, units, suggested: sug, status: "open", actual: null, live: liveBet });
+      }
+      setTrackAllMsg(additions.length ? `Tracked ${additions.length} new bet(s) from the current filters.` : "All filtered plays are already tracked.");
+      return additions.length ? [...additions, ...prev] : prev;
+    });
   }
   function updateBetOdds(key, odds) { setMyBets((p) => p.map((b) => b.key === key ? { ...b, odds: odds === "" ? "" : Number(odds) } : b)); }
   function updateBetUnits(key, units) { setMyBets((p) => p.map((b) => b.key === key ? { ...b, units: units === "" ? "" : Math.max(0, Number(units)) } : b)); }
@@ -1814,8 +1838,15 @@ export default function NBAApp() {
                 <label className="text-xs text-slate-400 flex flex-col gap-1">proj aligned
                   <button onClick={() => setDirAligned((s) => !s)} className={`text-xs rounded px-3 py-1.5 border font-medium ${dirAligned ? "border-sky-600 bg-sky-950 text-sky-300" : "border-slate-700 text-slate-500 hover:text-slate-300"}`} title="Only show plays where proj direction agrees with the bet side">{dirAligned ? "on" : "off"}</button>
                 </label>
+                <label className="text-xs text-slate-400 flex flex-col gap-1 ml-auto">
+                  <span>&nbsp;</span>
+                  <button onClick={trackAllFiltered} className="text-xs rounded px-3 py-1.5 border border-emerald-700 bg-emerald-950 text-emerald-300 hover:bg-emerald-900 font-bold" title="Track every play currently passing the Board filters as an open bet, in one click">
+                    Track all filtered ({Object.values(grouped).reduce((n, a) => n + a.length, 0)})
+                  </button>
+                </label>
               </div>
             )}
+            {trackAllMsg && <div className="text-[11px] text-emerald-400/80 mb-2">{trackAllMsg}</div>}
             {boardEntries.length === 0 ? (
               <div className="text-sm text-slate-500 py-10 text-center">No odds pulled yet. On the Slate tab, expand a game and tap <span className="text-sky-400">get odds</span> to load {BOOK_LABELS[book] || book} props here, ranked by EV/edge.</div>
             ) : Object.keys(grouped).length === 0 ? (
