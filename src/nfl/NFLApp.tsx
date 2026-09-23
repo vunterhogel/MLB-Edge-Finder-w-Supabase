@@ -264,11 +264,39 @@ const CALIB_KEEP = {
 const CALIB_KEEP_DEFAULT = 0.5;
 function keepFor(type) { return (type != null && CALIB_KEEP[type] != null) ? CALIB_KEEP[type] : CALIB_KEEP_DEFAULT; }
 function calibrateToMarket(p, market, type) { return (p == null || market == null) ? p : clamp(market + keepFor(type) * (p - market), 0.001, 0.999); }
+// Soft probability floor (2026-09 audit): a category in SOFT_PROB_FLOOR has shown ROI that's
+// negative below its floor probability and positive above it — but the fix is a soft penalty on
+// the DISPLAYED edge/EV, not a hard filter, so a genuinely large edge can still clear a min-edge
+// threshold after the haircut. Anytime TD's 0.14 floor: realized ROI on picks the model rated
+// below 14% ran -18% to -40%; at/above 14% it ran +11% to +15%. Never touches an already-negative
+// edge/EV — nothing to protect there. Retune the floor and SOFT_FLOOR_SOFTNESS together once the
+// de-vig and QB-rushing fixes below have had a few weeks of graded volume behind them.
+const SOFT_PROB_FLOOR = { "Anytime TD": 0.14 };
+const SOFT_FLOOR_SOFTNESS = 3; // penalty reaches full (edge/EV -> 0) by roughly floor - floor/softness
+function softFloorMult(p, type) {
+  const floorP = SOFT_PROB_FLOOR[type];
+  if (floorP == null || p == null || p >= floorP) return 1;
+  const shortfall = (floorP - p) / floorP;
+  return clamp(1 - shortfall * SOFT_FLOOR_SOFTNESS, 0, 1);
+}
+function applySoftFloor(value, mult) { return (value != null && value > 0) ? value * mult : value; } // only dampens a positive signal
 const pct = (x) => (x == null || isNaN(x) ? "—" : `${(x * 100).toFixed(1)}%`);
 const fmtOdds = (o) => (o == null ? "—" : (o > 0 ? `+${o}` : `${o}`));
+// ONE_SIDED_DEVIG_HOLD: when a market only ever posts one side, there's no offsetting price to
+// de-vig against — Anytime TD is the only NFL prop that hits this path (every other category in
+// the 2026-09 board-log audit showed genuine two-sided pricing), and the fallback here used to be
+// the raw vig-included implied probability, mislabeled as "novig." That quietly inflated both the
+// calibration anchor and every displayed edge on the category. This haircut is derived from that
+// same audit: across the full Anytime TD board log (n=308, not just placed bets), average raw
+// implied probability was 27.2% vs. a 24.7% actual hit rate — a ~10.2% relative overround.
+// Retune once real closing-line data or a larger settled sample exists for one-sided books.
+const ONE_SIDED_DEVIG_HOLD = 0.102;
 function noVigProb(overOdds, underOdds, side) {
   if (overOdds == null && underOdds == null) return null;
-  if (overOdds == null || underOdds == null) return impliedProb(side === "over" ? overOdds : underOdds);
+  if (overOdds == null || underOdds == null) {
+    const imp = impliedProb(side === "over" ? overOdds : underOdds);
+    return clamp(imp / (1 + ONE_SIDED_DEVIG_HOLD), 0.001, 0.999);
+  }
   const io = impliedProb(overOdds), iu = impliedProb(underOdds), s = io + iu;
   const novigOver = s > 0 ? io / s : 0.5;
   return side === "over" ? novigOver : 1 - novigOver;
@@ -373,6 +401,7 @@ const LG = {
   passTdRate: 0.043, intRate: 0.020,                 // per pass attempt
   teamPassAtt: 33.5, teamRushAtt: 27.0,
   rushYpc: 4.2, rushTdRate: 0.028,                    // rush TDs per carry
+  qbRushAttPerGame: 2.5, qbRushTdRate: 0.06,           // ALL QBs incl. pocket passers — deliberately low volume, higher TD rate than an RB's per-carry rate (QB rush attempts skew toward goal-line sneaks/designed scores); day-1 estimate, retune from settled Stats data
   catchRate: 0.65, ypt: 8.0, recTdRate: 0.045,        // yards/TDs per target
   targetShareWR1: 0.22, targetShareWR2: 0.15, targetShareRB: 0.10,
   sackRatePerPassAtt: 0.065, defIntRatePerPassAtt: 0.021,
@@ -595,12 +624,34 @@ function projectWR(ctx, type, line) {
   return { pOver, proj: t.mean, calc: fullCalc("Neg.Binom", `μ=${t.mean.toFixed(2)}, φ=${t.phi}`, t.mean, `${base.targets.toFixed(1)} tgt/g season base`, [["game script", gs], ["weather", wx], ["opp pass D vs pos", oppYds], ["availability", avail], ["target-share boost", ctx.injuredTeammateBoost || 1]]) };
 }
 
+// -------- QB rushing-TD rate: this QB's own measured rush-attempt volume and TD rate, shrunk
+// toward a LOW league-average-QB prior — never the RB prior. rbBaseRates' fallback assumes 40% of
+// the team's rush attempts (a lead-back workload), which badly overprojects a QB with a thin or
+// empty rushing sample. Only feeds projectAnytimeTD below — QBs never get a standalone Rush
+// Yards/Rush TDs prop (not in QB_PROPS), so this only needs a TD-rate mean, not a full rush model.
+function qbRushTdMean(ctx) {
+  const s = ctx.season || {}; const l = ctx.recent || null;
+  const lOK = l && l.games >= MIN_L4_SNAPS;
+  const priorRushAtt = priorRate(ctx, "rushAtt", "g", LG.qbRushAttPerGame);
+  const priorRushTdRate = priorRate(ctx, "rushTd", "rushAtt", LG.qbRushTdRate);
+  const rushAttRaw = blendRate(s.rushAtt && s.g ? s.rushAtt / s.g : priorRushAtt, lOK ? l.rushAtt / l.games : null, RECENT_WEIGHT);
+  const rushAtt = shrinkValue(rushAttRaw, s.g || 0, priorRushAtt, SHRINK_N.rushAtt);
+  const rushTdRate = shrinkRate(s.rushAtt ? s.rushTd / s.rushAtt : 0, s.rushAtt || 0, priorRushTdRate, SHRINK_N.rate);
+  return rushAtt * rushTdRate * (ctx.goalLineShareMult || 1);
+}
 // -------- Anytime TD: union of a player's rushing-TD and receiving-TD probability --------
 // P(>=1 TD) = 1 - P(0 rush TD) x P(0 rec TD), each from that player's own NB(mean,phi) above.
+// QBs: rushing now uses qbRushTdMean (was hard-coded to { proj: 0 } — discarded a mobile QB's
+// entire rushing-TD equity, the main way most QBs actually score); receiving is skipped entirely
+// for QBs (was running the WR target-share pipeline on a QB context with no real target data,
+// which barely shrank toward zero because it used the QB's total games-played as if that were a
+// receiving sample size — manufacturing meaningful phantom receiving-TD probability for what's
+// actually a real trick-play rarity, not a QB1's role).
 function projectAnytimeTD(ctx) {
   let pNoRush = 1, pNoRec = 1, pNoPass = 1;
-  if (ctx.pos === "RB" || ctx.pos === "QB") { const r = ctx.pos === "QB" ? { proj: 0 } : projectRB(ctx, "Rush TDs", -1); pNoRush = 1 - negativeBinomialCDFComplement(r.proj, NB_PHI.rushTd); }
-  if (ctx.pos !== "K" && ctx.pos !== "DST") { const r = projectWR(ctx, "Receiving TDs", -1); pNoRec = 1 - negativeBinomialCDFComplement(r.proj, NB_PHI.recTd); }
+  if (ctx.pos === "RB") { const r = projectRB(ctx, "Rush TDs", -1); pNoRush = 1 - negativeBinomialCDFComplement(r.proj, NB_PHI.rushTd); }
+  else if (ctx.pos === "QB") { pNoRush = 1 - negativeBinomialCDFComplement(qbRushTdMean(ctx), NB_PHI.rushTd); }
+  if (ctx.pos !== "K" && ctx.pos !== "DST" && ctx.pos !== "QB") { const r = projectWR(ctx, "Receiving TDs", -1); pNoRec = 1 - negativeBinomialCDFComplement(r.proj, NB_PHI.recTd); }
   const pAtLeastOne = 1 - pNoRush * pNoRec * pNoPass;
   return clamp(pAtLeastOne, 0.001, 0.98);
 }
@@ -670,8 +721,9 @@ function evalBet(b, pre) {
   const fairRef = novig != null ? novig : imp;
   const modelP = calibrateToMarket(rawP, fairRef, b.type);
   const bmult = isNaN(odds) ? 0 : (odds > 0 ? odds / 100 : 100 / -odds);
-  const edge = (modelP != null && fairRef != null) ? modelP - fairRef : null;
-  const ev = (modelP != null && !isNaN(odds)) ? evPerUnit(modelP, odds) : null;
+  const floorMult = softFloorMult(modelP, b.type);
+  const edge = applySoftFloor((modelP != null && fairRef != null) ? modelP - fairRef : null, floorMult);
+  const ev = applySoftFloor((modelP != null && !isNaN(odds)) ? evPerUnit(modelP, odds) : null, floorMult);
   return { modelP, rawModelP: rawP, proj, calc, imp, novig, edge, ev, b: bmult, fair: modelP != null ? probToAmerican(modelP) : "—", devigged: b.overOdds != null && b.underOdds != null };
 }
 
@@ -2121,8 +2173,9 @@ export default function NFLApp() {
       const odds = Number(b.odds);
       const modelP = b.modelP, imp = isNaN(odds) ? null : impliedProb(odds);
       const fairRef = b.novig != null ? b.novig : imp;
-      const edge = (modelP != null && fairRef != null) ? modelP - fairRef : null;
-      const ev = (modelP != null && !isNaN(odds)) ? evPerUnit(modelP, odds) : null;
+      const floorMult = softFloorMult(modelP, b.type);
+      const edge = applySoftFloor((modelP != null && fairRef != null) ? modelP - fairRef : null, floorMult);
+      const ev = applySoftFloor((modelP != null && !isNaN(odds)) ? evPerUnit(modelP, odds) : null, floorMult);
       const units = b.units != null ? b.units : 1;
       const suggested = b.suggested != null ? b.suggested : suggestedUnits(modelP, odds);
       // CLV: positive = market moved toward your side since you bet (your side's price shortened) = you beat the line

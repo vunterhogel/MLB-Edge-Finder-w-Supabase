@@ -349,6 +349,22 @@ const evPerUnit = (p, o) => { const b = o > 0 ? o / 100 : 100 / -o; return p * b
 // calibration: blend the model toward the sharp market price, keeping keepFor(type) of the disagreement.
 // This corrects overconfident favorites AND over-projected longshots (shrinking toward 0.5 would inflate longshots).
 function calibrateToMarket(p, market, type) { return (p == null || market == null) ? p : clamp(market + keepFor(type) * (p - market), 0.001, 0.999); }
+// Soft probability floor (2026-09 audit): a category in SOFT_PROB_FLOOR has shown ROI that's
+// negative below its floor probability and positive above it — but the fix is a soft penalty on
+// the DISPLAYED edge/EV, not a hard filter, so a genuinely large edge can still clear a min-edge
+// threshold after the haircut. Home Run's 0.14 floor: realized ROI on picks the model rated below
+// 14% ran -18% to -40%; at/above 14% it ran +11% to +15% (n=243 placed bets, confirmed on the
+// larger board-log sample too). Never touches an already-negative edge/EV — nothing to protect
+// there. Retune the floor and SOFT_FLOOR_SOFTNESS together once more graded volume comes in.
+const SOFT_PROB_FLOOR = { "Home Run": 0.14 };
+const SOFT_FLOOR_SOFTNESS = 3; // penalty reaches full (edge/EV -> 0) by roughly floor - floor/softness
+function softFloorMult(p, type) {
+  const floorP = SOFT_PROB_FLOOR[type];
+  if (floorP == null || p == null || p >= floorP) return 1;
+  const shortfall = (floorP - p) / floorP;
+  return clamp(1 - shortfall * SOFT_FLOOR_SOFTNESS, 0, 1);
+}
+function applySoftFloor(value, mult) { return (value != null && value > 0) ? value * mult : value; } // only dampens a positive signal
 const pct = (x) => (x == null || isNaN(x) ? "—" : `${(x * 100).toFixed(1)}%`);
 const fmtOdds = (o) => (o == null ? "—" : (o > 0 ? `+${o}` : `${o}`));
 // no-vig probability for a side given both prices; falls back to raw if one side missing
@@ -775,8 +791,9 @@ function evalBet(b, pre) {
   const outsSanityFailed = b.type === "Outs" && proj != null && !isNaN(lineNum) && Math.abs(proj - lineNum) > OUTS_SANITY_DELTA;
   const modelP = outsSanityFailed ? fairRef : calibrateToMarket(rawP, fairRef, b.type);
   const bmult = isNaN(odds) ? 0 : (odds > 0 ? odds / 100 : 100 / -odds);
-  const edge = (modelP != null && fairRef != null) ? modelP - fairRef : null;
-  const ev = (modelP != null && !isNaN(odds)) ? evPerUnit(modelP, odds) : null;
+  const floorMult = softFloorMult(modelP, b.type);
+  const edge = applySoftFloor((modelP != null && fairRef != null) ? modelP - fairRef : null, floorMult);
+  const ev = applySoftFloor((modelP != null && !isNaN(odds)) ? evPerUnit(modelP, odds) : null, floorMult);
   return { modelP, rawModelP: rawP, proj, calc, imp, novig, edge, ev, b: bmult, fair: modelP != null ? probToAmerican(modelP) : "—", devigged: b.overOdds != null && b.underOdds != null, outsSanityFailed };
 }
 
@@ -2470,8 +2487,9 @@ export default function App() {
       const odds = Number(b.odds);
       const modelP = b.modelP, imp = isNaN(odds) ? null : impliedProb(odds);
       const fairRef = b.novig != null ? b.novig : imp;
-      const edge = (modelP != null && fairRef != null) ? modelP - fairRef : null;
-      const ev = (modelP != null && !isNaN(odds)) ? evPerUnit(modelP, odds) : null;
+      const floorMult = softFloorMult(modelP, b.type);
+      const edge = applySoftFloor((modelP != null && fairRef != null) ? modelP - fairRef : null, floorMult);
+      const ev = applySoftFloor((modelP != null && !isNaN(odds)) ? evPerUnit(modelP, odds) : null, floorMult);
       const units = b.units != null ? b.units : 1;        // back-compat for older bets
       const suggested = b.suggested != null ? b.suggested : suggestedUnits(modelP, odds);
       // CLV: positive = market moved toward your side since you bet (your side's price shortened) = you beat the line
@@ -2578,8 +2596,9 @@ export default function App() {
       const odds = Number(b.odds);
       const imp = isNaN(odds) ? null : impliedProb(odds);
       const fairRef = b.novig != null ? b.novig : imp;
-      const edge = (b.modelP != null && fairRef != null) ? b.modelP - fairRef : null;
-      const ev = (b.modelP != null && !isNaN(odds)) ? evPerUnit(b.modelP, odds) : null;
+      const floorMult = softFloorMult(b.modelP, b.type);
+      const edge = applySoftFloor((b.modelP != null && fairRef != null) ? b.modelP - fairRef : null, floorMult);
+      const ev = applySoftFloor((b.modelP != null && !isNaN(odds)) ? evPerUnit(b.modelP, odds) : null, floorMult);
       const units = b.units != null ? b.units : 1;
       const profit = (b.status === "won" || b.status === "lost") ? profitUnits(b.status, odds, units).toFixed(2) : "";
       const clv = (b.currentOdds != null && !isNaN(odds)) ? ((impliedProb(b.currentOdds) - impliedProb(odds)) * 100).toFixed(1) : "";
