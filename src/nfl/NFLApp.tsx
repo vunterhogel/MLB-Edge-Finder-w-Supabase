@@ -264,39 +264,11 @@ const CALIB_KEEP = {
 const CALIB_KEEP_DEFAULT = 0.5;
 function keepFor(type) { return (type != null && CALIB_KEEP[type] != null) ? CALIB_KEEP[type] : CALIB_KEEP_DEFAULT; }
 function calibrateToMarket(p, market, type) { return (p == null || market == null) ? p : clamp(market + keepFor(type) * (p - market), 0.001, 0.999); }
-// Soft probability floor (2026-09 audit): a category in SOFT_PROB_FLOOR has shown ROI that's
-// negative below its floor probability and positive above it — but the fix is a soft penalty on
-// the DISPLAYED edge/EV, not a hard filter, so a genuinely large edge can still clear a min-edge
-// threshold after the haircut. Anytime TD's 0.14 floor: realized ROI on picks the model rated
-// below 14% ran -18% to -40%; at/above 14% it ran +11% to +15%. Never touches an already-negative
-// edge/EV — nothing to protect there. Retune the floor and SOFT_FLOOR_SOFTNESS together once the
-// de-vig and QB-rushing fixes below have had a few weeks of graded volume behind them.
-const SOFT_PROB_FLOOR = { "Anytime TD": 0.14 };
-const SOFT_FLOOR_SOFTNESS = 3; // penalty reaches full (edge/EV -> 0) by roughly floor - floor/softness
-function softFloorMult(p, type) {
-  const floorP = SOFT_PROB_FLOOR[type];
-  if (floorP == null || p == null || p >= floorP) return 1;
-  const shortfall = (floorP - p) / floorP;
-  return clamp(1 - shortfall * SOFT_FLOOR_SOFTNESS, 0, 1);
-}
-function applySoftFloor(value, mult) { return (value != null && value > 0) ? value * mult : value; } // only dampens a positive signal
 const pct = (x) => (x == null || isNaN(x) ? "—" : `${(x * 100).toFixed(1)}%`);
 const fmtOdds = (o) => (o == null ? "—" : (o > 0 ? `+${o}` : `${o}`));
-// ONE_SIDED_DEVIG_HOLD: when a market only ever posts one side, there's no offsetting price to
-// de-vig against — Anytime TD is the only NFL prop that hits this path (every other category in
-// the 2026-09 board-log audit showed genuine two-sided pricing), and the fallback here used to be
-// the raw vig-included implied probability, mislabeled as "novig." That quietly inflated both the
-// calibration anchor and every displayed edge on the category. This haircut is derived from that
-// same audit: across the full Anytime TD board log (n=308, not just placed bets), average raw
-// implied probability was 27.2% vs. a 24.7% actual hit rate — a ~10.2% relative overround.
-// Retune once real closing-line data or a larger settled sample exists for one-sided books.
-const ONE_SIDED_DEVIG_HOLD = 0.102;
 function noVigProb(overOdds, underOdds, side) {
   if (overOdds == null && underOdds == null) return null;
-  if (overOdds == null || underOdds == null) {
-    const imp = impliedProb(side === "over" ? overOdds : underOdds);
-    return clamp(imp / (1 + ONE_SIDED_DEVIG_HOLD), 0.001, 0.999);
-  }
+  if (overOdds == null || underOdds == null) return impliedProb(side === "over" ? overOdds : underOdds);
   const io = impliedProb(overOdds), iu = impliedProb(underOdds), s = io + iu;
   const novigOver = s > 0 ? io / s : 0.5;
   return side === "over" ? novigOver : 1 - novigOver;
@@ -401,7 +373,6 @@ const LG = {
   passTdRate: 0.043, intRate: 0.020,                 // per pass attempt
   teamPassAtt: 33.5, teamRushAtt: 27.0,
   rushYpc: 4.2, rushTdRate: 0.028,                    // rush TDs per carry
-  qbRushAttPerGame: 2.5, qbRushTdRate: 0.06,           // ALL QBs incl. pocket passers — deliberately low volume, higher TD rate than an RB's per-carry rate (QB rush attempts skew toward goal-line sneaks/designed scores); day-1 estimate, retune from settled Stats data
   catchRate: 0.65, ypt: 8.0, recTdRate: 0.045,        // yards/TDs per target
   targetShareWR1: 0.22, targetShareWR2: 0.15, targetShareRB: 0.10,
   sackRatePerPassAtt: 0.065, defIntRatePerPassAtt: 0.021,
@@ -624,34 +595,12 @@ function projectWR(ctx, type, line) {
   return { pOver, proj: t.mean, calc: fullCalc("Neg.Binom", `μ=${t.mean.toFixed(2)}, φ=${t.phi}`, t.mean, `${base.targets.toFixed(1)} tgt/g season base`, [["game script", gs], ["weather", wx], ["opp pass D vs pos", oppYds], ["availability", avail], ["target-share boost", ctx.injuredTeammateBoost || 1]]) };
 }
 
-// -------- QB rushing-TD rate: this QB's own measured rush-attempt volume and TD rate, shrunk
-// toward a LOW league-average-QB prior — never the RB prior. rbBaseRates' fallback assumes 40% of
-// the team's rush attempts (a lead-back workload), which badly overprojects a QB with a thin or
-// empty rushing sample. Only feeds projectAnytimeTD below — QBs never get a standalone Rush
-// Yards/Rush TDs prop (not in QB_PROPS), so this only needs a TD-rate mean, not a full rush model.
-function qbRushTdMean(ctx) {
-  const s = ctx.season || {}; const l = ctx.recent || null;
-  const lOK = l && l.games >= MIN_L4_SNAPS;
-  const priorRushAtt = priorRate(ctx, "rushAtt", "g", LG.qbRushAttPerGame);
-  const priorRushTdRate = priorRate(ctx, "rushTd", "rushAtt", LG.qbRushTdRate);
-  const rushAttRaw = blendRate(s.rushAtt && s.g ? s.rushAtt / s.g : priorRushAtt, lOK ? l.rushAtt / l.games : null, RECENT_WEIGHT);
-  const rushAtt = shrinkValue(rushAttRaw, s.g || 0, priorRushAtt, SHRINK_N.rushAtt);
-  const rushTdRate = shrinkRate(s.rushAtt ? s.rushTd / s.rushAtt : 0, s.rushAtt || 0, priorRushTdRate, SHRINK_N.rate);
-  return rushAtt * rushTdRate * (ctx.goalLineShareMult || 1);
-}
 // -------- Anytime TD: union of a player's rushing-TD and receiving-TD probability --------
 // P(>=1 TD) = 1 - P(0 rush TD) x P(0 rec TD), each from that player's own NB(mean,phi) above.
-// QBs: rushing now uses qbRushTdMean (was hard-coded to { proj: 0 } — discarded a mobile QB's
-// entire rushing-TD equity, the main way most QBs actually score); receiving is skipped entirely
-// for QBs (was running the WR target-share pipeline on a QB context with no real target data,
-// which barely shrank toward zero because it used the QB's total games-played as if that were a
-// receiving sample size — manufacturing meaningful phantom receiving-TD probability for what's
-// actually a real trick-play rarity, not a QB1's role).
 function projectAnytimeTD(ctx) {
   let pNoRush = 1, pNoRec = 1, pNoPass = 1;
-  if (ctx.pos === "RB") { const r = projectRB(ctx, "Rush TDs", -1); pNoRush = 1 - negativeBinomialCDFComplement(r.proj, NB_PHI.rushTd); }
-  else if (ctx.pos === "QB") { pNoRush = 1 - negativeBinomialCDFComplement(qbRushTdMean(ctx), NB_PHI.rushTd); }
-  if (ctx.pos !== "K" && ctx.pos !== "DST" && ctx.pos !== "QB") { const r = projectWR(ctx, "Receiving TDs", -1); pNoRec = 1 - negativeBinomialCDFComplement(r.proj, NB_PHI.recTd); }
+  if (ctx.pos === "RB" || ctx.pos === "QB") { const r = ctx.pos === "QB" ? { proj: 0 } : projectRB(ctx, "Rush TDs", -1); pNoRush = 1 - negativeBinomialCDFComplement(r.proj, NB_PHI.rushTd); }
+  if (ctx.pos !== "K" && ctx.pos !== "DST") { const r = projectWR(ctx, "Receiving TDs", -1); pNoRec = 1 - negativeBinomialCDFComplement(r.proj, NB_PHI.recTd); }
   const pAtLeastOne = 1 - pNoRush * pNoRec * pNoPass;
   return clamp(pAtLeastOne, 0.001, 0.98);
 }
@@ -721,9 +670,8 @@ function evalBet(b, pre) {
   const fairRef = novig != null ? novig : imp;
   const modelP = calibrateToMarket(rawP, fairRef, b.type);
   const bmult = isNaN(odds) ? 0 : (odds > 0 ? odds / 100 : 100 / -odds);
-  const floorMult = softFloorMult(modelP, b.type);
-  const edge = applySoftFloor((modelP != null && fairRef != null) ? modelP - fairRef : null, floorMult);
-  const ev = applySoftFloor((modelP != null && !isNaN(odds)) ? evPerUnit(modelP, odds) : null, floorMult);
+  const edge = (modelP != null && fairRef != null) ? modelP - fairRef : null;
+  const ev = (modelP != null && !isNaN(odds)) ? evPerUnit(modelP, odds) : null;
   return { modelP, rawModelP: rawP, proj, calc, imp, novig, edge, ev, b: bmult, fair: modelP != null ? probToAmerican(modelP) : "—", devigged: b.overOdds != null && b.underOdds != null };
 }
 
@@ -936,6 +884,19 @@ const STAT_ALIASES = {
   longCmp: ["longPassing", "passingLong"],
 };
 const LONG_KEYS = ["longRec", "longRush", "longCmp"]; // gated-average, not summed, in fetchAthleteGamelog
+// Trends tab: maps each player-prop label to the per-game gamelog field (same STAT_ALIASES
+// vocabulary fetchAthleteGamelog already populates on every `games[]` row) that a trend's hit-rate
+// check reads. "Anytime TD" has no raw alias — it's a derived combo (rushTd + recTd), handled as a
+// special case in trendValueForGame(). Game-level props (Moneyline/Spread/Total) and DST props are
+// out of v1 scope: Trends is pure player box-score history, nothing ESPN's gamelog doesn't carry.
+const TREND_STAT_KEY = {
+  "Pass Yards": "passYds", "Pass TDs": "passTd", "Interceptions": "ints",
+  "Pass Completions": "passCmp", "Pass Attempts": "passAtt", "Longest Completion": "longCmp",
+  "Rush Yards": "rushYds", "Rush TDs": "rushTd", "Longest Rush": "longRush",
+  "Receptions": "rec", "Receiving Yards": "recYds", "Receiving TDs": "recTd", "Longest Reception": "longRec",
+  "Kicking Points": "kickPts", "Field Goals Made": "fgMade",
+};
+const TREND_PROPS = [...QB_PROPS, ...RB_PROPS, ...WR_PROPS, ...TD_PROPS, ...K_PROPS].filter((t, i, a) => a.indexOf(t) === i);
 function pickAlias(names, key) {
   const cands = STAT_ALIASES[key] || [key];
   for (const c of cands) { const i = names.findIndex((n) => String(n).toLowerCase() === c.toLowerCase()); if (i >= 0) return i; }
@@ -1032,6 +993,64 @@ async function fetchAthleteGamelog(athleteId, n = 4, season = null) {
 
     return { season, recent, games };
   } catch { return null; }
+}
+
+/* ---- Trends tab: pure hit-rate computation over a player's own gamelog rows ----
+   Every number here is backward-looking box-score history — no projection model, no Odds API
+   call. A "trend" is just: did this player's real per-game stat clear this line, how often, across
+   three slices of their own history (recent form / vs this opponent / this venue type). */
+function trendValueForGame(row, type) {
+  if (type === "Anytime TD") return (row.rushTd || 0) + (row.recTd || 0);
+  const key = TREND_STAT_KEY[type];
+  if (!key) return null;
+  const v = row[key];
+  return v != null ? v : 0;
+}
+function hitRateFromGames(games, type, line, side) {
+  if (!games || !games.length) return { n: 0, hits: 0, pct: null };
+  let hits = 0, counted = 0;
+  for (const row of games) {
+    const v = trendValueForGame(row, type);
+    if (v == null) continue;
+    counted++;
+    if (side === "under" ? v < line : v > line) hits++;
+  }
+  return { n: counted, hits, pct: counted ? hits / counted : null };
+}
+// Builds one Trends card for a player+prop, given their already-fetched gamelog (`gl`, from
+// fetchAthleteGamelog — no new fetch here). Sources the line from a matching Board entry (today's
+// real pulled odds, zero additional Odds API cost) when one exists; otherwise synthesizes a
+// model-free round-number threshold from the player's own recent average (Linemate does the same
+// for players/games nobody's pulled odds on yet) so Trends works even on a day with zero Odds API
+// usage. `boardEntriesForGame` should already be pre-filtered to this one game.
+function buildTrendCard(p, pos, type, gl, g, isHome, boardEntriesForGame, recentN) {
+  if (!gl || !gl.games || !gl.games.length) return null;
+  const oppAbbr = isHome ? g.away : g.home;
+  const matches = boardEntriesForGame.filter((e) => String(e.playerId) === String(p.id) && e.type === type);
+  const chosen = matches.find((e) => e.side === "over") || matches.find((e) => e.side === "under") || null;
+  let line, side, sourced, odds = null, boardEntryId = null;
+  if (chosen) {
+    line = parseFloat(chosen.line); side = chosen.side; sourced = "book"; odds = chosen.odds; boardEntryId = chosen.id;
+  } else {
+    const recentVals = gl.games.slice(0, recentN).map((row) => trendValueForGame(row, type)).filter((v) => v != null);
+    if (!recentVals.length) return null;
+    const avg = recentVals.reduce((a, b) => a + b, 0) / recentVals.length;
+    let synth = Math.floor(avg) + 0.5; if (synth > avg) synth -= 1;
+    line = Math.max(0.5, synth); side = "over"; sourced = "model";
+  }
+  const recentGames = gl.games.slice(0, recentN);
+  const recentForm = hitRateFromGames(recentGames, type, line, side);
+  const h2hGames = gl.games.filter((row) => row.opp === oppAbbr);
+  const vsOpp = hitRateFromGames(h2hGames, type, line, side);
+  const wantAtVs = isHome ? "vs" : "@";
+  const venueGames = gl.games.filter((row) => row.atVs === wantAtVs);
+  const homeAway = hitRateFromGames(venueGames, type, line, side);
+  if (!recentForm.n && !vsOpp.n && !homeAway.n) return null;
+  return {
+    id: `${g.pk}-${p.id}-${type}-${line}-${side}`, gamePk: g.pk, game: `${g.away}@${g.home}`,
+    playerId: p.id, name: p.name, pos, type, line, side, sourced, odds, boardEntryId,
+    recentForm, vsOpp, homeAway, opp: oppAbbr, isHome,
+  };
 }
 
 // ---- settlement-only: pull ONE game's "longest completion" value out of a QB's gamelog.
@@ -1586,6 +1605,17 @@ export default function NFLApp() {
   const [sideFilter, setSideFilter] = useState("all");
   const [classFilter, setClassFilter] = useState("all"); // all | props | lines
   const [showProjBar, setShowProjBar] = useState(true); // toggles the proj-vs-line buffer bar on Board rows
+  /* ---- Trends tab filter state ---- */
+  const [trendSearch, setTrendSearch] = useState("");
+  const [trendCatFilter, setTrendCatFilter] = useState("all"); // prop type, mirrors Board's catFilter
+  const [trendGameFilter, setTrendGameFilter] = useState("all");
+  const [trendSideFilter, setTrendSideFilter] = useState("all"); // all | over | under
+  const [trendSplit, setTrendSplit] = useState("recentForm"); // which of the 3 splits drives min-hit/sort
+  const [trendRecentN, setTrendRecentN] = useState(8); // "recent form" sample size (capped by GAMELOG_ROWS=8)
+  const [trendMinHit, setTrendMinHit] = useState("");
+  const [trendSourceFilter, setTrendSourceFilter] = useState("all"); // all | book | model
+  const [trendSort, setTrendSort] = useState("hit_desc");
+  const [showMoreTrends, setShowMoreTrends] = useState(false);
   const [analysisProfile, setAnalysisProfile] = useState(null); // { player, game, side }
   const [analysisQuery, setAnalysisQuery] = useState("");
   const [analysisResults, setAnalysisResults] = useState([]);
@@ -1947,6 +1977,59 @@ export default function NFLApp() {
   const filtersActive = classFilter !== "all" || catFilter !== "all" || gameFilter !== "all" || sideFilter !== "all" || minEdge !== "" || minModel !== "" || minEV !== "" || minOdds !== "" || maxOdds !== "" || minDelta !== "" || maxDelta !== "" || dirAligned || boardSearch !== "";
   function clearFilters() { setClassFilter("all"); setCatFilter("all"); setGameFilter("all"); setSideFilter("all"); setMinEdge(""); setMinModel(""); setMinEV(""); setMinOdds(""); setMaxOdds(""); setMinDelta(""); setMaxDelta(""); setDirAligned(false); setBoardSearch(""); }
 
+  /* ---- Trends (recent form / head-to-head / home-away hit rates) — pure client-side view over
+     detail[g.pk].gamelogs, already fetched by loadDetail() for Slate/Board use. No new network
+     calls for any game whose detail is already loaded; games not yet loaded just show 0 cards
+     until "load trends" (loadDetail) runs for them. ---- */
+  const trendCards = useMemo(() => {
+    const out = [];
+    for (const g of games) {
+      const d = detail[g.pk];
+      if (!d || !d.ready) continue;
+      const bEntriesForGame = boardEntries.filter((e) => String(e.gamePk) === String(g.pk));
+      for (const side of ["home", "away"]) {
+        const isHome = side === "home";
+        const teamData = isHome ? d.home : d.away;
+        if (!teamData || !teamData.featured) continue;
+        for (const p of teamData.featured) {
+          const posKey = p.pos === "PK" ? "K" : p.pos;
+          const props = [...propsForPos(posKey), ...(posKey !== "K" && posKey !== "DST" ? ["Anytime TD"] : [])];
+          for (const type of props) {
+            const card = buildTrendCard(p, posKey, type, gamelogFor(d, p.id), g, isHome, bEntriesForGame, trendRecentN);
+            if (card) out.push(card);
+          }
+        }
+      }
+    }
+    return out;
+  }, [games, detail, boardEntries, trendRecentN]);
+  const trendGames = useMemo(() => {
+    const seen = {}; const out = [];
+    for (const c of trendCards) if (!seen[c.gamePk]) { seen[c.gamePk] = 1; out.push({ pk: String(c.gamePk), label: c.game }); }
+    return out;
+  }, [trendCards]);
+  const filteredTrends = useMemo(() => {
+    const minHit = parseFloat(trendMinHit);
+    const f = trendCards.filter((c) => {
+      if (trendCatFilter !== "all" && c.type !== trendCatFilter) return false;
+      if (trendGameFilter !== "all" && String(c.gamePk) !== trendGameFilter) return false;
+      if (trendSideFilter !== "all" && c.side !== trendSideFilter) return false;
+      if (trendSourceFilter !== "all" && c.sourced !== trendSourceFilter) return false;
+      if (trendSearch && !`${c.name} ${c.game}`.toLowerCase().includes(trendSearch.toLowerCase())) return false;
+      if (!isNaN(minHit)) { const s = c[trendSplit]; if (!(s && s.pct != null && s.pct * 100 >= minHit)) return false; }
+      return true;
+    });
+    f.sort((a, b) => {
+      if (trendSort === "name_asc") return a.name.localeCompare(b.name);
+      const pa = (a[trendSplit] && a[trendSplit].pct != null) ? a[trendSplit].pct : -1;
+      const pb = (b[trendSplit] && b[trendSplit].pct != null) ? b[trendSplit].pct : -1;
+      return trendSort === "hit_asc" ? pa - pb : pb - pa;
+    });
+    return f;
+  }, [trendCards, trendCatFilter, trendGameFilter, trendSideFilter, trendSourceFilter, trendSearch, trendMinHit, trendSplit, trendSort]);
+  const trendFiltersActive = trendCatFilter !== "all" || trendGameFilter !== "all" || trendSideFilter !== "all" || trendSourceFilter !== "all" || trendSearch !== "" || trendMinHit !== "";
+  function clearTrendFilters() { setTrendCatFilter("all"); setTrendGameFilter("all"); setTrendSideFilter("all"); setTrendSourceFilter("all"); setTrendSearch(""); setTrendMinHit(""); }
+
   /* ---- my bets ---- */
   function trackBet(e) {
     const exists = myBets.some((b) => b.key === e.id);
@@ -2173,9 +2256,8 @@ export default function NFLApp() {
       const odds = Number(b.odds);
       const modelP = b.modelP, imp = isNaN(odds) ? null : impliedProb(odds);
       const fairRef = b.novig != null ? b.novig : imp;
-      const floorMult = softFloorMult(modelP, b.type);
-      const edge = applySoftFloor((modelP != null && fairRef != null) ? modelP - fairRef : null, floorMult);
-      const ev = applySoftFloor((modelP != null && !isNaN(odds)) ? evPerUnit(modelP, odds) : null, floorMult);
+      const edge = (modelP != null && fairRef != null) ? modelP - fairRef : null;
+      const ev = (modelP != null && !isNaN(odds)) ? evPerUnit(modelP, odds) : null;
       const units = b.units != null ? b.units : 1;
       const suggested = b.suggested != null ? b.suggested : suggestedUnits(modelP, odds);
       // CLV: positive = market moved toward your side since you bet (your side's price shortened) = you beat the line
@@ -2306,6 +2388,7 @@ export default function NFLApp() {
   /* ---------------------- render ---------------------- */
   const TABS = [
     { k: "slate", t: "Slate" }, { k: "board", t: `Board${boardEntries.length ? ` (${boardEntries.length})` : ""}` },
+    { k: "trends", t: `Trends${trendCards.length ? ` (${trendCards.length})` : ""}` },
     { k: "analysis", t: "Player Analysis" }, { k: "bets", t: `My Bets${myBets.filter((b) => b.status === "open").length ? ` (${myBets.filter((b) => b.status === "open").length})` : ""}` },
     { k: "stats", t: "Stats" },
   ];
@@ -2487,6 +2570,59 @@ export default function NFLApp() {
                   </div>
                 </div>
               ))
+            )}
+          </div>
+        )}
+
+        {/* ---------------- TRENDS ---------------- */}
+        {tab === "trends" && (
+          <div className="mt-3">
+            <div className="flex items-center gap-2 flex-wrap mb-3">
+              <input value={trendSearch} onChange={(e) => setTrendSearch(e.target.value)} placeholder="search player or team" className="bg-slate-950 border border-slate-700 rounded px-2.5 py-1.5 text-sm w-44 text-slate-100" />
+              <Sel compact label="prop" v={trendCatFilter} opts={["all", ...TREND_PROPS]} labels={{ all: "All props" }} onChange={setTrendCatFilter} />
+              <Sel compact label="game" v={trendGameFilter} opts={["all", ...trendGames.map((g) => g.pk)]} labels={{ all: "All games", ...Object.fromEntries(trendGames.map((g) => [g.pk, g.label])) }} onChange={setTrendGameFilter} />
+              <Sel compact label="side" v={trendSideFilter} opts={["all", "over", "under"]} labels={{ all: "Both" }} onChange={setTrendSideFilter} />
+              <Sel compact label="split" v={trendSplit} opts={["recentForm", "vsOpp", "homeAway"]} labels={{ recentForm: "Recent Form", vsOpp: "Head to Head", homeAway: "Home/Away" }} onChange={setTrendSplit} />
+              <Sel compact label="sample" v={trendRecentN} opts={[3, 5, 8]} labels={{ 3: "last 3", 5: "last 5", 8: "last 8" }} onChange={(v) => setTrendRecentN(+v)} />
+              {(() => { const n = (trendMinHit !== "" ? 1 : 0) + (trendSourceFilter !== "all" ? 1 : 0); return (
+                <button onClick={() => setShowMoreTrends((s) => !s)} className={`text-xs rounded px-2.5 py-1.5 border ${showMoreTrends || n ? "border-emerald-700 text-emerald-300" : "border-slate-700 text-slate-400 hover:text-slate-200"}`}>filters{n ? ` (${n})` : ""} {showMoreTrends ? "▴" : "▾"}</button>
+              ); })()}
+              {trendFiltersActive && <button onClick={clearTrendFilters} className="text-[11px] text-slate-400 hover:text-rose-300 border border-slate-700 rounded px-2.5 py-1.5">clear</button>}
+              <div className="ml-auto text-[11px] text-slate-500" style={mono}>{filteredTrends.length} trends</div>
+            </div>
+            {showMoreTrends && (
+              <div className="flex items-end gap-3 flex-wrap mb-3 p-2.5 rounded-lg bg-slate-900/40 border border-slate-800">
+                <label className="text-xs text-slate-400 flex flex-col gap-1">min hit rate %
+                  <input value={trendMinHit} onChange={(e) => setTrendMinHit(e.target.value)} placeholder="any" inputMode="decimal" className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-20 text-slate-100" />
+                </label>
+                <Sel compact label="line source" v={trendSourceFilter} opts={["all", "book", "model"]} labels={{ all: "Any", book: "Book line", model: "Model-free" }} onChange={setTrendSourceFilter} />
+                <Sel compact label="sort" v={trendSort} opts={["hit_desc", "hit_asc", "name_asc"]} labels={{ hit_desc: "Hit rate ↓", hit_asc: "Hit rate ↑", name_asc: "Name A-Z" }} onChange={setTrendSort} />
+              </div>
+            )}
+            {games.length === 0 ? (
+              <div className="text-sm text-slate-500 py-10 text-center">Load a slate first (Slate tab) to build trends.</div>
+            ) : trendCards.length === 0 ? (
+              <div className="text-sm text-slate-500 py-10 text-center">
+                No game/player data loaded yet. Trends reads the same roster + gamelog data the Slate/Board tabs already pull — no Odds API credits needed.
+                <div className="mt-3"><button onClick={() => games.forEach((g) => loadDetail(g))} className="bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-sm rounded-lg px-3 py-1.5">Load trends for all games</button></div>
+              </div>
+            ) : filteredTrends.length === 0 ? (
+              <div className="text-sm text-slate-500 py-10 text-center">No trends pass the current filter.</div>
+            ) : (
+              <div className="space-y-2">
+                {filteredTrends.map((c) => {
+                  const entry = c.boardEntryId ? boardEntries.find((e) => e.id === c.boardEntryId) : null;
+                  return <TrendCard key={c.id} c={c} entry={entry} tracked={entry ? myBets.some((b) => b.key === entry.id) : false} onTrack={trackBet} />;
+                })}
+              </div>
+            )}
+            {games.length > 0 && (
+              <div className="mt-3 flex items-center gap-2 text-[11px] text-slate-500">
+                <span>{games.filter((g) => detail[g.pk] && detail[g.pk].ready).length}/{games.length} games loaded for trends.</span>
+                {games.some((g) => !(detail[g.pk] && detail[g.pk].ready)) && (
+                  <button onClick={() => games.forEach((g) => loadDetail(g))} className="text-[11px] text-emerald-400 hover:text-emerald-300 border border-slate-700 rounded px-2 py-1">load remaining</button>
+                )}
+              </div>
             )}
           </div>
         )}
@@ -2919,6 +3055,47 @@ function BoardRow({ e, tracked, onTrack, showProjBar = true }) {
         </div>
       )}
       {show && <MathPanel r={e} />}
+    </div>
+  );
+}
+function TrendPill({ label, s }) {
+  if (!s || !s.n) {
+    return (
+      <div className="flex-1 min-w-[88px] text-center bg-slate-950/60 border border-slate-800 rounded-lg px-2 py-1.5">
+        <div className="text-[10px] text-slate-500 uppercase tracking-wide truncate">{label}</div>
+        <div className="text-slate-600 text-sm">no data</div>
+      </div>
+    );
+  }
+  const pct = Math.round(s.pct * 100);
+  const color = pct >= 70 ? "text-emerald-400" : pct <= 30 ? "text-rose-400" : "text-slate-200";
+  return (
+    <div className="flex-1 min-w-[88px] text-center bg-slate-950/60 border border-slate-800 rounded-lg px-2 py-1.5">
+      <div className="text-[10px] text-slate-500 uppercase tracking-wide truncate">{label}</div>
+      <div className={`text-sm font-bold ${color}`}>{s.hits}/{s.n} <span className="text-[11px]">({pct}%)</span></div>
+    </div>
+  );
+}
+function TrendCard({ c, entry, tracked, onTrack }) {
+  return (
+    <div className="bg-slate-900/70 border border-slate-800 rounded-xl overflow-hidden">
+      <div className="flex items-center gap-3 px-4 py-3 flex-wrap">
+        <div className="flex-1 min-w-[160px]">
+          <div className="font-semibold truncate">{c.name} <span className="text-slate-500 text-xs">{c.game}</span></div>
+          <div className="text-[11px] text-slate-400" style={mono}>
+            {c.side} {c.line} {c.type}{c.odds != null ? ` @ ${fmtOdds(c.odds)}` : ""}
+            <span className={`ml-1.5 ${c.sourced === "book" ? "text-sky-400" : "text-slate-500"}`}>{c.sourced === "book" ? "· book line" : "· model-free line"}</span>
+          </div>
+        </div>
+        <div className="flex gap-1.5 flex-wrap">
+          <TrendPill label="Recent Form" s={c.recentForm} />
+          <TrendPill label={`vs ${c.opp || "OPP"}`} s={c.vsOpp} />
+          <TrendPill label={c.isHome ? "Home" : "Away"} s={c.homeAway} />
+        </div>
+        {entry && (
+          <button onClick={() => onTrack(entry)} disabled={tracked} className={`text-[11px] font-bold rounded px-2 py-1 ${tracked ? "bg-slate-700 text-slate-400" : "bg-emerald-600 hover:bg-emerald-500 text-white"}`}>{tracked ? "tracked" : "track"}</button>
+        )}
+      </div>
     </div>
   );
 }
