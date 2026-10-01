@@ -603,15 +603,32 @@ async function fetchDepthChart(teamId, year) {
   } catch { return {}; }
 }
 
-/* ---- athlete gamelog: season + recent-N aggregate, column-tolerant ---- */
-function findStatArrays(node, names, depth, out) {
-  if (depth > 8 || node == null) return;
-  if (Array.isArray(node)) {
-    if (node.length === names.length && node.every((x) => typeof x === "string" || typeof x === "number" || x === "")) out.push(node);
-    else node.forEach((c) => findStatArrays(c, names, depth + 1, out));
-  } else if (typeof node === "object") {
-    for (const k in node) findStatArrays(node[k], names, depth + 1, out);
+/* ---- athlete gamelog: season + recent-N aggregate, column-tolerant ----
+   FIXED (was the same bug NFL's gamelog fetch had, confirmed live and shipped a few weeks back):
+   findStatArrays() used to search `d.events || d` — a dict of game METADATA (opponent, date,
+   atVs) that never contains stat values — for arrays matching names[].length, which is why it
+   always came back empty in practice (any array of the right length anywhere in that metadata
+   tree could also false-match, silently). The REAL per-game numbers live under
+   `d.seasonTypes[].categories[].events[]`, an array of {eventId, stats} rows, joined to the
+   metadata by eventId — exactly the structure NFL's statsByEventFromGamelog() already parses
+   correctly for this same ESPN gamelog endpoint shape, reused verbatim here. */
+function statsByEventFromGamelog(d, idx) {
+  const out = {};
+  for (const st of d.seasonTypes || []) {
+    for (const cat of st.categories || []) {
+      const ev = cat.events;
+      if (!ev) continue;
+      const rows = Array.isArray(ev) ? ev : (typeof ev === "object" ? Object.values(ev) : []);
+      for (const row of rows) {
+        if (!row || !row.stats) continue;
+        const eid = row.eventId != null ? String(row.eventId) : null;
+        if (!eid) continue;
+        const rec = (out[eid] = out[eid] || {});
+        for (const k in idx) if (idx[k] >= 0 && row.stats[idx[k]] != null) rec[k] = num(row.stats[idx[k]]);
+      }
+    }
   }
+  return out;
 }
 function num(v) { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; }
 const STAT_ALIASES = {
@@ -625,37 +642,120 @@ function pickAlias(names, key) {
   return -1;
 }
 const GAMELOG_ROWS = 10; // "Last N Games" log table
-async function fetchAthleteGamelog(athleteId, n = 10) {
+// `season` param added (NBA never had one before) so a thin-sample fallback to last season's real
+// gamelog is possible here the same way NFL's is — see loadDetail()'s priorGamelogs fetch and
+// trendGamelogFor(). NOTE: unlike the NFL version this function was ported from, the local
+// season-aggregate variable below was deliberately named `seasonAgg` from the start, not `season`
+// — that exact name collision (a parameter and a later `const` sharing one name) was the actual
+// root cause of NFL's gamelog fetch throwing on every single call for weeks; see that file's
+// fetchAthleteGamelog for the full account of what that looked like and how it was found.
+async function fetchAthleteGamelog(athleteId, n = 10, season = null) {
   try {
-    const d = await jget(`${ESPN_WEB}/athletes/${athleteId}/gamelog`);
+    const url = `${ESPN_WEB}/athletes/${athleteId}/gamelog` + (season ? `?season=${season}` : "");
+    const d = await jget(url);
     const names = d.names || [];
-    if (!names.length) return null;
-    const rows = [];
-    findStatArrays(d.events || d, names, 0, rows);
+    if (!names.length) { console.warn(`[gamelog] empty names[] for athlete ${athleteId}${season ? ` (season ${season})` : ""} — response: ${JSON.stringify(d).slice(0, 200)}`); return null; }
     const idx = {};
     for (const k in STAT_ALIASES) idx[k] = pickAlias(names, k);
-    const toRec = (row) => { const r = {}; for (const k in idx) if (idx[k] >= 0) r[k] = num(row[idx[k]]); return r; };
-    const all = rows.map(toRec);
-    const sum = (arr) => arr.reduce((acc, r) => { for (const k in r) acc[k] = (acc[k] || 0) + r[k]; return acc; }, { g: arr.length });
-    const season = sum(all); season.g = all.length;
+    const statsByEvent = statsByEventFromGamelog(d, idx);
+
+    // Chronological order by the metadata's own date — NBA gamelog rows have no "week" field
+    // (unlike NFL), just gameDate, so sort by that alone.
+    const eventsObj = (d.events && typeof d.events === "object" && !Array.isArray(d.events)) ? d.events : {};
+    const eventIds = Object.keys(eventsObj).sort((a, b) => {
+      const da = eventsObj[a] && eventsObj[a].gameDate ? Date.parse(eventsObj[a].gameDate) : 0;
+      const db = eventsObj[b] && eventsObj[b].gameDate ? Date.parse(eventsObj[b].gameDate) : 0;
+      return da - db;
+    });
+    const all = eventIds.map((eid) => statsByEvent[eid] || {});
+    const sum = (arr) => arr.reduce((acc, r) => { for (const k in r) acc[k] = (acc[k] || 0) + (r[k] || 0); return acc; }, { g: arr.length });
+    const seasonAgg = sum(all); seasonAgg.g = all.length;
     const recentSlice = all.slice(-n);
     const recent = sum(recentSlice); recent.games = recentSlice.length;
 
-    let games = [];
-    const eventsObj = (d.events && typeof d.events === "object" && !Array.isArray(d.events)) ? d.events : null;
-    if (eventsObj) {
-      const eventIds = Object.keys(eventsObj);
-      if (eventIds.length && eventIds.length === all.length) {
-        games = eventIds.map((eid, i) => {
-          const ev = eventsObj[eid] || {};
-          const opp = (ev.opponent && (ev.opponent.abbreviation || ev.opponent.displayName)) || null;
-          return { eventId: eid, date: ev.gameDate || ev.date || null, atVs: ev.atVs || null, opp, score: ev.score || null, result: ev.gameResult || null, ...all[i] };
-        });
-      }
-    }
+    // Per-game log rows (date/opponent) for the "Last N Games" table — metadata and stats are
+    // joined by event id directly, same as NFL's fixed version (no positional-pairing risk).
+    let games = eventIds.map((eid) => {
+      const ev = eventsObj[eid] || {};
+      const opp = (ev.opponent && (ev.opponent.abbreviation || ev.opponent.displayName)) || null;
+      return { eventId: eid, date: ev.gameDate || ev.date || null, atVs: ev.atVs || null, opp, score: ev.score || null, result: ev.gameResult || null, ...(statsByEvent[eid] || {}) };
+    });
     games = games.slice(-GAMELOG_ROWS).reverse();
-    return { season, recent, games };
-  } catch { return null; }
+    return { season: seasonAgg, recent, games };
+  } catch (e) { console.warn(`[gamelog] fetch threw for athlete ${athleteId}${season ? ` (season ${season})` : ""}:`, (e && e.message) || e); return null; }
+}
+
+/* ---- Trends tab: pure hit-rate computation over a player's own gamelog rows (ported from the
+   NFL app's Trends tab — see that file for the full mechanic writeup). For a player+prop, shows
+   backward-looking hit rates across three splits of their own game history: Recent Form, Head to
+   Head (vs the upcoming opponent), Home/Away. No projection model, no Odds API credits. */
+const TREND_STAT_KEY = {
+  "Points": "pts", "Rebounds": "reb", "Assists": "ast", "Three-Pointers Made": "fg3m",
+  "Steals": "stl", "Blocks": "blk", "Turnovers": "tov",
+};
+const TREND_PROPS = ALL_PLAYER_PROPS; // every NBA prop type is trend-eligible — no position gating like NFL's
+function trendValueForGame(row, type) {
+  if (type === "Pts+Reb+Ast") return (row.pts || 0) + (row.reb || 0) + (row.ast || 0);
+  if (type === "Pts+Reb") return (row.pts || 0) + (row.reb || 0);
+  if (type === "Pts+Ast") return (row.pts || 0) + (row.ast || 0);
+  if (type === "Reb+Ast") return (row.reb || 0) + (row.ast || 0);
+  if (type === "Blocks+Steals") return (row.blk || 0) + (row.stl || 0);
+  if (type === "Double-Double" || type === "Triple-Double") {
+    const catsAt10 = [row.pts || 0, row.reb || 0, row.ast || 0, row.stl || 0, row.blk || 0].filter((v) => v >= 10).length;
+    return catsAt10 >= (type === "Triple-Double" ? 3 : 2) ? 1 : 0;
+  }
+  const key = TREND_STAT_KEY[type];
+  if (!key) return null;
+  const v = row[key];
+  return v != null ? v : 0;
+}
+function hitRateFromGames(games, type, line, side) {
+  if (!games || !games.length) return { n: 0, hits: 0, pct: null };
+  let hits = 0, counted = 0;
+  for (const row of games) {
+    const v = trendValueForGame(row, type);
+    if (v == null) continue;
+    counted++;
+    if (side === "under" ? v < line : v > line) hits++;
+  }
+  return { n: counted, hits, pct: counted ? hits / counted : null };
+}
+// Builds one Trends card for a player+prop from their already-fetched gamelog (`gl` — current
+// season rows, or current+prior merged by trendGamelogFor() when the current season is thin).
+// Sources the line from a matching Board entry when one exists (real odds, zero additional Odds
+// API cost); otherwise synthesizes a model-free round-number threshold from the player's recent
+// average. Double-Double/Triple-Double always use a fixed 0.5 "over" (=yes) line when synthesized,
+// matching how this app already treats them as yes/no bets (isYesNoType) rather than real lines.
+function buildTrendCard(p, type, gl, g, isHome, boardEntriesForGame, recentN) {
+  if (!gl || !gl.games || !gl.games.length) return null;
+  const oppAbbr = isHome ? g.away : g.home;
+  const matches = boardEntriesForGame.filter((e) => String(e.playerId) === String(p.id) && e.type === type);
+  const chosen = matches.find((e) => e.side === "over") || matches.find((e) => e.side === "under") || null;
+  let line, side, sourced, odds = null, boardEntryId = null;
+  if (chosen) {
+    line = parseFloat(chosen.line); side = chosen.side; sourced = "book"; odds = chosen.odds; boardEntryId = chosen.id;
+  } else if (type === "Double-Double" || type === "Triple-Double") {
+    line = 0.5; side = "over"; sourced = "model";
+  } else {
+    const recentVals = gl.games.slice(0, recentN).map((row) => trendValueForGame(row, type)).filter((v) => v != null);
+    if (!recentVals.length) return null;
+    const avg = recentVals.reduce((a, b) => a + b, 0) / recentVals.length;
+    let synth = Math.floor(avg) + 0.5; if (synth > avg) synth -= 1;
+    line = Math.max(0.5, synth); side = "over"; sourced = "model";
+  }
+  const recentGames = gl.games.slice(0, recentN);
+  const recentForm = hitRateFromGames(recentGames, type, line, side);
+  const h2hGames = gl.games.filter((row) => row.opp === oppAbbr);
+  const vsOpp = hitRateFromGames(h2hGames, type, line, side);
+  const wantAtVs = isHome ? "vs" : "@";
+  const venueGames = gl.games.filter((row) => row.atVs === wantAtVs);
+  const homeAway = hitRateFromGames(venueGames, type, line, side);
+  if (!recentForm.n && !vsOpp.n && !homeAway.n) return null;
+  return {
+    id: `${g.pk}-${p.id}-${type}-${line}-${side}`, gamePk: g.pk, game: `${g.away}@${g.home}`,
+    playerId: p.id, name: p.name, type, line, side, sourced, odds, boardEntryId,
+    recentForm, vsOpp, homeAway, opp: oppAbbr, isHome,
+  };
 }
 
 /* ---- team season stats + standings ---- */
@@ -1079,6 +1179,18 @@ export default function NBAApp() {
   const [sideFilter, setSideFilter] = useState("all");
   const [classFilter, setClassFilter] = useState("all");
   const [showProjBar, setShowProjBar] = useState(true);
+  /* ---- Trends tab filter state (ported from NFL) ---- */
+  const [trendSearch, setTrendSearch] = useState("");
+  const [trendCatFilter, setTrendCatFilter] = useState("all");
+  const [trendGameFilter, setTrendGameFilter] = useState("all");
+  const [trendSideFilter, setTrendSideFilter] = useState("all");
+  const [trendSplit, setTrendSplit] = useState("recentForm");
+  const [trendRecentN, setTrendRecentN] = useState(8);
+  const [trendMinHit, setTrendMinHit] = useState("");
+  const [trendSourceFilter, setTrendSourceFilter] = useState("all");
+  const [trendSort, setTrendSort] = useState("hit_desc");
+  const [showMoreTrends, setShowMoreTrends] = useState(false);
+  const [trendBulkLoading, setTrendBulkLoading] = useState(null);
   const [analysisProfile, setAnalysisProfile] = useState(null);
   const [analysisQuery, setAnalysisQuery] = useState("");
   const [analysisResults, setAnalysisResults] = useState([]);
@@ -1173,9 +1285,24 @@ export default function NBAApp() {
     const featH = featuredFromRosterAndDepth(rosterH, depthH);
     const featA = featuredFromRosterAndDepth(rosterA, depthA);
     const gamelogs = {};
+    const priorGamelogs = {};
     const tasks = [];
     for (const p of [...featH, ...featA]) {
-      tasks.push(fetchAthleteGamelog(p.id, 10).then((gl) => { gamelogs[p.id] = gl; }).catch(() => {}));
+      tasks.push(
+        fetchAthleteGamelog(p.id, 10).then(async (gl) => {
+          gamelogs[p.id] = gl;
+          // Same prior-season fallback NFL's loadDetail added for its Trends tab: early in a
+          // season (or any thin-sample stretch) the current season's gamelog alone may not have
+          // enough games for a meaningful "last N games" read. Trigger on empty OR thin (fewer
+          // than GAMELOG_ROWS games), not just fully empty, so Trends has real prior-season rows
+          // to fall back on instead of going blank. No behavior change for anything that doesn't
+          // read priorGamelogs — projectPlayer still only reads gl.season/gl.recent/gl.games.
+          if (!gl || !gl.games || gl.games.length < GAMELOG_ROWS) {
+            const prior = await fetchAthleteGamelog(p.id, 10, year - 1).catch(() => null);
+            if (prior) priorGamelogs[p.id] = prior;
+          }
+        }).catch(() => {})
+      );
     }
     await Promise.allSettled(tasks);
     const sH = standings[g.homeId] || {}, sA = standings[g.awayId] || {};
@@ -1190,7 +1317,7 @@ export default function NBAApp() {
       ready: true, loading: false,
       home: { roster: rosterH, depth: depthH, featured: featH, teamStats: teamStatsH, standings: sH, rest: restH },
       away: { roster: rosterA, depth: depthA, featured: featA, teamStats: teamStatsA, standings: sA, rest: restA },
-      gamelogs, lambdaH, lambdaA,
+      gamelogs, priorGamelogs, lambdaH, lambdaA,
     };
     setDetail((p) => ({ ...p, [g.pk]: obj }));
     inflight.current.delete(g.pk);
@@ -1200,6 +1327,25 @@ export default function NBAApp() {
     if (open === g.pk) { setOpen(null); return; }
     setOpen(g.pk);
     if (!g.manual) await loadDetail(g);
+  }
+
+  // Trends-only bulk loader — loads games ONE AT A TIME, not all at once (games.forEach with no
+  // await). NFL's first version of this fired loadDetail for every game on the slate
+  // simultaneously, which — combined with its separate gamelog bug — looked exactly like a
+  // self-inflicted concurrency/rate-limit problem. It turned out not to be the actual bug there,
+  // but loading one game at a time is still the same request pattern Slate/Board already use
+  // (one game, not sixteen, fanning out its own ~10-20 gamelog calls), so it stays the safe default
+  // here too. Reports progress so the button doesn't look frozen.
+  async function loadTrendsForGames(list) {
+    if (trendBulkLoading) return;
+    const todo = list.filter((g) => !(detail[g.pk] && detail[g.pk].ready));
+    if (!todo.length) return;
+    setTrendBulkLoading({ done: 0, total: todo.length });
+    for (let i = 0; i < todo.length; i++) {
+      await loadDetail(todo[i]).catch(() => {});
+      setTrendBulkLoading({ done: i + 1, total: todo.length });
+    }
+    setTrendBulkLoading(null);
   }
 
   /* ---- context builder: one featured player -> the ctx object projectPlayer consumes ---- */
@@ -1227,6 +1373,18 @@ export default function NBAApp() {
     };
   }
   function gamelogFor(d, pid) { return d && d.gamelogs ? d.gamelogs[pid] : null; }
+  // Trends-only: splice the prior-season fallback (already fetched by loadDetail when the current
+  // season is thin) onto the end of the current season's games — both already most-recent-first,
+  // so the combined list stays correctly ordered across the season boundary. Pure read of
+  // already-fetched state, no new network calls. Ported from the NFL app's identical helper.
+  function trendGamelogFor(d, pid) {
+    const gl = gamelogFor(d, pid);
+    const priorGl = d && d.priorGamelogs ? d.priorGamelogs[pid] : null;
+    const curGames = (gl && gl.games) || [];
+    const priorGames = (priorGl && priorGl.games) || [];
+    if (!curGames.length && !priorGames.length) return null;
+    return { games: [...curGames, ...priorGames] };
+  }
 
   async function runAnalysisSearch() {
     const q = analysisQuery.trim();
@@ -1364,6 +1522,82 @@ export default function NBAApp() {
   }, [boardEntries, boardSort, minEdge, minModel, minEV, minOdds, maxOdds, minDelta, maxDelta, dirAligned, catFilter, classFilter, gameFilter, sideFilter, boardSearch]);
   const filtersActive = classFilter !== "all" || catFilter !== "all" || gameFilter !== "all" || sideFilter !== "all" || minEdge !== "" || minModel !== "" || minEV !== "" || minOdds !== "" || maxOdds !== "" || minDelta !== "" || maxDelta !== "" || dirAligned || boardSearch !== "";
   function clearFilters() { setClassFilter("all"); setCatFilter("all"); setGameFilter("all"); setSideFilter("all"); setMinEdge(""); setMinModel(""); setMinEV(""); setMinOdds(""); setMaxOdds(""); setMinDelta(""); setMaxDelta(""); setDirAligned(false); setBoardSearch(""); }
+
+  /* ---- Trends (recent form / head-to-head / home-away hit rates) — pure client-side view over
+     detail[g.pk].gamelogs, already fetched by loadDetail() for Slate/Board use. Ported from NFL's
+     Trends tab; see that file for the fuller write-up of the mechanic and the debugging history
+     behind the diagnostics below. ---- */
+  const trendDebug = useMemo(() => {
+    let players = 0, withCurGames = 0, withAnyGames = 0, propAttempts = 0, cardsBuilt = 0;
+    for (const g of games) {
+      const d = detail[g.pk];
+      if (!d || !d.ready) continue;
+      const bEntriesForGame = boardEntries.filter((e) => String(e.gamePk) === String(g.pk));
+      for (const side of ["home", "away"]) {
+        const isHome = side === "home";
+        const teamData = isHome ? d.home : d.away;
+        if (!teamData || !teamData.featured) continue;
+        for (const p of teamData.featured) {
+          players++;
+          const gl = gamelogFor(d, p.id);
+          if (gl && gl.games && gl.games.length) withCurGames++;
+          const merged = trendGamelogFor(d, p.id);
+          if (merged && merged.games && merged.games.length) withAnyGames++;
+          for (const type of TREND_PROPS) {
+            propAttempts++;
+            if (buildTrendCard(p, type, merged, g, isHome, bEntriesForGame, trendRecentN)) cardsBuilt++;
+          }
+        }
+      }
+    }
+    return { players, withCurGames, withAnyGames, propAttempts, cardsBuilt };
+  }, [games, detail, boardEntries, trendRecentN]);
+  const trendCards = useMemo(() => {
+    const out = [];
+    for (const g of games) {
+      const d = detail[g.pk];
+      if (!d || !d.ready) continue;
+      const bEntriesForGame = boardEntries.filter((e) => String(e.gamePk) === String(g.pk));
+      for (const side of ["home", "away"]) {
+        const isHome = side === "home";
+        const teamData = isHome ? d.home : d.away;
+        if (!teamData || !teamData.featured) continue;
+        for (const p of teamData.featured) {
+          for (const type of TREND_PROPS) {
+            const card = buildTrendCard(p, type, trendGamelogFor(d, p.id), g, isHome, bEntriesForGame, trendRecentN);
+            if (card) out.push(card);
+          }
+        }
+      }
+    }
+    return out;
+  }, [games, detail, boardEntries, trendRecentN]);
+  const trendGames = useMemo(() => {
+    const seen = {}; const out = [];
+    for (const c of trendCards) if (!seen[c.gamePk]) { seen[c.gamePk] = 1; out.push({ pk: String(c.gamePk), label: c.game }); }
+    return out;
+  }, [trendCards]);
+  const filteredTrends = useMemo(() => {
+    const minHit = parseFloat(trendMinHit);
+    const f = trendCards.filter((c) => {
+      if (trendCatFilter !== "all" && c.type !== trendCatFilter) return false;
+      if (trendGameFilter !== "all" && String(c.gamePk) !== trendGameFilter) return false;
+      if (trendSideFilter !== "all" && c.side !== trendSideFilter) return false;
+      if (trendSourceFilter !== "all" && c.sourced !== trendSourceFilter) return false;
+      if (trendSearch && !`${c.name} ${c.game}`.toLowerCase().includes(trendSearch.toLowerCase())) return false;
+      if (!isNaN(minHit)) { const s = c[trendSplit]; if (!(s && s.pct != null && s.pct * 100 >= minHit)) return false; }
+      return true;
+    });
+    f.sort((a, b) => {
+      if (trendSort === "name_asc") return a.name.localeCompare(b.name);
+      const pa = (a[trendSplit] && a[trendSplit].pct != null) ? a[trendSplit].pct : -1;
+      const pb = (b[trendSplit] && b[trendSplit].pct != null) ? b[trendSplit].pct : -1;
+      return trendSort === "hit_asc" ? pa - pb : pb - pa;
+    });
+    return f;
+  }, [trendCards, trendCatFilter, trendGameFilter, trendSideFilter, trendSourceFilter, trendSearch, trendMinHit, trendSplit, trendSort]);
+  const trendFiltersActive = trendCatFilter !== "all" || trendGameFilter !== "all" || trendSideFilter !== "all" || trendSourceFilter !== "all" || trendSearch !== "" || trendMinHit !== "";
+  function clearTrendFilters() { setTrendCatFilter("all"); setTrendGameFilter("all"); setTrendSideFilter("all"); setTrendSourceFilter("all"); setTrendSearch(""); setTrendMinHit(""); }
 
   function trackBet(e) {
     const exists = myBets.some((b) => b.key === e.id);
@@ -1677,6 +1911,7 @@ export default function NBAApp() {
 
   const TABS = [
     { k: "slate", t: "Slate" }, { k: "board", t: `Board${boardEntries.length ? ` (${boardEntries.length})` : ""}` },
+    { k: "trends", t: `Trends${trendCards.length ? ` (${trendCards.length})` : ""}` },
     { k: "analysis", t: "Player Analysis" }, { k: "bets", t: `My Bets${myBets.filter((b) => b.status === "open").length ? ` (${myBets.filter((b) => b.status === "open").length})` : ""}` },
     { k: "stats", t: "Stats" },
   ];
@@ -1860,6 +2095,80 @@ export default function NBAApp() {
                   </div>
                 </div>
               ))
+            )}
+          </div>
+        )}
+
+        {/* ---------------- TRENDS ---------------- */}
+        {tab === "trends" && (
+          <div className="mt-3">
+            <div className="flex items-center gap-2 flex-wrap mb-3">
+              <input value={trendSearch} onChange={(e) => setTrendSearch(e.target.value)} placeholder="search player or team" className="bg-slate-950 border border-slate-700 rounded px-2.5 py-1.5 text-sm w-44 text-slate-100" />
+              <Sel compact label="prop" v={trendCatFilter} opts={["all", ...TREND_PROPS]} labels={{ all: "All props" }} onChange={setTrendCatFilter} />
+              <Sel compact label="game" v={trendGameFilter} opts={["all", ...trendGames.map((g) => g.pk)]} labels={{ all: "All games", ...Object.fromEntries(trendGames.map((g) => [g.pk, g.label])) }} onChange={setTrendGameFilter} />
+              <Sel compact label="side" v={trendSideFilter} opts={["all", "over", "under"]} labels={{ all: "Both" }} onChange={setTrendSideFilter} />
+              <Sel compact label="split" v={trendSplit} opts={["recentForm", "vsOpp", "homeAway"]} labels={{ recentForm: "Recent Form", vsOpp: "Head to Head", homeAway: "Home/Away" }} onChange={setTrendSplit} />
+              <Sel compact label="sample" v={trendRecentN} opts={[3, 5, 8, 10]} labels={{ 3: "last 3", 5: "last 5", 8: "last 8", 10: "last 10" }} onChange={(v) => setTrendRecentN(+v)} />
+              {(() => { const n = (trendMinHit !== "" ? 1 : 0) + (trendSourceFilter !== "all" ? 1 : 0); return (
+                <button onClick={() => setShowMoreTrends((s) => !s)} className={`text-xs rounded px-2.5 py-1.5 border ${showMoreTrends || n ? "border-emerald-700 text-emerald-300" : "border-slate-700 text-slate-400 hover:text-slate-200"}`}>filters{n ? ` (${n})` : ""} {showMoreTrends ? "▴" : "▾"}</button>
+              ); })()}
+              {trendFiltersActive && <button onClick={clearTrendFilters} className="text-[11px] text-slate-400 hover:text-rose-300 border border-slate-700 rounded px-2.5 py-1.5">clear</button>}
+              <div className="ml-auto text-[11px] text-slate-500" style={mono}>{filteredTrends.length} trends</div>
+            </div>
+            {showMoreTrends && (
+              <div className="flex items-end gap-3 flex-wrap mb-3 p-2.5 rounded-lg bg-slate-900/40 border border-slate-800">
+                <label className="text-xs text-slate-400 flex flex-col gap-1">min hit rate %
+                  <input value={trendMinHit} onChange={(e) => setTrendMinHit(e.target.value)} placeholder="any" inputMode="decimal" className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-20 text-slate-100" />
+                </label>
+                <Sel compact label="line source" v={trendSourceFilter} opts={["all", "book", "model"]} labels={{ all: "Any", book: "Book line", model: "Model-free" }} onChange={setTrendSourceFilter} />
+                <Sel compact label="sort" v={trendSort} opts={["hit_desc", "hit_asc", "name_asc"]} labels={{ hit_desc: "Hit rate ↓", hit_asc: "Hit rate ↑", name_asc: "Name A-Z" }} onChange={setTrendSort} />
+              </div>
+            )}
+            {games.length === 0 ? (
+              <div className="text-sm text-slate-500 py-10 text-center">Load a slate first (Slate tab) to build trends.</div>
+            ) : trendCards.length === 0 ? (
+              <div className="text-sm text-slate-500 py-10 text-center">
+                {trendDebug.players === 0 ? (
+                  <>No game/player data loaded yet. Trends reads the same roster + gamelog data the Slate/Board tabs already pull — no Odds API credits needed.
+                  <div className="mt-3">
+                    <button onClick={() => loadTrendsForGames(games)} disabled={!!trendBulkLoading} className="bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-bold text-sm rounded-lg px-3 py-1.5">
+                      {trendBulkLoading ? `Loading ${trendBulkLoading.done}/${trendBulkLoading.total}…` : "Load trends for all games"}
+                    </button>
+                  </div></>
+                ) : (
+                  <>
+                    <div>Games/rosters loaded ({trendDebug.players} featured players), but no trend cards came out the other end.</div>
+                    <div className="mt-2 text-[11px]" style={mono}>
+                      gamelog this season: {trendDebug.withCurGames}/{trendDebug.players} players · with prior-season fallback: {trendDebug.withAnyGames}/{trendDebug.players} players · prop checks run: {trendDebug.propAttempts} · cards built: {trendDebug.cardsBuilt}
+                    </div>
+                    <div className="mt-2 max-w-xl mx-auto">
+                      {trendDebug.withAnyGames === 0
+                        ? <>Every player's gamelog fetch came back empty — open the browser console and look for <span className="text-slate-300">[gamelog]</span> warnings and send those over.</>
+                        : "Gamelogs are loading, but no player/prop cleared a line in any split — try widening the sample size above, or this slate's players genuinely have too short a history yet."}
+                    </div>
+                  </>
+                )}
+              </div>
+            ) : filteredTrends.length === 0 ? (
+              <div className="text-sm text-slate-500 py-10 text-center">No trends pass the current filter.</div>
+            ) : (
+              <div className="space-y-2">
+                {filteredTrends.map((c) => {
+                  const entry = c.boardEntryId ? boardEntries.find((e) => e.id === c.boardEntryId) : null;
+                  return <TrendCard key={c.id} c={c} entry={entry} tracked={entry ? myBets.some((b) => b.key === entry.id) : false} onTrack={trackBet} />;
+                })}
+              </div>
+            )}
+            {games.length > 0 && (
+              <div className="mt-3 flex items-center gap-2 text-[11px] text-slate-500">
+                <span>
+                  {games.filter((g) => detail[g.pk] && detail[g.pk].ready).length}/{games.length} games loaded for trends.
+                  {trendBulkLoading && ` Loading ${trendBulkLoading.done}/${trendBulkLoading.total}…`}
+                </span>
+                {games.some((g) => !(detail[g.pk] && detail[g.pk].ready)) && (
+                  <button onClick={() => loadTrendsForGames(games)} disabled={!!trendBulkLoading} className="text-[11px] text-emerald-400 hover:text-emerald-300 disabled:opacity-50 border border-slate-700 rounded px-2 py-1">load remaining</button>
+                )}
+              </div>
             )}
           </div>
         )}
@@ -2240,6 +2549,48 @@ function BoardRow({ e, tracked, onTrack, showProjBar = true }) {
         </div>
       )}
       {show && <MathPanel r={e} />}
+    </div>
+  );
+}
+function TrendPill({ label, s }) {
+  if (!s || !s.n) {
+    return (
+      <div className="flex-1 min-w-[88px] text-center bg-slate-950/60 border border-slate-800 rounded-lg px-2 py-1.5">
+        <div className="text-[10px] text-slate-500 uppercase tracking-wide truncate">{label}</div>
+        <div className="text-slate-600 text-sm">no data</div>
+      </div>
+    );
+  }
+  const pct = Math.round(s.pct * 100);
+  const color = pct >= 70 ? "text-emerald-400" : pct <= 30 ? "text-rose-400" : "text-slate-200";
+  return (
+    <div className="flex-1 min-w-[88px] text-center bg-slate-950/60 border border-slate-800 rounded-lg px-2 py-1.5">
+      <div className="text-[10px] text-slate-500 uppercase tracking-wide truncate">{label}</div>
+      <div className={`text-sm font-bold ${color}`}>{s.hits}/{s.n} <span className="text-[11px]">({pct}%)</span></div>
+    </div>
+  );
+}
+function TrendCard({ c, entry, tracked, onTrack }) {
+  const isYN = isYesNoType(c.type);
+  return (
+    <div className="bg-slate-900/70 border border-slate-800 rounded-xl overflow-hidden">
+      <div className="flex items-center gap-3 px-4 py-3 flex-wrap">
+        <div className="flex-1 min-w-[160px]">
+          <div className="font-semibold truncate">{c.name} <span className="text-slate-500 text-xs">{c.game}</span></div>
+          <div className="text-[11px] text-slate-400" style={mono}>
+            {isYN ? (c.side === "over" ? "Yes" : "No") : `${c.side} ${c.line}`} {c.type}{c.odds != null ? ` @ ${fmtOdds(c.odds)}` : ""}
+            <span className={`ml-1.5 ${c.sourced === "book" ? "text-sky-400" : "text-slate-500"}`}>{c.sourced === "book" ? "· book line" : "· model-free line"}</span>
+          </div>
+        </div>
+        <div className="flex gap-1.5 flex-wrap">
+          <TrendPill label="Recent Form" s={c.recentForm} />
+          <TrendPill label={`vs ${c.opp || "OPP"}`} s={c.vsOpp} />
+          <TrendPill label={c.isHome ? "Home" : "Away"} s={c.homeAway} />
+        </div>
+        {entry && (
+          <button onClick={() => onTrack(entry)} disabled={tracked} className={`text-[11px] font-bold rounded px-2 py-1 ${tracked ? "bg-slate-700 text-slate-400" : "bg-emerald-600 hover:bg-emerald-500 text-white"}`}>{tracked ? "tracked" : "track"}</button>
+        )}
+      </div>
     </div>
   );
 }
