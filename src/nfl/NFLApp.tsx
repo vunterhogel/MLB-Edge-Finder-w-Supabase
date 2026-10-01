@@ -940,7 +940,11 @@ async function fetchAthleteGamelog(athleteId, n = 4, season = null) {
     const url = `${ESPN_WEB}/athletes/${athleteId}/gamelog` + (season ? `?season=${season}` : "");
     const d = await jget(url);
     const names = d.names || [];
-    if (!names.length) return null;
+    // This used to fail 100% silently: any failure here (bad response shape, no names[], a
+    // thrown fetch error below) just returned null and every caller swallows that null without
+    // a trace. Trends depends entirely on this succeeding, so log *why* it came back empty —
+    // check the browser console for these if Trends shows "0 trends" with games/detail loaded.
+    if (!names.length) { console.warn(`[gamelog] empty names[] for athlete ${athleteId}${season ? ` (season ${season})` : ""} — response: ${JSON.stringify(d).slice(0, 200)}`); return null; }
     const idx = {};
     for (const k in STAT_ALIASES) idx[k] = pickAlias(names, k);
     const statsByEvent = statsByEventFromGamelog(d, idx);
@@ -967,8 +971,20 @@ async function fetchAthleteGamelog(athleteId, n = 4, season = null) {
       return vals.length ? { avg: vals.reduce((a, b) => a + b, 0) / vals.length, n: vals.length } : { avg: null, n: 0 };
     };
     const sum = (arr) => arr.reduce((acc, r) => { for (const k in r) if (!LONG_KEYS.includes(k)) acc[k] = (acc[k] || 0) + (r[k] || 0); return acc; }, { g: arr.length });
-    const season = sum(all); season.g = all.length;
-    for (const k of LONG_KEYS) { const { avg, n: cnt } = avgLong(all, k); season[`${k}Avg`] = avg; season[`${k}N`] = cnt; }
+    // THE ACTUAL ROOT CAUSE of every gamelog fetch throwing (console: "Cannot access 'season2'
+    // before initialization", for 100% of players, unaffected by concurrency or season-thinness —
+    // which is exactly why neither of the last two fixes touched it): this local aggregate used to
+    // be named `season`, which is ALSO this function's parameter name (the season year to query).
+    // Redeclaring a parameter with `const` in the same function scope is an illegal duplicate
+    // declaration; esbuild's build-time transform silently renames one binding instead of raising a
+    // syntax error, and the renamed binding gets read before its own initializer runs — a guaranteed
+    // throw on every single invocation, caught by this function's own try/catch and swallowed into a
+    // silent `null` since before this session started (this predates the Trends tab entirely — it's
+    // why Player Analysis's season/recent splits and the projection shrinkage prior were presumably
+    // always running on empty data too, not just Trends). Renamed to seasonAgg; no behavior change
+    // for callers, which only ever read the RETURNED object's `.season` key, set at the bottom.
+    const seasonAgg = sum(all); seasonAgg.g = all.length;
+    for (const k of LONG_KEYS) { const { avg, n: cnt } = avgLong(all, k); seasonAgg[`${k}Avg`] = avg; seasonAgg[`${k}N`] = cnt; }
     const recentSlice = all.slice(-n);
     const recent = sum(recentSlice); recent.games = recentSlice.length;
     for (const k of LONG_KEYS) { const { avg, n: cnt } = avgLong(recentSlice, k); recent[`${k}Avg`] = avg; recent[`${k}N`] = cnt; }
@@ -991,8 +1007,8 @@ async function fetchAthleteGamelog(athleteId, n = 4, season = null) {
     });
     games = games.slice(-GAMELOG_ROWS).reverse(); // most-recent-first, capped
 
-    return { season, recent, games };
-  } catch { return null; }
+    return { season: seasonAgg, recent, games };
+  } catch (e) { console.warn(`[gamelog] fetch threw for athlete ${athleteId}${season ? ` (season ${season})` : ""}:`, (e && e.message) || e); return null; }
 }
 
 /* ---- Trends tab: pure hit-rate computation over a player's own gamelog rows ----
@@ -1616,6 +1632,7 @@ export default function NFLApp() {
   const [trendSourceFilter, setTrendSourceFilter] = useState("all"); // all | book | model
   const [trendSort, setTrendSort] = useState("hit_desc");
   const [showMoreTrends, setShowMoreTrends] = useState(false);
+  const [trendBulkLoading, setTrendBulkLoading] = useState(null); // null | { done, total } while a bulk "load trends" pass is running
   const [analysisProfile, setAnalysisProfile] = useState(null); // { player, game, side }
   const [analysisQuery, setAnalysisQuery] = useState("");
   const [analysisResults, setAnalysisResults] = useState([]);
@@ -1743,7 +1760,12 @@ export default function NFLApp() {
           // cause behind identical projections for different players at the same depth-chart slot).
           // Pull last season's real, complete log as the shrinkage prior instead, so "this player's
           // own career rate" anchors the projection rather than "the league average."
-          if (!gl || !gl.season || !gl.season.g) {
+          // Trigger on "empty OR thin" (not just empty): the comment above always described both
+          // cases, but the condition used to only catch a fully-empty season. A thin 1-3 game season
+          // sample is exactly the case the Trends tab hits hardest — "last N games" has almost nothing
+          // to read from in the season's first few weeks — so broadening this also gives Trends (and
+          // the shrinkage prior) real prior-season rows to fall back on instead of going empty.
+          if (!gl || !gl.games || gl.games.length < GAMELOG_ROWS) {
             const prior = await fetchAthleteGamelog(p.id, 4, year - 1).catch(() => null);
             if (prior) priorGamelogs[p.id] = prior;
           }
@@ -1772,6 +1794,29 @@ export default function NFLApp() {
     if (open === g.pk) { setOpen(null); return; }
     setOpen(g.pk);
     if (!g.manual) await loadDetail(g);
+  }
+
+  // Trends-only bulk loader. loadDetail(g) for a SINGLE game already fans out up to ~16 featured
+  // players × up to 2 gamelog calls (current + prior-season) concurrently via Promise.all — that's
+  // the same thing Slate's "expand" and Board's "get odds" already do per game, and it's proven fine.
+  // But the Trends tab's old "load trends for all games" button fired loadDetail for EVERY game on
+  // the slate at once (games.forEach, no await) — 16 games × ~32 calls could mean 300-500+ gamelog
+  // requests hitting ESPN in the same instant. That's a plausible, self-inflicted reason every single
+  // one of 256 players' gamelog fetches came back empty at once (a burst like that is exactly what
+  // trips a rate limit or a proxy's concurrent-connection cap) even though the identical per-game
+  // fetch has worked fine everywhere else in this app. Load games one at a time instead — slower, but
+  // it's the same request pattern that's already known to work, and it reports progress so the button
+  // doesn't just look frozen for the ~16 games this takes.
+  async function loadTrendsForGames(list) {
+    if (trendBulkLoading) return;
+    const todo = list.filter((g) => !(detail[g.pk] && detail[g.pk].ready));
+    if (!todo.length) return;
+    setTrendBulkLoading({ done: 0, total: todo.length });
+    for (let i = 0; i < todo.length; i++) {
+      await loadDetail(todo[i]).catch(() => {});
+      setTrendBulkLoading({ done: i + 1, total: todo.length });
+    }
+    setTrendBulkLoading(null);
   }
 
   /* ---- context builder: one featured player -> the ctx object projectProp consumes ---- */
@@ -1822,6 +1867,22 @@ export default function NFLApp() {
     };
   }
   function gamelogFor(d, pid) { return d && d.gamelogs ? d.gamelogs[pid] : null; }
+  // Trends-only: "last X games" shouldn't dead-end at a season boundary. Early in a season (or for
+  // a player on a bye/thin sample), the current-season gamelog alone can be too short — or, in the
+  // season's first weeks, empty — to compute a meaningful hit rate from. loadDetail() already fetches
+  // last season's real gamelog as a shrinkage prior whenever the current-season sample is thin (see
+  // loadDetail); this just reuses those same already-fetched rows here, appending them AFTER the
+  // current season's (which are already most-recent-first), so the combined list stays correctly
+  // ordered newest-to-oldest across the season boundary. Pure read of already-fetched state — no
+  // new network calls.
+  function trendGamelogFor(d, pid) {
+    const gl = gamelogFor(d, pid);
+    const priorGl = d && d.priorGamelogs ? d.priorGamelogs[pid] : null;
+    const curGames = (gl && gl.games) || [];
+    const priorGames = (priorGl && priorGl.games) || [];
+    if (!curGames.length && !priorGames.length) return null;
+    return { games: [...curGames, ...priorGames] };
+  }
 
   const propsForPos = (pos) => pos === "QB" ? QB_PROPS : pos === "RB" ? RB_PROPS : (pos === "WR" || pos === "TE") ? WR_PROPS : pos === "K" ? K_PROPS : pos === "DST" ? DST_PROPS : [];
 
@@ -1981,6 +2042,38 @@ export default function NFLApp() {
      detail[g.pk].gamelogs, already fetched by loadDetail() for Slate/Board use. No new network
      calls for any game whose detail is already loaded; games not yet loaded just show 0 cards
      until "load trends" (loadDetail) runs for them. ---- */
+  // Debug counters surfaced directly in the Trends tab (not just console) — when "0 trends" shows
+  // up with games fully loaded, this says WHERE the pipeline is actually going empty: no featured
+  // players found at all vs. featured players found but their gamelog fetch came back empty, vs.
+  // gamelog present but every buildTrendCard call still bailing (a line/split mismatch, not a fetch
+  // failure). Each stage is a strict subset of the one before it, so the first low number is the cause.
+  const trendDebug = useMemo(() => {
+    let players = 0, withCurGames = 0, withAnyGames = 0, propAttempts = 0, cardsBuilt = 0;
+    for (const g of games) {
+      const d = detail[g.pk];
+      if (!d || !d.ready) continue;
+      const bEntriesForGame = boardEntries.filter((e) => String(e.gamePk) === String(g.pk));
+      for (const side of ["home", "away"]) {
+        const isHome = side === "home";
+        const teamData = isHome ? d.home : d.away;
+        if (!teamData || !teamData.featured) continue;
+        for (const p of teamData.featured) {
+          players++;
+          const gl = gamelogFor(d, p.id);
+          if (gl && gl.games && gl.games.length) withCurGames++;
+          const merged = trendGamelogFor(d, p.id);
+          if (merged && merged.games && merged.games.length) withAnyGames++;
+          const posKey = p.pos === "PK" ? "K" : p.pos;
+          const props = [...propsForPos(posKey), ...(posKey !== "K" && posKey !== "DST" ? ["Anytime TD"] : [])];
+          for (const type of props) {
+            propAttempts++;
+            if (buildTrendCard(p, posKey, type, merged, g, isHome, bEntriesForGame, trendRecentN)) cardsBuilt++;
+          }
+        }
+      }
+    }
+    return { players, withCurGames, withAnyGames, propAttempts, cardsBuilt };
+  }, [games, detail, boardEntries, trendRecentN]);
   const trendCards = useMemo(() => {
     const out = [];
     for (const g of games) {
@@ -1995,7 +2088,7 @@ export default function NFLApp() {
           const posKey = p.pos === "PK" ? "K" : p.pos;
           const props = [...propsForPos(posKey), ...(posKey !== "K" && posKey !== "DST" ? ["Anytime TD"] : [])];
           for (const type of props) {
-            const card = buildTrendCard(p, posKey, type, gamelogFor(d, p.id), g, isHome, bEntriesForGame, trendRecentN);
+            const card = buildTrendCard(p, posKey, type, trendGamelogFor(d, p.id), g, isHome, bEntriesForGame, trendRecentN);
             if (card) out.push(card);
           }
         }
@@ -2583,7 +2676,7 @@ export default function NFLApp() {
               <Sel compact label="game" v={trendGameFilter} opts={["all", ...trendGames.map((g) => g.pk)]} labels={{ all: "All games", ...Object.fromEntries(trendGames.map((g) => [g.pk, g.label])) }} onChange={setTrendGameFilter} />
               <Sel compact label="side" v={trendSideFilter} opts={["all", "over", "under"]} labels={{ all: "Both" }} onChange={setTrendSideFilter} />
               <Sel compact label="split" v={trendSplit} opts={["recentForm", "vsOpp", "homeAway"]} labels={{ recentForm: "Recent Form", vsOpp: "Head to Head", homeAway: "Home/Away" }} onChange={setTrendSplit} />
-              <Sel compact label="sample" v={trendRecentN} opts={[3, 5, 8]} labels={{ 3: "last 3", 5: "last 5", 8: "last 8" }} onChange={(v) => setTrendRecentN(+v)} />
+              <Sel compact label="sample" v={trendRecentN} opts={[3, 5, 8, 12, 16]} labels={{ 3: "last 3", 5: "last 5", 8: "last 8", 12: "last 12", 16: "last 16" }} onChange={(v) => setTrendRecentN(+v)} />
               {(() => { const n = (trendMinHit !== "" ? 1 : 0) + (trendSourceFilter !== "all" ? 1 : 0); return (
                 <button onClick={() => setShowMoreTrends((s) => !s)} className={`text-xs rounded px-2.5 py-1.5 border ${showMoreTrends || n ? "border-emerald-700 text-emerald-300" : "border-slate-700 text-slate-400 hover:text-slate-200"}`}>filters{n ? ` (${n})` : ""} {showMoreTrends ? "▴" : "▾"}</button>
               ); })()}
@@ -2603,8 +2696,26 @@ export default function NFLApp() {
               <div className="text-sm text-slate-500 py-10 text-center">Load a slate first (Slate tab) to build trends.</div>
             ) : trendCards.length === 0 ? (
               <div className="text-sm text-slate-500 py-10 text-center">
-                No game/player data loaded yet. Trends reads the same roster + gamelog data the Slate/Board tabs already pull — no Odds API credits needed.
-                <div className="mt-3"><button onClick={() => games.forEach((g) => loadDetail(g))} className="bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-sm rounded-lg px-3 py-1.5">Load trends for all games</button></div>
+                {trendDebug.players === 0 ? (
+                  <>No game/player data loaded yet. Trends reads the same roster + gamelog data the Slate/Board tabs already pull — no Odds API credits needed.
+                  <div className="mt-3">
+                    <button onClick={() => loadTrendsForGames(games)} disabled={!!trendBulkLoading} className="bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-bold text-sm rounded-lg px-3 py-1.5">
+                      {trendBulkLoading ? `Loading ${trendBulkLoading.done}/${trendBulkLoading.total}…` : "Load trends for all games"}
+                    </button>
+                  </div></>
+                ) : (
+                  <>
+                    <div>Games/rosters loaded ({trendDebug.players} featured players), but no trend cards came out the other end.</div>
+                    <div className="mt-2 text-[11px]" style={mono}>
+                      gamelog this season: {trendDebug.withCurGames}/{trendDebug.players} players · with prior-season fallback: {trendDebug.withAnyGames}/{trendDebug.players} players · prop checks run: {trendDebug.propAttempts} · cards built: {trendDebug.cardsBuilt}
+                    </div>
+                    <div className="mt-2 max-w-xl mx-auto">
+                      {trendDebug.withAnyGames === 0
+                        ? <>Every player's gamelog fetch came back empty — this is a known failure mode when ALL games load at once (a burst of 300+ concurrent requests can trip a rate limit). Hit <span className="text-slate-300">Refresh</span> up top to reset, then reload trends — the loader now fetches one game at a time. If it's still 0/{trendDebug.players} after that, check the browser console for <span className="text-slate-300">[gamelog]</span> warnings and send those over.</>
+                        : "Gamelogs are loading, but no player/prop cleared a line in any split — try widening the sample size above, or this slate's players genuinely have too short a history yet."}
+                    </div>
+                  </>
+                )}
               </div>
             ) : filteredTrends.length === 0 ? (
               <div className="text-sm text-slate-500 py-10 text-center">No trends pass the current filter.</div>
@@ -2618,9 +2729,12 @@ export default function NFLApp() {
             )}
             {games.length > 0 && (
               <div className="mt-3 flex items-center gap-2 text-[11px] text-slate-500">
-                <span>{games.filter((g) => detail[g.pk] && detail[g.pk].ready).length}/{games.length} games loaded for trends.</span>
+                <span>
+                  {games.filter((g) => detail[g.pk] && detail[g.pk].ready).length}/{games.length} games loaded for trends.
+                  {trendBulkLoading && ` Loading ${trendBulkLoading.done}/${trendBulkLoading.total}…`}
+                </span>
                 {games.some((g) => !(detail[g.pk] && detail[g.pk].ready)) && (
-                  <button onClick={() => games.forEach((g) => loadDetail(g))} className="text-[11px] text-emerald-400 hover:text-emerald-300 border border-slate-700 rounded px-2 py-1">load remaining</button>
+                  <button onClick={() => loadTrendsForGames(games)} disabled={!!trendBulkLoading} className="text-[11px] text-emerald-400 hover:text-emerald-300 disabled:opacity-50 border border-slate-700 rounded px-2 py-1">load remaining</button>
                 )}
               </div>
             )}
