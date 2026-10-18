@@ -259,8 +259,12 @@ const CALIB_KEEP = {
   "Rush Yards": 0.45, "Rush TDs": 0.35, "Longest Rush": 0.35,
   "Receptions": 0.45, "Receiving Yards": 0.45, "Receiving TDs": 0.35, "Longest Reception": 0.35,
   "Anytime TD": 0.35, "Kicking Points": 0.40, "Field Goals Made": 0.40, "Sacks": 0.35, "Def. Interceptions": 0.30,
-  "Spread": 0.50, "Total": 0.50,
+  // v2: game lines are EXPERIMENTAL. When market odds exist, buildGameLineEntries anchors the team
+  // means to the market total/spread, so any "edge" is only the NB shape (which can't see key
+  // numbers 3/7). Trust the market heavily until a real score model exists.
+  "Spread": 0.25, "Total": 0.25, "Moneyline": 0.25,
 };
+const EXPERIMENTAL_TYPES = new Set(["Spread", "Total", "Moneyline", "Longest Completion", "Longest Rush", "Longest Reception", "Kicking Points", "Field Goals Made", "Sacks", "Def. Interceptions"]);
 const CALIB_KEEP_DEFAULT = 0.5;
 function keepFor(type) { return (type != null && CALIB_KEEP[type] != null) ? CALIB_KEEP[type] : CALIB_KEEP_DEFAULT; }
 function calibrateToMarket(p, market, type) { return (p == null || market == null) ? p : clamp(market + keepFor(type) * (p - market), 0.001, 0.999); }
@@ -356,11 +360,16 @@ function projectLongestStat(ctx, key, fallbackPrior) {
 const RECENT_WEIGHT = 0.30;       // L4-game blend weight — heavier than MLB's 0.20 L15 weight because
                                    // an NFL season (17 games) has far less season-to-date signal to lean on
 const MIN_L4_SNAPS = 2;           // require >=2 recent games with snaps before blending recent form in
-const NB_PHI = {                  // dispersion priors (var/mean) — DAY-1, retune from settled data
-  passYds: 2.2, passAtt: 1.3, passCmp: 1.2, passTd: 1.4, ints: 1.3, longestCmp: 1.6,
-  rushYds: 2.0, rushAtt: 1.3, rushTd: 1.5, longestRush: 1.8,
-  rec: 1.6, recYds: 2.4, recTd: 1.5, longestRec: 1.8,
-  anytimeTd: 1.4, kickPts: 1.7, fgMade: 1.3, sacks: 1.4, defInt: 1.4,
+// v2 (2026-10-18): refit from the settled board log (weeks 3-6, 827 unique player/game/prop rows).
+// The Day-1 yardage priors (2.0-2.4) implied a ~23-yd SD on a 240-yd QB; the observed predictive
+// spread is ~65-70 yds (var/mean ~20). That made raw yardage Brier 0.31-0.38 (worse than a coin flip)
+// and inflated claimed edge ~3.5x (claimed +10.5pp, realized +2.9pp). Values below are set slightly
+// conservative of the in-sample Brier optimum; retune once more weeks settle.
+const NB_PHI = {
+  passYds: 20, passAtt: 3.0, passCmp: 2.0, passTd: 1.4, ints: 1.3, longestCmp: 7,
+  rushYds: 20, rushAtt: 1.8, rushTd: 1.5, longestRush: 6,
+  rec: 1.4, recYds: 22, recTd: 1.5, longestRec: 8,
+  anytimeTd: 1.4, kickPts: 3.5, fgMade: 1.3, sacks: 1.4, defInt: 1.4,
 };
 
 /* -------- league-average priors (empirical-Bayes shrinkage targets) --------
@@ -376,7 +385,7 @@ const LG = {
   catchRate: 0.65, ypt: 8.0, recTdRate: 0.045,        // yards/TDs per target
   targetShareWR1: 0.22, targetShareWR2: 0.15, targetShareRB: 0.10,
   sackRatePerPassAtt: 0.065, defIntRatePerPassAtt: 0.021,
-  fgAttPerDrive: 0.10, fgMakePct: 0.85,
+  fgAttPerDrive: 0.17, fgMakePct: 0.85, // v2: was 0.10 -> projected 0.90 FG/g vs 1.77 actual (n=26); NFL teams attempt ~1.8 FGA/g on ~10.8 drives
   passYdsAllowedPerGame: 234.5, rushYdsAllowedPerGame: 113.4, // teamPassAtt*ypa, teamRushAtt*rushYpc — league-avg denominators for calculateOppDefenseAdjustment
 };
 const SHRINK_N = { passAtt: 4, rushAtt: 4, targets: 4, rate: 60 }; // "games" or "attempts" of prior weight
@@ -597,10 +606,21 @@ function projectWR(ctx, type, line) {
 
 // -------- Anytime TD: union of a player's rushing-TD and receiving-TD probability --------
 // P(>=1 TD) = 1 - P(0 rush TD) x P(0 rec TD), each from that player's own NB(mean,phi) above.
+// v2: QBs previously got a hardcoded 0 rushing-TD mean (so every QB anytime-TD under looked like an
+// edge) AND a fake receiving-TD mean from WR target priors. A QB scores an anytime TD only by rushing
+// (passing TDs credit the receiver), so QBs now use their own rush-TD/game rate, shrunk toward their
+// prior season (or a 0.12/g league prior), and get no receiving component.
+const QB_RUSH_TD_PRIOR_PER_G = 0.12;
+function qbRushTdMean(ctx) {
+  const s = ctx.season || {};
+  const prior = priorRate(ctx, "rushTd", "g", QB_RUSH_TD_PRIOR_PER_G);
+  const obs = s.g ? (s.rushTd || 0) / s.g : prior;
+  return shrinkValue(obs, s.g || 0, prior, 6) * calculateInjuryAvailability(ctx.injuryStatus);
+}
 function projectAnytimeTD(ctx) {
   let pNoRush = 1, pNoRec = 1, pNoPass = 1;
-  if (ctx.pos === "RB" || ctx.pos === "QB") { const r = ctx.pos === "QB" ? { proj: 0 } : projectRB(ctx, "Rush TDs", -1); pNoRush = 1 - negativeBinomialCDFComplement(r.proj, NB_PHI.rushTd); }
-  if (ctx.pos !== "K" && ctx.pos !== "DST") { const r = projectWR(ctx, "Receiving TDs", -1); pNoRec = 1 - negativeBinomialCDFComplement(r.proj, NB_PHI.recTd); }
+  if (ctx.pos === "RB" || ctx.pos === "QB") { const r = ctx.pos === "QB" ? { proj: qbRushTdMean(ctx) } : projectRB(ctx, "Rush TDs", -1); pNoRush = 1 - negativeBinomialCDFComplement(r.proj, NB_PHI.rushTd); }
+  if (ctx.pos !== "K" && ctx.pos !== "DST" && ctx.pos !== "QB") { const r = projectWR(ctx, "Receiving TDs", -1); pNoRec = 1 - negativeBinomialCDFComplement(r.proj, NB_PHI.recTd); }
   const pAtLeastOne = 1 - pNoRush * pNoRec * pNoPass;
   return clamp(pAtLeastOne, 0.001, 0.98);
 }
@@ -661,18 +681,36 @@ function fullCalc(dist, params, proj, baseStr, mults) { return { dist, params, p
 function liveCalc(dist, params, current, projFinal, baseStr, fr) { return { dist, params, proj: projFinal, baseStr, mults: [], live: { current, fr } }; }
 
 /* full evaluation of a single priced bet (model + market) — verbatim from MLB */
+// v2 role-check gate (NFL analog of MLB's Outs sanity cap). When the projection and the posted
+// line disagree by BOTH a large ratio and a large absolute amount, the usual cause is a role the
+// model can't see (backup QB thrust into a start, a returning starter, a demoted RB) — e.g. a
+// 70-yd projection vs a 201.5 line priced as a 72% under. Those rows keep their raw numbers for
+// research but get edge suppressed to the market, and are flagged in the UI.
+const ROLE_CHECK_ABS = { "Pass Yards": 60, "Pass Attempts": 10, "Pass Completions": 7, "Rush Yards": 30, "Receiving Yards": 30, "Receptions": 2.5 };
+function roleCheckFailed(type, proj, line) {
+  const abs = ROLE_CHECK_ABS[type];
+  if (abs == null || proj == null || !(line > 0)) return false;
+  const ratio = proj / line;
+  return (ratio < 0.5 || ratio > 2.0) && Math.abs(proj - line) > abs;
+}
 function evalBet(b, pre) {
   const { pOver, proj, calc } = pre || projectProp(b.ctx, b.type, parseFloat(b.line));
-  const rawP = b.side === "over" ? pOver : 1 - pOver;
   const odds = Number(b.odds);
   const imp = isNaN(odds) ? null : impliedProb(odds);
   const novig = (b.overOdds != null || b.underOdds != null) ? noVigProb(b.overOdds, b.underOdds, b.side) : imp;
-  const fairRef = novig != null ? novig : imp;
-  const modelP = calibrateToMarket(rawP, fairRef, b.type);
   const bmult = isNaN(odds) ? 0 : (odds > 0 ? odds / 100 : 100 / -odds);
+  // v2: a missing/invalid model probability stays missing on BOTH sides (previously 1 - null = 1,
+  // i.e. a fake 100% raw under).
+  if (pOver == null || !isFinite(pOver)) {
+    return { modelP: null, rawModelP: null, proj, calc, imp, novig, edge: null, ev: null, b: bmult, fair: "—", devigged: b.overOdds != null && b.underOdds != null, roleCheck: false };
+  }
+  const rawP = b.side === "over" ? pOver : 1 - pOver;
+  const fairRef = novig != null ? novig : imp;
+  const roleCheck = roleCheckFailed(b.type, proj, parseFloat(b.line));
+  const modelP = roleCheck && fairRef != null ? fairRef : calibrateToMarket(rawP, fairRef, b.type);
   const edge = (modelP != null && fairRef != null) ? modelP - fairRef : null;
   const ev = (modelP != null && !isNaN(odds)) ? evPerUnit(modelP, odds) : null;
-  return { modelP, rawModelP: rawP, proj, calc, imp, novig, edge, ev, b: bmult, fair: modelP != null ? probToAmerican(modelP) : "—", devigged: b.overOdds != null && b.underOdds != null };
+  return { modelP, rawModelP: rawP, proj, calc, imp, novig, edge, ev, b: bmult, fair: modelP != null ? probToAmerican(modelP) : "—", devigged: b.overOdds != null && b.underOdds != null, roleCheck };
 }
 
 /* ============================================================
@@ -1377,15 +1415,18 @@ function buildGameLineEntries(g, d, gl, book) {
    PERSISTENCE — My Bets (localStorage) + Board Log (IndexedDB),
    ported from MLB's storage layer verbatim (prefix renamed nfl*).
    ============================================================ */
-const MODEL_VERSION = "nfl-v1-2026-08";
+// Bump on EVERY model change. The version is part of the board-log id, so a new version logs its
+// own snapshot alongside (never overwriting) the old one — that's what makes champion/challenger
+// comparisons on identical games possible.
+const MODEL_VERSION = "nfl-v2-2026-10-18";
 const LS_BETS = "nfief_mybets_v1";
 function loadBets() { try { return JSON.parse(localStorage.getItem(LS_BETS)) || []; } catch { return []; } }
 function saveBets(b) { try { localStorage.setItem(LS_BETS, JSON.stringify(b)); } catch { /* storage unavailable */ } }
 const LS_CREDITS = "nfief_credits_v1";
 function loadCredits() { try { const v = localStorage.getItem(LS_CREDITS); return v == null || v === "" ? null : +v; } catch { return null; } }
 
-const BOARD_LOG_MAX_ROWS = 100000;
-const BOARD_LOG_RETENTION_DAYS = 60;
+const BOARD_LOG_MAX_ROWS = 300000;
+const BOARD_LOG_RETENTION_DAYS = 730; // was 60: research history was silently aging out (MLB lost everything before Sep 8)
 const BOARD_DB_NAME = "nfief_boardlog_db";
 const BOARD_DB_STORE = "kv";
 const BOARD_DB_KEY = "boardLog";
@@ -1423,13 +1464,16 @@ async function appendBoardLog(entries, modelVersion, weekKey) {
   const existingById = new Map(existing.map((e) => [e.logId, e]));
   let backfilled = 0;
   for (const e of entries) {
-    const already = existingById.get(`${weekKey}|${e.id}`);
+    const already = existingById.get(`${weekKey}|${modelVersion}|${e.id}`);
     if (already && !already.gameTimeIso && e.gameTimeIso) { already.gameTimeIso = e.gameTimeIso; backfilled++; }
   }
   const newRows = entries.filter((e) => e.modelP != null && e.novig != null).map((e) => {
-    const logId = `${weekKey}|${e.id}`;
+    // v2: model version is part of the id (v1 rows keep their old "week|id" ids untouched).
+    const logId = `${weekKey}|${modelVersion}|${e.id}`;
     return {
       logId, loggedAt: now, modelVersion, week: weekKey,
+      preStart: e.gameTimeIso ? Date.parse(now) < Date.parse(e.gameTimeIso) : null,
+      roleCheck: !!e.roleCheck,
       game: e.game, gameTimeIso: e.gameTimeIso || null, gamePk: String(e.gamePk), playerId: String(e.playerId ?? ""), name: e.name, type: e.type, line: e.line, side: e.side, odds: e.odds,
       novig: e.novig != null ? +e.novig.toFixed(4) : null, rawModelP: e.rawModelP != null ? +e.rawModelP.toFixed(4) : null,
       calibratedP: e.modelP != null ? +e.modelP.toFixed(4) : null, edge: e.edge != null ? +e.edge.toFixed(4) : null, ev: e.ev != null ? +e.ev.toFixed(4) : null, proj: e.proj != null ? +e.proj.toFixed(3) : null,
@@ -2275,7 +2319,7 @@ export default function NFLApp() {
     const log = loadBoardLog();
     if (!log.length) { alert("No board log entries yet. Load a game to start logging."); return; }
     const esc = (v) => { if (v == null) return ""; const s = String(v); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
-    const headers = ["logId", "loggedAt", "modelVersion", "week", "game", "gameTimeIso", "gamePk", "playerId", "name", "type", "line", "side", "odds", "novig", "rawModelP", "calibratedP", "edge", "ev", "proj", "settled", "actualStat", "result"];
+    const headers = ["logId", "loggedAt", "modelVersion", "week", "game", "gameTimeIso", "gamePk", "playerId", "name", "type", "line", "side", "odds", "novig", "rawModelP", "calibratedP", "edge", "ev", "proj", "settled", "actualStat", "result", "preStart", "roleCheck"];
     const rows = [headers.join(",")];
     for (const e of log) {
       rows.push([
@@ -2285,6 +2329,7 @@ export default function NFLApp() {
         e.novig ?? "", e.rawModelP ?? "", e.calibratedP ?? "",
         e.edge ?? "", e.ev ?? "", e.proj ?? "",
         e.settled ? "true" : "false", e.actualStat ?? "", esc(e.result),
+        e.preStart == null ? "" : (e.preStart ? "true" : "false"), e.roleCheck ? "true" : "",
       ].join(","));
     }
     const blob = new Blob([rows.join("\n")], { type: "text/csv;charset=utf-8;" });
@@ -3156,8 +3201,10 @@ function BoardRow({ e, tracked, onTrack, showProjBar = true }) {
           </div>
         </div>
         <div className="text-right text-[11px]" style={mono}>
-          <div className="text-slate-400">model {pct(e.modelP)} · fair {e.fair}</div>
-          <div className={evGood ? "text-emerald-400 font-bold" : "text-rose-400 font-bold"}>EV {evGood ? "+" : ""}{e.ev != null ? (e.ev * 100).toFixed(1) : "—"}% · edge {e.edge != null ? `${e.edge >= 0 ? "+" : ""}${(e.edge * 100).toFixed(1)}%` : "—"}</div>
+          <div className="text-slate-400">model {pct(e.modelP)} · fair {e.fair}{EXPERIMENTAL_TYPES.has(e.type) && <span className="ml-1.5 text-amber-400" title="Experimental market: not yet calibrated against settled results">exp</span>}</div>
+          {e.roleCheck
+            ? <div className="text-amber-400 font-bold" title="Projection and line disagree by a large ratio AND amount; usually a role change the model can't see (backup starting, returning starter, demotion). Edge suppressed to market.">⚠ role check · edge suppressed</div>
+            : <div className={evGood ? "text-emerald-400 font-bold" : "text-rose-400 font-bold"}>EV {evGood ? "+" : ""}{e.ev != null ? (e.ev * 100).toFixed(1) : "—"}% · edge {e.edge != null ? `${e.edge >= 0 ? "+" : ""}${(e.edge * 100).toFixed(1)}%` : "—"}</div>}
         </div>
         <button onClick={() => setShow((s) => !s)} className="text-[11px] text-slate-500 hover:text-emerald-300 border border-slate-700 rounded px-2 py-1">{show ? "hide" : "math"}</button>
         <button onClick={() => onTrack(e)} disabled={tracked} className={`text-[11px] font-bold rounded px-2 py-1 ${tracked ? "bg-slate-700 text-slate-400" : "bg-emerald-600 hover:bg-emerald-500 text-white"}`}>{tracked ? "tracked" : "track"}</button>

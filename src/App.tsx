@@ -763,6 +763,8 @@ function liveCalc(dist, params, current, projFinal, baseStr, fr) { return { dist
 /* full evaluation of a single priced bet (model + market). */
 function evalBet(b, pre) {
   const { pOver, proj, calc } = pre || projectProp(b.ctx, b.type, parseFloat(b.line));
+  // a missing/invalid model probability stays missing on BOTH sides (was 1 - null = 1: a fake 100% under)
+  if (pOver == null || !isFinite(pOver)) return { modelP: null, rawModelP: null, proj, calc, imp: null, novig: null, edge: null, ev: null, b: 0, fair: "—", devigged: false, outsSanityFailed: false };
   const rawP = b.side === "over" ? pOver : 1 - pOver;
   const odds = Number(b.odds);
   const imp = isNaN(odds) ? null : impliedProb(odds);
@@ -1638,7 +1640,9 @@ function oddsDebug(data, bookKey) {
 // Bump MODEL_VERSION whenever a structural change is made to the prediction engine.
 // Every board log entry is tagged with this string so historical CSV exports remain
 // stratifiable by model version for calibration analysis.
-const MODEL_VERSION = "v4.2-2026-06-29";
+// Bump on EVERY model change so board-log rows can be segmented by the model that produced them.
+// (v4.2 label was never bumped through the Jul-Sep calibration edits; v4.3 marks rows from 2026-10-18 on.)
+const MODEL_VERSION = "v4.3-2026-10-18";
 const LS_BETS = "mlbef_mybets_v1";
 function loadBets() { try { return JSON.parse(localStorage.getItem(LS_BETS)) || []; } catch { return []; } }
 function saveBets(b) { try { localStorage.setItem(LS_BETS, JSON.stringify(b)); } catch { /* storage unavailable */ } }
@@ -1670,8 +1674,8 @@ function saveBookOverrides(o) { try { localStorage.setItem(LS_BOOK_OVERRIDES, JS
  * Retention: last 60 days / 100k rows, enforced on every append.
  */
 const LS_BOARD_LOG = "mlbef_boardlog_v1"; // legacy localStorage key (auto-migrated to IndexedDB)
-const BOARD_LOG_MAX_ROWS = 100000;
-const BOARD_LOG_RETENTION_DAYS = 60;
+const BOARD_LOG_MAX_ROWS = 300000;
+const BOARD_LOG_RETENTION_DAYS = 730; // was 60: everything before Sep 8 had already aged out of the research log
 
 /* Board log storage: IndexedDB (localStorage's ~5MB quota silently dropped rows past ~10.5k).
    An in-memory cache keeps all readers synchronous; writes persist async to IndexedDB. */
@@ -1806,6 +1810,8 @@ async function appendBoardLog(entries, modelVersion, date) {
         edge: e.edge != null ? +e.edge.toFixed(4) : null,
         ev: e.ev != null ? +e.ev.toFixed(4) : null,
         proj: e.proj != null ? +e.proj.toFixed(3) : null,
+        // in-game snapshot? (live and pregame rows were previously indistinguishable in the log)
+        live: !!(e.calc && (e.calc.live || /live/i.test(String(e.calc.dist || "")))),
         // settlement (filled later)
         settled: false,
         actualStat: null,
@@ -2823,7 +2829,7 @@ export default function App() {
     const log = loadBoardLog();
     if (!log.length) { alert("No board log entries yet. Load a game to start logging."); return; }
     const esc = (v) => { if (v == null) return ""; const s = String(v); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
-    const headers = ["logId","loggedAt","modelVersion","date","game","gameTimeIso","gamePk","playerId","name","type","line","side","odds","novig","rawModelP","calibratedP","edge","ev","proj","settled","actualStat","result","closingNovig","clv"];
+    const headers = ["logId","loggedAt","modelVersion","date","game","gameTimeIso","gamePk","playerId","name","type","line","side","odds","novig","rawModelP","calibratedP","edge","ev","proj","settled","actualStat","result","closingNovig","clv","live"];
     const rows = [headers.join(",")];
     for (const e of log) {
       rows.push([
@@ -2833,7 +2839,7 @@ export default function App() {
         e.novig ?? "", e.rawModelP ?? "", e.calibratedP ?? "",
         e.edge ?? "", e.ev ?? "", e.proj ?? "",
         e.settled ? "true" : "false",
-        e.actualStat ?? "", esc(e.result), e.closingNovig ?? "", e.clv ?? "",
+        e.actualStat ?? "", esc(e.result), e.closingNovig ?? "", e.clv ?? "", e.live == null ? "" : (e.live ? "true" : "false"),
       ].join(","));
     }
     const blob = new Blob([rows.join("\n")], { type: "text/csv;charset=utf-8;" });

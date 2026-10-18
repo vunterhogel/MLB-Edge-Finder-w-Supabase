@@ -462,6 +462,8 @@ function fullCalc(dist, params, proj, baseStr, mults) { return { dist, params, p
 /* full evaluation of a single priced bet (model + market) — verbatim from MLB/NFL */
 function evalBet(b, pre) {
   const { pOver, proj, calc } = pre || projectPlayer(b.ctx, b.type, parseFloat(b.line));
+  // a missing/invalid model probability stays missing on BOTH sides (was 1 - null = 1: a fake 100% under)
+  if (pOver == null || !isFinite(pOver)) return { modelP: null, rawModelP: null, proj, calc, imp: null, novig: null, edge: null, ev: null, b: 0, fair: "—", devigged: false };
   const rawP = b.side === "over" ? pOver : 1 - pOver;
   const odds = Number(b.odds);
   const imp = isNaN(odds) ? null : impliedProb(odds);
@@ -989,8 +991,8 @@ function saveBets(b) { try { localStorage.setItem(LS_BETS, JSON.stringify(b)); }
 const LS_CREDITS = "nbaef_credits_v1";
 function loadCredits() { try { const v = localStorage.getItem(LS_CREDITS); return v == null || v === "" ? null : +v; } catch { return null; } }
 
-const BOARD_LOG_MAX_ROWS = 100000;
-const BOARD_LOG_RETENTION_DAYS = 60;
+const BOARD_LOG_MAX_ROWS = 300000;
+const BOARD_LOG_RETENTION_DAYS = 730; // was 60: research history was silently aging out
 const BOARD_DB_NAME = "nbaef_boardlog_db";
 const BOARD_DB_STORE = "kv";
 const BOARD_DB_KEY = "boardLog";
