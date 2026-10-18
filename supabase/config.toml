@@ -444,3 +444,7 @@ enabled = true
 verify_jwt = false
 import_map = "./functions/nba-stats-proxy/deno.json"
 entrypoint = "./functions/nba-stats-proxy/index.ts"
+[functions.nhl-collector]
+enabled = true
+verify_jwt = false  # auth is the x-collector-token header, checked against Vault
+entrypoint = "./functions/nhl-collector/index.ts"
