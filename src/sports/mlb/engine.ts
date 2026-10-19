@@ -177,10 +177,17 @@ export function shrinkValue(obs, count, prior, k) {
   return (o * (count || 0) + prior * k) / ((count || 0) + k);
 }
 
+/* Postseason mode. Managers pull starters earlier and run scoring drops in October. Fitted on the
+   2026 board log (27 playoff starts, 15 playoff games: outs ran 21% under projection, K 14% under,
+   runs 18% under) and shrunk about halfway toward no adjustment because the sample is small.
+   Recent-form windows now include playoff games too (data.ts ALL_GAME_TYPES), which covers part
+   of the gap on its own. */
+export const POSTSEASON = { ip: 0.90, runs: 0.93 };
+export const postseasonFactor = (ctx, key) => (ctx && ctx.postseason ? POSTSEASON[key] : 1);
 export function calculateBaseProjection(ctx) {
   const s = ctx.season || {};
   if (ctx.kind === "pitcher") {
-    const ipExp = clamp(s.expIp || 5.2, 2.5, 7.0);
+    const ipExp = clamp(s.expIp || 5.2, 2.5, 7.0) * postseasonFactor(ctx, "ip");
     // Blend season K/9 with recent-starts K/9 (same 20% RECENT_WEIGHT as hitter L15).
     // recentLog.avgK is populated by fetchPitcherLog (last 5 starts) and attached to s by loadDetail.
     // Blending toward recent form reduces systematic overestimate when a pitcher's K rate is declining.
@@ -492,9 +499,9 @@ export function projectProp(ctx, type, line) {
     // Decomposed (projHits + projRRI) was reverted: it inflated projections for good hitters because
     // mcRates.pHit already baked in all positive adjustments, then rriPerG added more on top.
     // The single formula is consistent with every other NB prop and doesn't double-count upside.
-    const mean = Math.max(base.hrrG * M.park * M.weather * M.matchup * M.platoon * M.lineup * M.recent * M.team * M.statcast, 1e-6);
+    const mean = Math.max(base.hrrG * M.park * M.weather * M.matchup * M.platoon * M.lineup * M.recent * M.team * M.statcast * postseasonFactor(ctx, "runs"), 1e-6);
     if (live) { const cur = getCurrentStatTotal(totals, "h") + getCurrentStatTotal(totals, "r") + getCurrentStatTotal(totals, "rbi"); pOver = liveProbabilityOver("nb", seed, { mean: mean * fr, phi: NB_PHI.hrr }, cur, line); proj = cur + mean * fr; calc = liveCalc("Neg.Binom·MC", `μ=${(mean * fr).toFixed(2)} rem, φ=${NB_PHI.hrr}`, cur, proj, `${base.hrrG.toFixed(3)} (H+R+RBI)/g blend`, fr); }
-    else { pOver = probabilityOver("nb", line, "over", seed, { mean, phi: NB_PHI.hrr }); proj = mean; calc = fullCalc("Neg.Binom·MC", `μ=${mean.toFixed(2)}, φ=${NB_PHI.hrr}`, proj, `${base.hrrG.toFixed(3)} (H+R+RBI)/g`, [["park", M.park], ["weather", M.weather], ["matchup", M.matchup], ["hand", M.platoon], ["lineup", M.lineup], ["opp pitching", M.team], ["statcast", M.statcast]]); }
+    else { pOver = probabilityOver("nb", line, "over", seed, { mean, phi: NB_PHI.hrr }); proj = mean; calc = fullCalc("Neg.Binom·MC", `μ=${mean.toFixed(2)}, φ=${NB_PHI.hrr}`, proj, `${base.hrrG.toFixed(3)} (H+R+RBI)/g`, [["park", M.park], ["weather", M.weather], ["matchup", M.matchup], ["hand", M.platoon], ["lineup", M.lineup], ["opp pitching", M.team], ["statcast", M.statcast], ...(ctx.postseason ? [["postseason", POSTSEASON.runs]] : [])]); }
   } else if (type === "Strikeouts") {
     const base = calculateBaseProjection(ctx);
     const oppK = ctx.oppKRate ? clamp(ctx.oppKRate / LG_KRATE, 0.75, 1.30) : 1; // widened 0.85-1.18→0.75-1.30: contact lineups now meaningfully suppress K projection
@@ -504,14 +511,14 @@ export function projectProp(ctx, type, line) {
     const mean = Math.max(kRaw <= K_SOFT_CAP ? kRaw : K_SOFT_CAP + (kRaw - K_SOFT_CAP) * K_SOFT_COMPRESS, 1e-6);
     const kPerOut = (ctx.season && ctx.season.k9 ? ctx.season.k9 / 9 : 0) * oppK * kSc;
     if (live) { const curK = getCurrentStatTotal(totals, "k"); const curOuts = getCurrentStatTotal(totals, "outs"); const remOuts = Math.max(0, base.outsExp - curOuts); const remK = kPerOut * (remOuts / 3); pOver = liveProbabilityOver("nb", seed, { mean: Math.max(remK, 1e-6), phi: NB_PHI.k }, curK, line); proj = curK + remK; calc = liveCalc("Neg.Binom·MC", `μ=${remK.toFixed(2)} rem K, φ=${NB_PHI.k}`, curK, proj, `${(ctx.season && ctx.season.k9 || 0).toFixed(1)} K/9 · ${(remOuts / 3).toFixed(1)} IP left · opp K×${oppK.toFixed(2)}`, fr); }
-    else { pOver = probabilityOver("nb", line, "over", seed, { mean, phi: NB_PHI.k }); proj = mean; calc = fullCalc("Neg.Binom·MC", `μ=${mean.toFixed(2)}, φ=${NB_PHI.k}`, proj, `${(ctx.season && ctx.season.k9 || 0).toFixed(1)} K/9 × ~${(base.ipExp || 5.2).toFixed(1)} IP`, [["opp K rate", oppK], ["statcast K", kSc]]); }
+    else { pOver = probabilityOver("nb", line, "over", seed, { mean, phi: NB_PHI.k }); proj = mean; calc = fullCalc("Neg.Binom·MC", `μ=${mean.toFixed(2)}, φ=${NB_PHI.k}`, proj, `${(ctx.season && ctx.season.k9 || 0).toFixed(1)} K/9 × ~${(base.ipExp || 5.2).toFixed(1)} IP`, [["opp K rate", oppK], ["statcast K", kSc], ...(ctx.postseason ? [["postseason leash", POSTSEASON.ip]] : [])]); }
   } else if (type === "Outs") {
     const base = calculateBaseProjection(ctx);
     const outSc = pitcherStatcastOutsAdjustment(ctx);
     const mean = Math.max(base.outsExp * outSc * OUTS_PROJ_CALIB, 1e-6);
     // Poisson family: actual Outs var/mean=0.71 (tighter than NB). Poisson(phi=1) is much closer than NB(phi=1.5).
     if (live) { const curOuts = getCurrentStatTotal(totals, "outs"); const remOuts = Math.max(0, base.outsExp * outSc * OUTS_PROJ_CALIB - curOuts); pOver = liveProbabilityOver("poisson", seed, { mean: Math.max(remOuts, 1e-6) }, curOuts, line); proj = curOuts + remOuts; calc = liveCalc("Poisson·Outs", `μ=${remOuts.toFixed(1)} rem outs`, curOuts, proj, `~${(base.ipExp || 5.2).toFixed(1)} IP start`, fr); }
-    else { pOver = probabilityOver("poisson", line, "over", seed, { mean }); proj = mean; calc = fullCalc("Poisson·Outs", `μ=${mean.toFixed(1)}`, proj, `~${(base.ipExp || 5.2).toFixed(1)} IP × 3`, [["statcast outs", outSc], ["calib", OUTS_PROJ_CALIB]]); }
+    else { pOver = probabilityOver("poisson", line, "over", seed, { mean }); proj = mean; calc = fullCalc("Poisson·Outs", `μ=${mean.toFixed(1)}`, proj, `~${(base.ipExp || 5.2).toFixed(1)} IP × 3`, [["statcast outs", outSc], ["calib", OUTS_PROJ_CALIB], ...(ctx.postseason ? [["postseason leash", POSTSEASON.ip]] : [])]); }
   }
   return { pOver, proj, calc };
 }

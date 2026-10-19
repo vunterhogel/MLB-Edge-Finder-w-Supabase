@@ -3,7 +3,7 @@
    behaves exactly as before. Other sports implement the same shape (see core/sport.ts). */
 import { ALL_PROPS, BOOKS, BOOK_LABELS, CATEGORY_ORDER, DEFAULT_LINE, HITTER_PROPS, LG_KRATE, LG_RPG, ODDS_TESTING_LIMIT, PARKS, PITCHER_PROPS, isLineType, matchesQuery } from "./config";
 import { TREND_PROPS, attachPitcherHr9FromStatsApi, buildGameLineEntries, buildTrendCard, emptyStatcast, expectedStartIP, fetchBvP, fetchEventOdds, fetchGameResult, fetchGameStatcast, fetchHands, fetchHitterLog, fetchHitterSeason, fetchHitterSplits, fetchHitterStatcastLeaderboards, fetchLiveBox, fetchOddsEvents, fetchPitcherLog, fetchPitcherSeason, fetchPlayerAnalysisProfile, fetchPlayerGameLogs, fetchPlayerSeasonStatcast, fetchSchedule, fetchTeamRPG, fetchWeather, matchCurrentOdds, matchEvent, oddsDebug, parseEventOdds, parseGameOdds, resolveHitterSeasonStatcast, searchPlayers, statcastCoverageSummary } from "./data";
-import { calculateOppPitchingAdjustment, evalBet, gameFractionRemaining, gameProbs, projectProp } from "./engine";
+import { POSTSEASON, calculateOppPitchingAdjustment, evalBet, gameFractionRemaining, gameProbs, projectProp } from "./engine";
 import { clamp, pct, probToAmerican } from "../../core/math";
 import { normName } from "../../core/odds";
 import { Env, mono } from "../../core/ui";
@@ -14,9 +14,9 @@ import * as storage from "./storage";
 /* ---- context builders (moved from App) ---- */
 function liveSnap(d, pid) { if (!d.live) return null; return { fractionRemaining: d.live.fractionRemaining, totals: (d.live.totalsById && d.live.totalsById[pid]) || {} }; }
 function hitterCtx(d, h, pid) {
-  return { kind: "hitter", season: h.season, l15: h.l15, bvp: h.bvp, splits: h.splits, bats: h.bats, oppThrows: h.oppThrows, lineupIndex: h.idx, park: d.park, weather: d.weather, statcastLive: h.statcastLive || null, statcastSeason: h.statcastSeason || null, teamLambda: h.side === "home" ? d.lambdaH : d.lambdaA, oppRAPG: h.side === "home" ? d.rapgAway : d.rapgHome, oppSP: (h.oppSP && d.spStats[h.oppSP.id]) || null, live: liveSnap(d, pid) };
+  return { kind: "hitter", season: h.season, l15: h.l15, bvp: h.bvp, splits: h.splits, bats: h.bats, oppThrows: h.oppThrows, lineupIndex: h.idx, park: d.park, weather: d.weather, statcastLive: h.statcastLive || null, statcastSeason: h.statcastSeason || null, teamLambda: h.side === "home" ? d.lambdaH : d.lambdaA, oppRAPG: h.side === "home" ? d.rapgAway : d.rapgHome, oppSP: (h.oppSP && d.spStats[h.oppSP.id]) || null, live: liveSnap(d, pid), postseason: !!d.postseason };
 }
-function pitcherCtx(d, sp, isHome) { const ps = d.spStats[sp.id]; return { kind: "pitcher", season: ps, statcastSeason: ps && ps.statcastSeason, park: d.park, weather: d.weather, teamLambda: isHome ? d.lambdaH : d.lambdaA, oppKRate: isHome ? d.kRateAway : d.kRateHome, live: liveSnap(d, sp.id) }; }
+function pitcherCtx(d, sp, isHome) { const ps = d.spStats[sp.id]; return { kind: "pitcher", season: ps, statcastSeason: ps && ps.statcastSeason, park: d.park, weather: d.weather, teamLambda: isHome ? d.lambdaH : d.lambdaA, oppKRate: isHome ? d.kRateAway : d.kRateHome, live: liveSnap(d, sp.id), postseason: !!d.postseason }; }
 
 /* ---- game detail: every stat the MLB engine needs for one game (moved from App.loadDetail) ---- */
 async function loadGameDetail(g, { season, date }) {
@@ -79,11 +79,12 @@ async function loadGameDetail(g, { season, date }) {
   const offA = clamp((teamA.rpg || LG_RPG) / LG_RPG, 0.7, 1.4);   // away offense strength
   const oppPitchForHome = calculateOppPitchingAdjustment({ kind: "hitter", oppSP: g.awaySP ? spStats[g.awaySP.id] : null, oppRAPG: teamA.rapg });
   const oppPitchForAway = calculateOppPitchingAdjustment({ kind: "hitter", oppSP: g.homeSP ? spStats[g.homeSP.id] : null, oppRAPG: teamH.rapg });
-  const lambdaH = +clamp(LG_RPG * offH * oppPitchForHome * park.rf, 2.0, 8.5).toFixed(2);
-  const lambdaA = +clamp(LG_RPG * offA * oppPitchForAway * park.rf, 2.0, 8.5).toFixed(2);
+  const psRuns = g.postseason ? POSTSEASON.runs : 1;   // October run environment (engine.ts POSTSEASON)
+  const lambdaH = +clamp(LG_RPG * offH * oppPitchForHome * park.rf * psRuns, 2.0, 8.5).toFixed(2);
+  const lambdaA = +clamp(LG_RPG * offA * oppPitchForAway * park.rf * psRuns, 2.0, 8.5).toFixed(2);
   const statcastCoverage = statcastCoverageSummary(hitters, spStats, statcast);
   const live = g.status === "LIVE" ? { fractionRemaining: gameFractionRemaining(g.inning, g.inningState, g.outs), totalsById: liveBox || {} } : null;
-  return { ready: true, loading: false, hitters, spStats, gamelogs, priorGamelogs, weather: wx, park, statcast, statcastCoverage, lambdaH, lambdaA, kRateHome: teamH.kRate, kRateAway: teamA.kRate, rapgHome: teamH.rapg, rapgAway: teamA.rapg, live };
+  return { ready: true, loading: false, postseason: !!g.postseason, hitters, spStats, gamelogs, priorGamelogs, weather: wx, park, statcast, statcastCoverage, lambdaH, lambdaA, kRateHome: teamH.kRate, kRateAway: teamA.kRate, rapgHome: teamH.rapg, rapgAway: teamA.rapg, live };
 }
 
 /* ---- odds rows -> priced board entries for one game (moved from App.getOdds) ---- */

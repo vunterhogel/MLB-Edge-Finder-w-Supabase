@@ -6,6 +6,12 @@ import { normName, oddsProxyFetch, sideOf } from "../../core/odds";
 
 /* ---------------------- statsapi ---------------------- */
 export const SA = "https://statsapi.mlb.com/api/v1";
+// statsapi game logs default to REGULAR SEASON ONLY. Ask for every game type so recent-form windows,
+// pitcher workload and Trends include Wild Card / Division / LCS / World Series games.
+// (Season-total stats stay regular season: bigger, more stable sample.)
+export const ALL_GAME_TYPES = "R,F,D,L,W";
+export const POSTSEASON_TYPES = ["F", "D", "L", "W"];
+const byDate = (a, b) => Date.parse(a.date || "") - Date.parse(b.date || "");
 export async function jget(url) { const r = await fetch(url); if (!r.ok) throw new Error(`${r.status}`); return r.json(); }
 export async function fetchSchedule(date) {
   const d = await jget(`${SA}/schedule?sportId=1&date=${date}&hydrate=probablePitcher,lineups,team,venue,linescore`);
@@ -45,6 +51,7 @@ export function mapGame(g) {
     awaySP: g.teams.away.probablePitcher ? { id: g.teams.away.probablePitcher.id, name: g.teams.away.probablePitcher.fullName } : null,
     homeLineup: ((g.lineups && g.lineups.homePlayers) || []).map((p) => ({ id: p.id, name: p.fullName })),
     awayLineup: ((g.lineups && g.lineups.awayPlayers) || []).map((p) => ({ id: p.id, name: p.fullName })),
+    postseason: POSTSEASON_TYPES.includes(g.gameType),
     manual: false,
   };
 }
@@ -55,8 +62,8 @@ export async function fetchHitterSeason(id, season) {
   return { g: +s.gamesPlayed || 0, ab: +s.atBats || 0, h: +s.hits || 0, hr: +s.homeRuns || 0, tb: +s.totalBases || 0, r: +s.runs || 0, rbi: +s.rbi || 0, bb: +s.baseOnBalls || 0, so: +s.strikeOuts || 0, pa: +s.plateAppearances || 0, avg: s.avg, obp: s.obp, slg: s.slg, ops: s.ops };
 }
 export async function fetchHitterLog(id, season, n = 15) {
-  const d = await jget(`${SA}/people/${id}/stats?stats=gameLog&group=hitting&season=${season}`);
-  const sp = ((d.stats && d.stats[0] && d.stats[0].splits) || []).slice(-n);
+  const d = await jget(`${SA}/people/${id}/stats?stats=gameLog&group=hitting&season=${season}&gameType=${ALL_GAME_TYPES}`);
+  const sp = ((d.stats && d.stats[0] && d.stats[0].splits) || []).slice().sort(byDate).slice(-n);
   let ab = 0, h = 0, hr = 0, tb = 0, r = 0, rbi = 0;
   for (const x of sp) { ab += +x.stat.atBats || 0; h += +x.stat.hits || 0; hr += +x.stat.homeRuns || 0; tb += +x.stat.totalBases || 0; r += +x.stat.runs || 0; rbi += +x.stat.rbi || 0; }
   return { games: sp.length, ab, h, hr, tb, r, rbi, avg: ab ? h / ab : 0, ops: ab ? ((h / ab) + (tb / ab)) : 0 };
@@ -186,7 +193,7 @@ export function outsToIp(outs) {
 }
 export async function fetchPlayerGameLogs(id, season, group, n = 20) {
   try {
-    const d = await jget(`${SA}/people/${id}/stats?stats=gameLog&group=${group}&season=${season}`);
+    const d = await jget(`${SA}/people/${id}/stats?stats=gameLog&group=${group}&season=${season}&gameType=${ALL_GAME_TYPES}`);
     const splits = ((d.stats && d.stats[0] && d.stats[0].splits) || [])
       .slice()
       .sort((a, b) => Date.parse(a.date || "") - Date.parse(b.date || ""))
@@ -335,8 +342,8 @@ export async function fetchPitcherSeason(id, season) {
 // recent starts reflect the pitcher's current mid-season workload. Falls back gracefully (null) if blocked.
 export async function fetchPitcherLog(id, season, n = 5) {
   try {
-    const d = await jget(`${SA}/people/${id}/stats?stats=gameLog&group=pitching&season=${season}`);
-    const splits = ((d.stats && d.stats[0] && d.stats[0].splits) || [])
+    const d = await jget(`${SA}/people/${id}/stats?stats=gameLog&group=pitching&season=${season}&gameType=${ALL_GAME_TYPES}`);
+    const splits = ((d.stats && d.stats[0] && d.stats[0].splits) || []).slice().sort(byDate)
       .filter((s) => +(s.stat.gamesStarted || 0) > 0)   // starts only
       .slice(-n);
     if (!splits.length) return null;

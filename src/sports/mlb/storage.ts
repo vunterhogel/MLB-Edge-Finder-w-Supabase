@@ -4,7 +4,7 @@
 // stratifiable by model version for calibration analysis.
 // Bump on EVERY model change so board-log rows can be segmented by the model that produced them.
 // (v4.2 label was never bumped through the Jul-Sep calibration edits; v4.3 marks rows from 2026-10-18 on.)
-export const MODEL_VERSION = "v4.3-2026-10-18";
+export const MODEL_VERSION = "v4.4-2026-10-19";   // v4.4: playoff games in recent windows + postseason mode
 export const LS_BETS = "mlbef_mybets_v1";
 export function loadBets() { try { return JSON.parse(localStorage.getItem(LS_BETS)) || []; } catch { return []; } }
 export function saveBets(b) { try { localStorage.setItem(LS_BETS, JSON.stringify(b)); } catch { /* storage unavailable */ } }
