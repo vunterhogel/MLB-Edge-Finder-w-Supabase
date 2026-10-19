@@ -22,3 +22,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+Claude outputs/
+vite.config.ts.timestamp-*.mjs
