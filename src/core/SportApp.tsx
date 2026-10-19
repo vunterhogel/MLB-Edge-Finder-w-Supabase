@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { evPerUnit, impliedProb, pct, probToAmerican, suggestedUnits } from "./math";
+import { evPerUnit, impliedProb, pct, probToAmerican, profitUnits, suggestedUnits } from "./math";
 import { MultiSel, NumIn, Sel, StatCard, mono } from "./ui";
 
 /* SportApp: the shared Edge Finder shell (Slate / Board / Trends / Player Analysis / My Bets / Stats).
@@ -10,7 +10,7 @@ import { MultiSel, NumIn, Sel, StatCard, mono } from "./ui";
 export default function SportApp({ sport }) {
   const { ALL_PROPS, BOOKS, BOOK_LABELS, CATEGORY_ORDER, DEFAULT_LINE, ODDS_TESTING_LIMIT, isLineType, matchesQuery, STAT_ORDER, TREND_PROPS } = sport.config;
   const { BOARD_DB_KEY, LS_BOARD_LOG, LS_CREDITS, MODEL_VERSION, appendBoardLog, boardLogReady, getBoardLogSaveError, idbDel, loadBets, loadBoardLog, loadBookOverrides, loadCredits, loadShowCoverage, resetBoardLogCache, saveBets, saveBoardLog, saveBookOverrides, saveShowCoverage, settleBoardLog } = sport.storage;
-  const { fetchSchedule, fetchOddsEvents, fetchEventOdds, matchEvent, oddsDebug, parseEventOdds, parseGameOdds, matchCurrentOdds, buildGameLineEntries, fetchGameResult, searchPlayers, fetchPlayerAnalysisProfile, findPlayerInSlate, buildTrendCard, getDeltaSignal, profitUnits } = sport.api;
+  const { fetchSchedule, fetchOddsEvents, fetchEventOdds, matchEvent, oddsDebug, parseEventOdds, parseGameOdds, matchCurrentOdds, buildGameLineEntries, fetchGameResult, searchPlayers, fetchPlayerAnalysisProfile, findPlayerInSlate, buildTrendCard, getDeltaSignal } = sport.api;
   const { projectProp } = sport.model;
   const { Chip, ScoreLine, GameSubtitle, SlateDetail, BoardRow, MyBetRow, TrendCard, PlayerAnalysisIntro, PlayerProfilePanel } = sport.ui;
   const meta = sport.meta;
@@ -565,8 +565,8 @@ export default function SportApp({ sport }) {
       const updates = {}; let matched = 0, missed = 0, games_ = 0, frozen = 0;
       const at = new Date().toISOString();
       for (const pkStr in byGame) {
-        const bets = byGame[pkStr]; const pk = Number(pkStr);
-        const g = games.find((x) => x.pk === pk);
+        const bets = byGame[pkStr];
+        const g = games.find((x) => String(x.pk) === pkStr);
         const ev = g ? matchEvent(events, g) : null;
         if (!ev) { for (const b of bets) { updates[b.key] = { oddsCheckedAt: at, currentOdds: null, lineMissing: true }; missed++; } continue; }
         // has first pitch passed? prefer the book's commence_time; fall back to slate status

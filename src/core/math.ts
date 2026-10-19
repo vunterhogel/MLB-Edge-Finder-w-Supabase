@@ -109,3 +109,18 @@ export function noVigProb(overOdds, underOdds, side) {
   const novigOver = s > 0 ? io / s : 0.5;
   return side === "over" ? novigOver : 1 - novigOver;
 }
+
+/* ---- shared settlement helpers ---- */
+export function gradeBet(side, point, actual) {
+  if (actual == null) return null;
+  if (actual === point) return "push";
+  const over = actual > point;
+  if (side === "over") return over ? "won" : "lost";
+  return over ? "lost" : "won";
+}
+export function profitUnits(status, odds, units = 1) {
+  const u = units == null || isNaN(units) ? 1 : units;
+  if (status === "won") return u * (odds > 0 ? odds / 100 : 100 / -odds);
+  if (status === "lost") return -u;
+  return 0;
+}

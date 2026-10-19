@@ -1,3 +1,5 @@
+import { gradeBet, profitUnits } from "../../core/math";
+export { gradeBet, profitUnits };
 /* settling helpers */
 export function actualFor(type, ps) {
   if (!ps) return null;
@@ -6,13 +8,6 @@ export function actualFor(type, ps) {
     case "H+R+RBI": return ps.h + ps.r + ps.rbi; case "Strikeouts": return ps.k; case "Outs": return ps.outs;
   }
   return null;
-}
-export function gradeBet(side, point, actual) {
-  if (actual == null) return null;
-  if (actual === point) return "push";
-  const over = actual > point;
-  if (side === "over") return over ? "won" : "lost";
-  return over ? "lost" : "won";
 }
 // grade a moneyline / total / run-line bet from the final score
 export function gradeLine(type, side, point, homeRuns, awayRuns) {
@@ -34,12 +29,6 @@ export function gradeLine(type, side, point, homeRuns, awayRuns) {
     return { status: (margin + point) > 0 ? "won" : "lost", actual: `${awayRuns}-${homeRuns}` };
   }
   return { status: null, actual: null };
-}
-export function profitUnits(status, odds, units = 1) {
-  const u = units == null || isNaN(units) ? 1 : units;
-  if (status === "won") return u * (odds > 0 ? odds / 100 : 100 / -odds);
-  if (status === "lost") return -u;
-  return 0;
 }
 export function findPlayerInSlate(playerId, games) {
   const id = String(playerId);

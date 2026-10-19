@@ -2,7 +2,7 @@ import React, { useState } from "react";
 import MLBApp from "./App";
 import NFLApp from "./nfl/NFLApp";
 import NBAApp from "./nba/NBAApp";
-import NHLApp from "./nhl/NHLApp";
+import NHLApp from "./sports/nhl/Page";
 import ParlayBuilder from "./parlay/ParlayBuilder";
 
 /* Root — the ONLY new top-level wiring the NFL/NBA integrations needed (see

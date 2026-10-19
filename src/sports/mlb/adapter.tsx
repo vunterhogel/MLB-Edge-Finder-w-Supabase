@@ -227,7 +227,7 @@ const MLB = {
   },
   config: { ALL_PROPS, BOOKS, BOOK_LABELS, CATEGORY_ORDER, DEFAULT_LINE, ODDS_TESTING_LIMIT, isLineType, matchesQuery, STAT_ORDER, TREND_PROPS },
   storage,
-  api: { fetchSchedule, fetchOddsEvents, fetchEventOdds, matchEvent, oddsDebug, parseEventOdds, parseGameOdds, matchCurrentOdds, buildGameLineEntries, fetchGameResult, searchPlayers, fetchPlayerAnalysisProfile, findPlayerInSlate, buildTrendCard, getDeltaSignal, profitUnits },
+  api: { fetchSchedule, fetchOddsEvents, fetchEventOdds, matchEvent, oddsDebug, parseEventOdds, parseGameOdds, matchCurrentOdds, buildGameLineEntries, fetchGameResult, searchPlayers, fetchPlayerAnalysisProfile, findPlayerInSlate, buildTrendCard, getDeltaSignal },
   model: { projectProp },
   loadGameDetail, buildPropEntries, analysisCtx, trendSubjects, propsForKind,
   gradeLineResult, gradeTrackedProp, gradeLogProp, draftCtx, draftDefaults,
