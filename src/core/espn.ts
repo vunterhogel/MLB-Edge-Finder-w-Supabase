@@ -28,7 +28,9 @@ export async function fetchGamelog(sport, athleteId, season = null) {
   const meta = (d.events && typeof d.events === "object") ? d.events : {};
   const rows = [];
   for (const st of d.seasonTypes || []) {
-    const post = /post/i.test(String(st.displayName || ""));
+    const label = String(st.displayName || "");
+    if (/pre-?season/i.test(label)) continue;   // exhibition games never feed a model or a trend
+    const post = /post/i.test(label);
     for (const cat of st.categories || []) {
       const evs = Array.isArray(cat.events) ? cat.events : Object.values(cat.events || {});
       for (const ev of evs) {

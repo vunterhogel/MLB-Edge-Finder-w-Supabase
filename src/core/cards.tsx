@@ -24,17 +24,18 @@ export function MathPanel({ r }) {
 }
 
 
-export function BoardRow({ e, tracked, onTrack, showProjBar = true, isLineType, getDeltaSignal }) {
+export function BoardRow({ e, tracked, onTrack, showProjBar = true, isLineType, getDeltaSignal, isYesNoType = null }) {
+  const yn = !!(isYesNoType && isYesNoType(e.type));   // Double-Double style: Yes/No, proj is a probability
   const [show, setShow] = useState(false);
   const evGood = e.ev >= 0;
-  const pm = !isLineType(e.type) ? projMeta(e.proj, e.line, e.side) : null;
+  const pm = !isLineType(e.type) && !yn ? projMeta(e.proj, e.line, e.side) : null;
   return (
     <div className="bg-slate-900/70 border border-slate-800 rounded-xl overflow-hidden">
       <div className="flex items-center gap-3 px-4 py-3">
         <div className="flex-1 min-w-0">
           <div className="font-semibold truncate">{e.name} <span className="text-slate-500 text-xs">{e.game}</span></div>
           <div className="text-[11px] text-slate-400" style={mono}>
-            {e.side} {e.line} {e.type} @ {fmtOdds(e.odds)} · <span className="text-sky-300">proj {e.proj != null ? e.proj.toFixed(2) : "—"}</span>
+            {yn ? <>{e.side === "over" ? "Yes" : "No"} {e.type} @ {fmtOdds(e.odds)} · <span className="text-sky-300">p {pct(e.proj)}</span></> : <>{e.side} {e.line} {e.type} @ {fmtOdds(e.odds)} · <span className="text-sky-300">proj {e.proj != null ? e.proj.toFixed(2) : "—"}</span></>}
             {pm && <span className={`ml-1.5 font-bold ${pm.color}`}>{pm.delta >= 0 ? "+" : "−"}{Math.abs(pm.delta).toFixed(2)}</span>}
             {(() => { const sig = getDeltaSignal(e.type, e.proj, e.line); return sig ? <span className={`ml-1 ${sig === "strong" ? "text-emerald-400" : "text-yellow-400"}`}>●</span> : null; })()}
           </div>
@@ -59,14 +60,15 @@ export function BoardRow({ e, tracked, onTrack, showProjBar = true, isLineType, 
     </div>
   );
 }
-export function TrendCard({ c, entry, tracked, onTrack }) {
+export function TrendCard({ c, entry, tracked, onTrack, isYesNoType = null }) {
+  const yn = !!(isYesNoType && isYesNoType(c.type));
   return (
     <div className="bg-slate-900/70 border border-slate-800 rounded-xl overflow-hidden">
       <div className="flex items-center gap-3 px-4 py-3 flex-wrap">
         <div className="flex-1 min-w-[160px]">
           <div className="font-semibold truncate">{c.name} <span className="text-slate-500 text-xs">{c.game}</span></div>
           <div className="text-[11px] text-slate-400" style={mono}>
-            {c.side} {c.line} {c.type}{c.odds != null ? ` @ ${fmtOdds(c.odds)}` : ""}
+            {yn ? (c.side === "over" ? "Yes" : "No") : <>{c.side} {c.line}</>} {c.type}{c.odds != null ? ` @ ${fmtOdds(c.odds)}` : ""}
             <span className={`ml-1.5 ${c.sourced === "book" ? "text-sky-400" : "text-slate-500"}`}>{c.sourced === "book" ? "· book line" : "· model-free line"}</span>
           </div>
         </div>
@@ -82,7 +84,8 @@ export function TrendCard({ c, entry, tracked, onTrack }) {
     </div>
   );
 }
-export function MyBetRow({ b, onOdds, onUnits, onRemove, isLineType }) {
+export function MyBetRow({ b, onOdds, onUnits, onRemove, isLineType, isYesNoType = null }) {
+  const yn = !!(isYesNoType && isYesNoType(b.type));
   const stColor = { open: "bg-slate-700 text-slate-300", won: "bg-emerald-600 text-white", lost: "bg-rose-600 text-white", push: "bg-amber-600 text-slate-950", void: "bg-slate-600 text-slate-200" }[b.status];
   const profit = (b.status === "won" || b.status === "lost") ? profitUnits(b.status, Number(b.odds), b.units) : null;
   return (
@@ -90,9 +93,9 @@ export function MyBetRow({ b, onOdds, onUnits, onRemove, isLineType }) {
       <div className="flex-1 min-w-0">
         <div className="font-semibold truncate">{b.name} <span className="text-slate-500 text-xs">{b.game} · {b.book}</span></div>
         <div className="text-[11px] text-slate-400" style={mono}>
-          {b.side} {b.line} {b.type}
+          {yn ? (b.side === "over" ? "Yes" : "No") : <>{b.side} {b.line}</>} {b.type}
           {b.proj != null ? <> · <span className="text-sky-300">proj {Number(b.proj).toFixed(2)}</span></> : ""}
-          {(() => { const pm = !isLineType(b.type) && b.proj != null ? projMeta(b.proj, b.line, b.side) : null; if (!pm) return null; return <span className={`ml-1.5 font-bold ${pm.color}`}>{pm.delta >= 0 ? "+" : "−"}{Math.abs(pm.delta).toFixed(2)}</span>; })()}
+          {(() => { const pm = !isLineType(b.type) && !yn && b.proj != null ? projMeta(b.proj, b.line, b.side) : null; if (!pm) return null; return <span className={`ml-1.5 font-bold ${pm.color}`}>{pm.delta >= 0 ? "+" : "−"}{Math.abs(pm.delta).toFixed(2)}</span>; })()}
           {b.actual != null ? <> · <span className="text-slate-300">actual {b.actual}</span></> : ""}
         </div>
         {b.currentOdds != null && (

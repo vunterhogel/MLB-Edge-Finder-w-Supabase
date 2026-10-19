@@ -482,7 +482,9 @@ export default function SportApp({ sport }) {
     let graded = 0;
     setMyBets((prev) => prev.map((b) => {
       if (b.status !== "open") return b;
-      const res = results[b.gamePk]; if (!res || !res.final) return b;
+      const res = results[b.gamePk];
+      if (res && res.canceled) { graded++; return { ...b, status: "void", actual: "CANCELED" }; }   // postponed / canceled game: no action
+      if (!res || !res.final) return b;
       if (isLineType(b.type)) {
         const { status, actual } = sport.gradeLineResult(b.type, b.side, parseFloat(b.line), res);
         if (!status) return b; graded++; return { ...b, status, actual };
@@ -521,6 +523,7 @@ export default function SportApp({ sport }) {
       const updated = log.map((e) => {
         if (e.settled) return e;
         const res = results[e.gamePk];
+        if (res && res.canceled) { graded++; return { ...e, settled: true, actualStat: null, result: "void" }; }
         if (!res || !res.final) return e; // game still in progress — leave unsettled
 
         // Game line props (moneyline / total / spread)

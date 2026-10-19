@@ -1,7 +1,7 @@
 import React, { useState } from "react";
 import MLBApp from "./App";
 import NFLApp from "./nfl/NFLApp";
-import NBAApp from "./nba/NBAApp";
+import NBAApp from "./sports/nba/Page";
 import NHLApp from "./sports/nhl/Page";
 import ParlayBuilder from "./parlay/ParlayBuilder";
 
