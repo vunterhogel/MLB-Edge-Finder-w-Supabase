@@ -1,7 +1,7 @@
 // nhl-collector: scheduled, server-side NHL research collector (paper mode).
 //
-// Jobs (POST JSON body {"job": ...}, header x-collector-token required):
-//   snapshot  {kind:"open"|"close"}  pull player-prop quotes for today's NHL games from several books in
+// Jobs (POST JSON body {"job": ...}, header x-ef-key (or x-collector-token) required):
+//   snapshot  {kind:"auto"|"open"|"close", date?}  pull player-prop quotes for today's NHL games from several books in
 //                                    ONE call per game (bookmaker list counts as one region), store every
 //                                    quote, and store a baseline model prediction for every quoted line.
 //                                    "close" only touches games starting in the next ~50 minutes that
@@ -35,12 +35,17 @@ const POS_PRIOR = {
 const SHRINK = { playerGames: 10, priorSeasonGames: 20, teamGames: 10, goalieShots: 400 };
 const PHI = { player_shots_on_goal: 1.25, player_points: 1.15, player_total_saves: 1.6 };
 
+const CORS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "content-type, x-ef-key, x-collector-token, authorization, apikey, x-client-info",
+};
 const json = (body: unknown, status = 200) =>
-  new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+  new Response(JSON.stringify(body), { status, headers: { ...CORS, "content-type": "application/json" } });
 
 // ---------------- helpers ----------------
 function normName(s: string) {
-  return (s || "").toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "")
+  return (s || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "")
     .replace(/[^a-z ]/g, " ").replace(/\b(jr|sr|ii|iii|iv)\b/g, "").replace(/\s+/g, " ").trim();
 }
 async function getJson(url: string, tries = 3): Promise<any> {
@@ -196,25 +201,35 @@ async function upsertGames(sb: any, date: string) {
   return games;
 }
 
-async function snapshot(sb: any, kind: "open" | "close", notes: any) {
+// kind "auto" (manual pulls from the app): per game, take the near-close snapshot if it starts within
+// CLOSE_WINDOW_MIN and has none yet, otherwise the opening snapshot if it has none yet; otherwise skip.
+const CLOSE_WINDOW_MIN = 60;
+async function snapshot(sb: any, kindReq: "open" | "close" | "auto", notes: any, date?: string) {
   const key = Deno.env.get("ODDS_API_KEY");
   if (!key) throw new Error("ODDS_API_KEY not set");
   const used = await creditsUsedThisMonth(sb);
   if (used >= MONTHLY_CAP) { notes.skipped = `monthly cap reached (${used}/${MONTHLY_CAP})`; return 0; }
 
-  const games = await upsertGames(sb, etDate());
+  const games = await upsertGames(sb, date || etDate());
   const now = Date.now();
   let targets = games.filter((g: any) => ["FUT", "PRE"].includes(g.gameState) && Date.parse(g.startTimeUTC) > now);
-  if (kind === "close") targets = targets.filter((g: any) => Date.parse(g.startTimeUTC) - now <= 50 * 60000);
-  if (!targets.length) { notes.targets = 0; return 0; }
+  if (kindReq === "close") targets = targets.filter((g: any) => Date.parse(g.startTimeUTC) - now <= 50 * 60000);
+  if (!targets.length) { notes.targets = 0; notes.reason = "no upcoming games"; return 0; }
 
-  // skip games already snapshotted for this kind
-  const { data: done } = await sb.from("quotes").select("event_id").eq("sport", SPORT).eq("snapshot_kind", kind)
+  // which snapshot kinds each game already has
+  const { data: done } = await sb.from("snapshots").select("event_id, kind").eq("sport", SPORT)
     .in("event_id", targets.map((g: any) => String(g.id)));
-  const doneSet = new Set((done || []).map((r: any) => r.event_id));
-  targets = targets.filter((g: any) => !doneSet.has(String(g.id)));
+  const have = new Set((done || []).map((r: any) => `${r.event_id}|${r.kind}`));
+  const kindFor = (g: any): "open" | "close" | null => {
+    const id = String(g.id);
+    if (kindReq !== "auto") return have.has(`${id}|${kindReq}`) ? null : kindReq;
+    const nearClose = Date.parse(g.startTimeUTC) - now <= CLOSE_WINDOW_MIN * 60000;
+    if (nearClose) return have.has(`${id}|close`) ? null : "close";
+    return have.has(`${id}|open`) ? null : "open";
+  };
+  targets = targets.filter((g: any) => kindFor(g) != null);
   notes.targets = targets.length;
-  if (!targets.length) return 0;
+  if (!targets.length) { notes.reason = "every upcoming game already has its snapshot"; return 0; }
 
   const events = await getJson(`${ODDS}/sports/${ODDS_SPORT}/events?apiKey=${key}&dateFormat=iso`); // free
   const cache = new Map<string, TeamCtx>();
@@ -222,6 +237,7 @@ async function snapshot(sb: any, kind: "open" | "close", notes: any) {
   notes.games = [];
 
   for (const g of targets) {
+    const kind = kindFor(g)!;
     const homeName = normName(`${g.homeTeam.placeName?.default ?? ""} ${g.homeTeam.commonName?.default ?? ""}`);
     const awayName = normName(`${g.awayTeam.placeName?.default ?? ""} ${g.awayTeam.commonName?.default ?? ""}`);
     const commonH = normName(g.homeTeam.commonName?.default ?? ""), commonA = normName(g.awayTeam.commonName?.default ?? "");
@@ -299,15 +315,16 @@ async function snapshot(sb: any, kind: "open" | "close", notes: any) {
       const { error } = await sb.from("predictions").upsert([...predRows.values()], { onConflict: "sport,event_id,player_id,market,line,model_version,snapshot_kind", ignoreDuplicates: true });
       if (error) throw error;
     }
-    notes.games.push({ id: g.id, matchup: `${g.awayTeam.abbrev}@${g.homeTeam.abbrev}`, quotes: quoteRows.length, predictions: predRows.size, unmatched, credits: last });
+    await sb.from("snapshots").upsert({ sport: SPORT, event_id: String(g.id), kind, quotes: quoteRows.length, predictions: predRows.size, credits: last }, { onConflict: "sport,event_id,kind" });
+    notes.games.push({ id: g.id, kind, matchup: `${g.awayTeam.abbrev}@${g.homeTeam.abbrev}`, quotes: quoteRows.length, predictions: predRows.size, unmatched, credits: last });
   }
   notes.remaining = remaining;
   return { credits, remaining };
 }
 
-async function settle(sb: any, notes: any) {
-  // refresh today's schedule too, so status/start-time changes (postponements) are recorded
-  await upsertGames(sb, etDate()).catch(() => null);
+async function settle(sb: any, notes: any, date?: string) {
+  // refresh the schedule too, so status/start-time changes (postponements) are recorded
+  await upsertGames(sb, date || etDate()).catch(() => null);
   const cutoff = new Date(Date.now() - 2 * 3600000).toISOString();
   const { data: open } = await sb.from("events").select("event_id").eq("sport", SPORT).eq("final", false).lt("start_time", cutoff).limit(40);
   notes.checked = (open || []).length; notes.settled = [];
@@ -341,23 +358,27 @@ async function settle(sb: any, notes: any) {
 }
 
 Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") return new Response(null, { headers: CORS });
   if (req.method !== "POST") return json({ error: "POST only" }, 405);
   const sb = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!, { auth: { persistSession: false } });
-  const token = req.headers.get("x-collector-token") || "";
+  // same private key the app uses for database writes (x-ef-key); x-collector-token kept for scheduled calls
+  const token = req.headers.get("x-ef-key") || req.headers.get("x-collector-token") || "";
   const { data: ok } = await sb.rpc("check_collector_token", { t: token });
   if (!ok) return json({ error: "unauthorized" }, 401);
 
   const body = await req.json().catch(() => ({}));
   const job = body.job || "snapshot";
-  const { data: run } = await sb.from("collector_runs").insert({ sport: SPORT, job: job === "snapshot" ? `snapshot:${body.kind || "open"}` : job }).select("id").single();
+  const date = typeof body.date === "string" && /^\d{4}-\d{2}-\d{2}$/.test(body.date) ? body.date : undefined;
+  const kindReq = body.kind === "close" ? "close" : body.kind === "open" ? "open" : "auto";
+  const { data: run } = await sb.from("collector_runs").insert({ sport: SPORT, job: job === "snapshot" ? `snapshot:${kindReq}` : job }).select("id").single();
   const notes: any = { model: MODEL_VERSION };
   let credits = 0, remaining: number | null = null, error: string | null = null;
   try {
     if (job === "snapshot") {
-      const res: any = await snapshot(sb, body.kind === "close" ? "close" : "open", notes);
+      const res: any = await snapshot(sb, kindReq, notes, date);
       if (res) { credits = res.credits || 0; remaining = res.remaining ?? null; }
     } else if (job === "settle") {
-      await settle(sb, notes);
+      await settle(sb, notes, date);
     } else {
       throw new Error(`unknown job ${job}`);
     }
