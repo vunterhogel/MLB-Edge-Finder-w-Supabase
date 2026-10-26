@@ -128,6 +128,15 @@ export const GAME_MARKETS = ["h2h", "spreads", "totals"];        // moneyline, r
 export const GAME_PROPS = ["Moneyline", "Run Line", "Total"];
 export const CATEGORY_ORDER = [...HITTER_PROPS, ...PITCHER_PROPS, ...GAME_PROPS];
 export const isLineType = (t) => GAME_PROPS.includes(t);
+// Projection-vs-line signal thresholds (core/signals.ts), fit from Sep 2-7 settled data.
+// TB / H+R+RBI: |delta| (both directions meaningful). Hits / K: direction-only (projection above the line).
+// Outs, HR and game lines have no rule: the delta signal was unreliable or inverted for them.
+export const SIGNAL_RULES = {
+  "Total Bases": { mode: "abs", strong: 1.0, moderate: 0.75 },
+  "H+R+RBI": { mode: "abs", strong: 1.0, moderate: 0.75 },
+  "Hits": { mode: "over", strong: 0.5, moderate: 0 },
+  "Strikeouts": { mode: "over", moderate: 0 },   // no strong tier: direction only
+};
 export const BOOKS = [
   { key: "draftkings", label: "DraftKings" }, { key: "fanduel", label: "FanDuel" },
   { key: "betmgm", label: "BetMGM" }, { key: "caesars", label: "Caesars" },

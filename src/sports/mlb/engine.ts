@@ -2,6 +2,11 @@ import { LG_BARREL, LG_BBPCT, LG_FB, LG_FIP, LG_HARDHIT, LG_KPCT, LG_KRATE, LG_P
 import { RNG, binCdf, clamp, evPerUnit, hashSeed, impliedProb, negativeBinomialPMF, noVigProb, poiCdf, probToAmerican, runMonteCarlo, sampleGamma, sampleNegBin, withSeededRng } from "../../core/math";
 
 
+// Bump on EVERY model change: it's part of every board-log id, so a new version logs its own snapshot
+// of the same bet next to the old one. (v4.2 was never bumped through the Jul-Sep calibration edits;
+// v4.3 marks rows from 2026-10-18 on.)
+export const MODEL_VERSION = "v4.4-2026-10-19";   // v4.4: playoff games in recent windows + postseason mode
+
 /* ---------- engine constants (tunable) ---------- */
 export const RECENT_WEIGHT = 0.20;
 export const RECENT_MULT_STRENGTH = 0.0;          // extra hot/cold mult (off; recency already in blend)

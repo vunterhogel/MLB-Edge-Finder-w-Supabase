@@ -3,13 +3,17 @@
    NFL runs by week, not date, so this adapter also supplies the shell's optional week navigator:
    the slate key is "<year>-<seasonType>-<week>" (e.g. "2026-2-8"), the same key the old page used for
    tracked bets and board-log ids, so existing data lines up. */
-import { ALL_PLAYER_PROPS, BOOKS, BOOK_LABELS, CATEGORY_ORDER, DEFAULT_LINE, HOME_FIELD_MULT, LG_PPG, ODDS_SPORT, ODDS_SPORT_PRESEASON, ODDS_TESTING_LIMIT, STADIUMS, isLineType, matchesQuery } from "./config";
-import { GAMELOG_ROWS, ESPN_WEB, TREND_PROPS, actualFor, buildGameLineEntries, buildTrendCard, currentWeekGuess, fetchAthleteGamelog, fetchCurrentWeek, fetchDepthChart, fetchEventOdds, fetchGameSummary, fetchLongCmpForEventTrySeasons, fetchOddsEvents, fetchRoster, fetchSchedule, fetchStandings, fetchTeamStats, fetchWeather, gradeLine, jget, matchCurrentOdds, matchEvent, normName, parseEventOdds, parseGameOdds, searchPlayers, weekYear } from "./data";
-import { EXPERIMENTAL_TYPES, evalBet, projectProp } from "./engine";
+import { ALL_PLAYER_PROPS, BOOKS, BOOK_LABELS, CATEGORY_ORDER, DEFAULT_LINE, HOME_FIELD_MULT, LG_PPG, ODDS_SPORT, ODDS_SPORT_PRESEASON, ODDS_TESTING_LIMIT, STADIUMS, SIGNAL_RULES, isLineType, matchesQuery } from "./config";
+import { GAMELOG_ROWS, ESPN_WEB, TREND_PROPS, actualFor, buildGameLineEntries, buildTrendCard, currentWeekGuess, fetchAthleteGamelog, fetchCurrentWeek, fetchDepthChart, fetchEventOdds, fetchGameSummary, fetchLongCmpForEventTrySeasons, fetchOddsEvents, fetchRoster, fetchSchedule, fetchStandings, fetchTeamStats, fetchWeather, gradeLine, jget, matchCurrentOdds, matchEvent, normName, parseEventOdds, parseGameOdds, searchPlayers, trendValueForGame, weekYear } from "./data";
+import { EXPERIMENTAL_TYPES, MODEL_VERSION, calculateInjuryAvailability, evalBet, gameProbs, projectProp } from "./engine";
 import { analysisCtx, featuredFromRosterAndDepth, playerCtx, posKey, propsForKind, propsForPos, rosterSpot } from "./context";
-import { MODEL_VERSION, storage } from "./storage";
-import { clamp, gradeBet } from "../../core/math";
-import { BoardRow, Chip, GameSubtitle, MyBetRow, PlayerAnalysisIntro, PlayerProfilePanel, ScoreLine, SlateDetail, TrendCard, WeekNav, getDeltaSignal } from "./ui";
+import { createStorage } from "../../core/storage";
+import { clamp, gradeBet, pct } from "../../core/math";
+import { WeekPicker, weekShift } from "./ui";
+import { logSections } from "../../core/playerLog";
+import { injuryBadge } from "../../core/slate";
+
+const storage = createStorage("nfief", MODEL_VERSION, {});   // nfief_* keys (unchanged)
 
 /* ---------------- week slate ---------------- */
 const SEASON_TYPE_SHORT = { 1: "Pre", 2: "", 3: "Post" };
@@ -25,7 +29,9 @@ const slate = {
   season: (k) => String(parseWeekKey(k).year),
   order: (k) => { const { year, seasonType, week } = parseWeekKey(k); return year * 1000 + seasonType * 100 + week; },
   label: (k) => { const { year, seasonType, week } = parseWeekKey(k); return `${year} ${SEASON_TYPE_SHORT[seasonType] ? `${SEASON_TYPE_SHORT[seasonType]} ` : ""}Wk ${week}`; },
-  Nav: WeekNav,
+  shift: weekShift,
+  today: async () => weekKeyOf(await fetchCurrentWeek()),
+  Picker: WeekPicker,
 };
 
 /* the odds feed splits preseason into its own sport key; follow whichever week is loaded */
@@ -160,6 +166,102 @@ function trendSubjects(g, d) {
   return out;
 }
 
+
+/* ---------------- Slate: what the shared game panel shows for a football game ---------------- */
+const game = {
+  subtitle: (g) => g.venue || "TBD",
+  finalSuffix: (g) => (g.period && g.period > 4 ? "/OT" : ""),
+  liveLabel: (g) => `${g.period > 4 ? "OT" : `Q${g.period}`} ${g.clock || ""}`,
+};
+// headline last-4-games rate per position, from the gamelog the Slate already fetches
+const L4_HEADLINE = { QB: ["passYds", "pYds"], RB: ["rushYds", "rYds"], WR: ["recYds", "rcYds"], TE: ["recYds", "rcYds"], K: ["kickPts", "pts"] };
+function l4(gl, pos) {
+  const cfg = L4_HEADLINE[pos];
+  if (!cfg || !gl || !gl.recent || !gl.recent.games) return null;
+  return `L${gl.recent.games} ${cfg[1]} ${((gl.recent[cfg[0]] || 0) / gl.recent.games).toFixed(1)}/g`;
+}
+function footballColumn(title, team, d) {
+  const dst = { id: `dst-${team.teamId}`, pos: "DST", name: `${title.split(" ")[0]} D/ST` };
+  const rows = [...team.featured, dst].map((p, i) => {
+    const pos = posKey(p.pos);
+    return {
+      id: p.id, idx: i + 1, tag: `${p.pos}${p.depthRank && p.depthRank < 90 ? p.depthRank : ""}`,
+      tagWarn: p.depthConfirmed === false ? "No confirmed depth chart for this team, so the order is the roster listing, not a verified starter" : null,
+      name: p.name, badges: [injuryBadge(p.injuryStatus)].filter(Boolean), stat: l4(d.logs[p.id], pos),
+      player: { id: p.id, name: p.name, pos: p.pos, teamId: team.teamId }, draft: { kind: pos, id: p.id, name: p.name },
+    };
+  });
+  return { title, legend: "last-4 form", empty: "— roster unavailable —", rows: team.featured.length ? rows : [] };
+}
+function slateView(g, d) {
+  const gp = gameProbs(d.lambdaH, d.lambdaA);
+  const w = d.weather;
+  return {
+    env: [
+      { label: "VENUE", v: g.venue || "—" },
+      ...(d.stadium && d.stadium.dome ? [{ label: "ROOF", v: "dome/closed" }] : []),
+      ...(w ? [{ label: "TEMP", v: `${w.temp}°`, hot: w.temp >= 90, cold: w.temp <= 32 }, { label: "WIND", v: `${w.wind}mph`, hot: w.wind >= 15 }, { label: "RAIN", v: `${w.pop}%`, hot: w.pop >= 50 }] : []),
+    ],
+    gameLine: { lambdaA: d.lambdaA, lambdaH: d.lambdaH, home: gp.home, away: gp.away, total: gp.totalLambda, extra: [["tie", pct(gp.tie)]], note: "team scoring environment (standings points for / against × home field). Game lines are experimental: once odds are pulled they anchor to the market total and spread." },
+    sections: [[footballColumn(`${g.away} (away)`, d.away, d), footballColumn(`${g.home} (home)`, d.home, d)]],
+  };
+}
+
+
+/* ---------------- Player Analysis data (rendered by the shared core/analysis.tsx) ---------------- */
+const NFL_ABBR = { "Pass Yards": "PaYd", "Pass Completions": "Cmp", "Pass Attempts": "Att", "Pass TDs": "PaTD", "Interceptions": "INT", "Rush Yards": "RuYd", "Rush TDs": "RuTD", "Receptions": "Rec", "Receiving Yards": "ReYd", "Receiving TDs": "ReTD", "Kicking Points": "KPts", "Field Goals Made": "FGM", "Anytime TD": "TD" };
+const FORM_TYPES = { QB: ["Pass Yards", "Pass Completions", "Pass Attempts", "Pass TDs"], RB: ["Rush Yards", "Receptions", "Receiving Yards", "Anytime TD"], WR: ["Receptions", "Receiving Yards", "Receiving TDs"], TE: ["Receptions", "Receiving Yards", "Receiving TDs"], K: ["Kicking Points", "Field Goals Made"] };
+const n1 = (x) => (x == null || isNaN(x) ? "—" : Number(x).toFixed(1));
+function seasonMetrics(pos, s) {
+  const has = !!(s && s.g > 0);
+  const v = (k) => (has ? Math.round(s[k] || 0) : "—");
+  const per = (k) => (has ? n1((s[k] || 0) / s.g) : "—");
+  if (pos === "QB") return { tiles: [["Pass Yds", v("passYds")], ["Pass TD", v("passTd")], ["INT", v("ints")], ["Yds/G", per("passYds")]], grid: [["G", has ? s.g : 0], ["Cmp/G", per("passCmp")], ["Att/G", per("passAtt")], ["Yds/G", per("passYds"), "sky"], ["TD", v("passTd"), "sky"], ["INT", v("ints")], ["Rush Yds", v("rushYds")], ["Rush TD", v("rushTd")]] };
+  if (pos === "RB") return { tiles: [["Rush Yds", v("rushYds")], ["Rush TD", v("rushTd")], ["Rec", v("rec")], ["YPC", has && s.rushAtt ? (s.rushYds / s.rushAtt).toFixed(1) : "—"]], grid: [["G", has ? s.g : 0], ["Car/G", per("rushAtt")], ["Rush Yds/G", per("rushYds"), "sky"], ["Rush TD", v("rushTd"), "sky"], ["Tgt/G", per("targets")], ["Rec/G", per("rec")], ["Rec Yds/G", per("recYds")], ["Rec TD", v("recTd")]] };
+  if (pos === "WR" || pos === "TE") return { tiles: [["Rec", v("rec")], ["Rec Yds", v("recYds")], ["Rec TD", v("recTd")], ["Yds/Rec", has && s.rec ? (s.recYds / s.rec).toFixed(1) : "—"]], grid: [["G", has ? s.g : 0], ["Tgt/G", per("targets"), "sky"], ["Rec/G", per("rec"), "sky"], ["Yds/G", per("recYds"), "sky"], ["Rec TD", v("recTd")], ["Catch%", has && s.targets ? `${Math.round((s.rec / s.targets) * 100)}%` : "—"], ["Yds/Tgt", has && s.targets ? (s.recYds / s.targets).toFixed(1) : "—"], ["Rush Yds", v("rushYds")]] };
+  if (pos === "K") return { tiles: [["FG Made", v("fgMade")], ["Kick Pts", v("kickPts")], ["Pts/G", per("kickPts")], ["Games", has ? s.g : "—"]], grid: [["G", has ? s.g : 0], ["FGM/G", per("fgMade"), "sky"], ["Pts/G", per("kickPts"), "sky"], ["FG Made", v("fgMade")]] };
+  return { tiles: [["Sacks", "—"], ["Def INT", "—"], ["Games", "—"], ["Depth", "—"]], grid: [] };
+}
+function playerView({ profile, spot, detail }) {
+  const p = profile.player;
+  const ready = spot && detail && detail.ready;
+  const ctx = ready ? analysisCtx(detail, spot, profile) : null;
+  const pos = (ctx && ctx.pos) || p.pos || "";
+  const log = (detail && detail.logs && detail.logs[p.id]) || profile.log;
+  const prior = (detail && detail.priorLogs && detail.priorLogs[p.id]) || profile.priorLog;
+  const sm = seasonMetrics(pos === "TE" ? "TE" : pos, log && log.season);
+  const types = FORM_TYPES[pos] || [];
+  const curRows = (log && log.games) || [];
+  const roster = ready ? [...detail.home.roster, ...detail.away.roster].find((x) => String(x.id) === String(p.id)) : null;
+  const mult = (x) => (x == null ? "—" : `×${Number(x).toFixed(2)}`);
+  const oppDef = ctx && ctx.oppPassYdsAllowed != null ? ctx.oppPassYdsAllowed : null;
+  return {
+    headshot: pos === "DST" ? null : `https://a.espncdn.com/i/headshots/nfl/players/full/${p.id}.png`,
+    subtitle: [p.teamAbbr || (spot ? (spot.side === "home" ? spot.game.home : spot.game.away) : "FA"), pos || "—", p.jersey ? `#${p.jersey}` : "", ctx && ctx.depthRank && ctx.depthRank < 90 ? `depth #${ctx.depthRank}` : "", roster && roster.injuryStatus ? roster.injuryStatus.replace(/_/g, " ") : ""].filter(Boolean).join(" · "),
+    metrics: sm.tiles,
+    cards: [
+      !spot ? { title: "SLATE MATCHUP", empty: "No game in the selected week (bye, or a different week is loaded)." } : {
+        title: "SLATE MATCHUP", headline: { text: `${spot.game.away} @ ${spot.game.home}` },
+        note: `${spot.side === "home" ? spot.game.home : spot.game.away} ${pos || "player"} · vs ${spot.side === "home" ? spot.game.away : spot.game.home}`,
+        lines: ready ? [
+          `model score ${spot.game.away} ${detail.lambdaA.toFixed(1)} – ${detail.lambdaH.toFixed(1)} ${spot.game.home}`,
+          detail.weather ? `${detail.weather.temp}°F · wind ${detail.weather.wind}mph · rain ${detail.weather.pop}%` : detail.stadium && detail.stadium.dome ? "dome / closed roof" : "weather unavailable",
+          roster && roster.injuryStatus ? { text: `status ${roster.injuryStatus.replace(/_/g, " ")}`, tone: "warn" } : { text: "no injury designation", tone: "muted" },
+        ] : [{ text: "loading detail…", tone: "muted" }],
+      },
+      { title: "SEASON BASELINE", empty: log && log.season && log.season.g > 0 ? null : "No season log yet.", grid: sm.grid },
+      !ctx ? { title: "MODEL CONTEXT", empty: spot ? "loading matchup context…" : "Available when the player is on the selected slate." } : {
+        title: "MODEL CONTEXT", note: "inputs the projection uses for this game",
+        grid: [["spread", ctx.teamSpread != null ? n1(ctx.teamSpread) : "—", "sky"], ["implied pts", ctx.impliedTeamPts != null ? n1(ctx.impliedTeamPts) : "—", "sky"],
+          ["opp pass yds/g", oppDef != null ? n1(oppDef) : "—"], ["opp rush yds/g", ctx.oppRushYdsAllowed != null ? n1(ctx.oppRushYdsAllowed) : "—"],
+          ["availability", mult(calculateInjuryAvailability(ctx.injuryStatus))], ["goal-line share", mult(ctx.goalLineShareMult)],
+          ["short week", ctx.shortWeek ? "yes" : "no"], ["prior season", ctx.priorSeason ? "in base" : "none"]],
+      },
+    ],
+    ...logSections({ rows: [...curRows, ...((prior && prior.games) || [])], curCount: curRows.length, types, valueFor: trendValueForGame, abbr: (t) => NFL_ABBR[t] || t, defaultLines: DEFAULT_LINE, title: "Recent Form" }),
+  };
+}
+
 /* ---------------- settlement ---------------- */
 // ESPN's box score has no Longest Completion; pull it from each passer's gamelog before grading
 async function augmentResults(items, results) {
@@ -203,19 +305,15 @@ const NFL = {
   id: "nfl",
   slate,
   meta: {
-    title: "NFL", emoji: "🏈", tagline: "live odds · de-vigged edge · Monte-Carlo props", league: "NFL",
+    title: "NFL", emoji: "🏈", league: "NFL",
     statsSource: "ESPN", searchPlaceholder: "Patrick Mahomes",
-    analysisHint: "League-wide NFL player lookup. Players whose team plays in the selected week get matchup context, model projections, and any pulled",
     csvPrefix: "nfl-edge-finder", boardLogCsvPrefix: "nfl-board-log", backupApp: "nfl-edge-finder",
-    slateColumn: "week",
-    boardLogExtraCols: [["preStart", (e) => (e.preStart == null ? "" : e.preStart ? "true" : "false")], ["roleCheck", (e) => (e.roleCheck ? "true" : "")]],
-    emptySlateMsg: "No games this week (bye-heavy week, or week/season not yet scheduled).",
     overrideTitle: "Per-market book overrides: pull one market from a different book when your main book doesn't carry it",
     diagnosticsType: "Anytime TD", diagnosticsMarketKey: "player_anytime_td",
     draftKindLabel: (kind) => kind || "PLAYER",
     searchResultLine: (p) => p.teamName || "Free agent / unresolved team",
   },
-  config: { ALL_PROPS: ALL_PLAYER_PROPS, BOOKS, BOOK_LABELS, CATEGORY_ORDER, DEFAULT_LINE, ODDS_TESTING_LIMIT, isLineType, matchesQuery, STAT_ORDER: CATEGORY_ORDER, TREND_PROPS, TREND_SAMPLES: [3, 5, 8, 12, 16], TREND_DEFAULT_N: 8 },
+  config: { ALL_PROPS: ALL_PLAYER_PROPS, BOOKS, BOOK_LABELS, CATEGORY_ORDER, DEFAULT_LINE, ODDS_TESTING_LIMIT, isLineType, matchesQuery, STAT_ORDER: CATEGORY_ORDER, TREND_PROPS, SIGNAL_RULES },
   storage,
   api: {
     fetchSchedule: fetchScheduleForKey,
@@ -232,7 +330,6 @@ const NFL = {
     searchPlayers: (q) => searchPlayers(q),
     fetchPlayerAnalysisProfile, findPlayerInSlate,
     buildTrendCard: (p, _pid, type, games, g, isHome, entries, n) => buildTrendCard(p, posKey(p.pos), type, games ? { games } : null, g, isHome, entries, n),
-    getDeltaSignal,
   },
   model: { projectProp },
   loadGameDetail, buildPropEntries, analysisCtx, trendSubjects, augmentResults,
@@ -242,7 +339,6 @@ const NFL = {
   gradeLogProp: (e, res) => gradeProp(e, res, "DNP"),
   draftCtx,
   draftDefaults: (kind) => { const type = DRAFT_DEFAULT[posKey(kind)] || "Receptions"; return { type, line: DEFAULT_LINE[type] || "0.5" }; },
-  ui: { Chip, ScoreLine, GameSubtitle, SlateDetail, BoardRow, MyBetRow, TrendCard, PlayerAnalysisIntro, PlayerProfilePanel },
+  game, slateView, playerView,
 };
-export { MODEL_VERSION };
 export default NFL;

@@ -95,7 +95,8 @@ function normalizeLeg(row, sport) {
     logId: row.logId || "",
     loggedAt: row.loggedAt || "",
     sport,
-    dateLabel: row.date || (row.week ? `Wk ${row.week}` : ""),
+    // NFL slates are week keys (year-seasonType-week); older NFL exports carried them in a `week` column
+    dateLabel: (() => { const k = row.date || row.week || ""; const m = /^\d{4}-([123])-(\d+)$/.exec(k); return m ? `${m[1] === "1" ? "Pre " : m[1] === "3" ? "Post " : ""}Wk ${m[2]}` : k; })(),
     game: row.game || "",
     // scheduled first-pitch/kickoff/tip-off timestamp, when the sport app logged one (older
     // board log exports won't have this column — those legs just won't be filterable by

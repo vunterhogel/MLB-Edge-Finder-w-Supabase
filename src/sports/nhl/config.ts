@@ -45,6 +45,9 @@ export const CATEGORY_ORDER = [...SKATER_PROPS, ...GOALIE_PROPS, ...GAME_PROPS];
 export const STAT_ORDER = CATEGORY_ORDER;
 export const TREND_PROPS = ALL_PROPS;
 export const isLineType = (t) => GAME_PROPS.includes(t);
+// Projection-vs-line signal thresholds (core/signals.ts). Empty until there is enough settled board-log
+// data to fit them per market, the way MLB's were; the Board shows the same signal column and filter.
+export const SIGNAL_RULES = {};
 export const BOOKS = [
   { key: "draftkings", label: "DraftKings" }, { key: "fanduel", label: "FanDuel" },
   { key: "betmgm", label: "BetMGM" }, { key: "caesars", label: "Caesars" },

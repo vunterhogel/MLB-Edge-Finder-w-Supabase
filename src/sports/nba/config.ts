@@ -58,6 +58,9 @@ export const GAME_MARKETS = ["h2h", "spreads", "totals"]; // moneyline, spread, 
 export const GAME_PROPS = ["Moneyline", "Spread", "Total"];
 export const CATEGORY_ORDER = [...CORE_PROPS, ...COMBO_PROPS, ...SPECIAL_PROPS, ...GAME_PROPS];
 export const isLineType = (t) => GAME_PROPS.includes(t);
+// Projection-vs-line signal thresholds (core/signals.ts). Empty until there is enough settled board-log
+// data to fit them per market, the way MLB's were; the Board shows the same signal column and filter.
+export const SIGNAL_RULES = {};
 export const isYesNoType = (t) => t === "Double-Double" || t === "Triple-Double";
 export const BOOKS = [
   { key: "draftkings", label: "DraftKings" }, { key: "fanduel", label: "FanDuel" },

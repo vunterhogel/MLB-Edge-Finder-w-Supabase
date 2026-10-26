@@ -1,15 +1,17 @@
 /* MLB sport adapter: everything the shared SportApp shell needs that is genuinely baseball-specific.
    Bodies below are moved verbatim from the original App.tsx (only their location changed), so MLB
    behaves exactly as before. Other sports implement the same shape (see core/sport.ts). */
-import { ALL_PROPS, BOOKS, BOOK_LABELS, CATEGORY_ORDER, DEFAULT_LINE, HITTER_PROPS, LG_KRATE, LG_RPG, ODDS_TESTING_LIMIT, PARKS, PITCHER_PROPS, isLineType, matchesQuery } from "./config";
+import { ALL_PROPS, BOOKS, BOOK_LABELS, CATEGORY_ORDER, DEFAULT_LINE, HITTER_PROPS, LG_KRATE, LG_RPG, ODDS_TESTING_LIMIT, PARKS, PITCHER_PROPS, SIGNAL_RULES, isLineType, matchesQuery } from "./config";
 import { TREND_PROPS, attachPitcherHr9FromStatsApi, buildGameLineEntries, buildTrendCard, emptyStatcast, expectedStartIP, fetchBvP, fetchEventOdds, fetchGameResult, fetchGameStatcast, fetchHands, fetchHitterLog, fetchHitterSeason, fetchHitterSplits, fetchHitterStatcastLeaderboards, fetchLiveBox, fetchOddsEvents, fetchPitcherLog, fetchPitcherSeason, fetchPlayerAnalysisProfile, fetchPlayerGameLogs, fetchPlayerSeasonStatcast, fetchSchedule, fetchTeamRPG, fetchWeather, matchCurrentOdds, matchEvent, oddsDebug, parseEventOdds, parseGameOdds, resolveHitterSeasonStatcast, searchPlayers, statcastCoverageSummary } from "./data";
-import { POSTSEASON, calculateOppPitchingAdjustment, evalBet, gameFractionRemaining, gameProbs, projectProp } from "./engine";
-import { clamp, pct, probToAmerican } from "../../core/math";
+import { MODEL_VERSION, POSTSEASON, calculatePlatoonAdjustment, calculateOppPitchingAdjustment, evalBet, gameFractionRemaining, gameProbs, projectProp } from "./engine";
+import { clamp } from "../../core/math";
 import { normName } from "../../core/odds";
-import { Env, mono } from "../../core/ui";
-import { BoardRow, Chip, LineupCol, MyBetRow, PlayerAnalysisIntro, PlayerProfilePanel, SPCard, STAT_ORDER, ScoreLine, TrendCard, getDeltaSignal } from "./ui";
+import { playerView } from "./view";
 import { actualFor, findPlayerInSlate, gradeBet, gradeLine, profitUnits } from "./settle";
-import * as storage from "./storage";
+import { createStorage } from "../../core/storage";
+
+// mlbef_* keys (unchanged); Home Run defaults to ESPN BET because DraftKings often omits that market
+const storage = createStorage("mlbef", MODEL_VERSION, { "Home Run": "espnbet" });
 
 /* ---- context builders (moved from App) ---- */
 function liveSnap(d, pid) { if (!d.live) return null; return { fractionRemaining: d.live.fractionRemaining, totals: (d.live.totalsById && d.live.totalsById[pid]) || {} }; }
@@ -176,62 +178,82 @@ function draftCtx(d, g, kind, pid) {
 const draftDefaults = (kind) => ({ type: kind === "pitcher" ? "Strikeouts" : "Hits", line: kind === "pitcher" ? "5.5" : "0.5" });
 const propsForKind = (kind) => (kind === "pitcher" ? PITCHER_PROPS : HITTER_PROPS);
 
-/* ---- Slate UI pieces ---- */
-function GameSubtitle({ g }) {
-  return <div className="text-[11px] text-slate-500 truncate">{(g.awaySP && g.awaySP.name) || "TBD"} vs {(g.homeSP && g.homeSP.name) || "TBD"}</div>;
+/* ---- Slate: what the shared game panel shows for a baseball game ---- */
+const game = {
+  subtitle: (g) => `${(g.awaySP && g.awaySP.name) || "TBD"} vs ${(g.homeSP && g.homeSP.name) || "TBD"}`,
+  finalSuffix: (g) => (g.inning && g.inning > 9 ? `/F${g.inning}` : ""),
+  liveLabel: (g) => {
+    const st = (g.inningState || "").toLowerCase();
+    const half = st.startsWith("mid") ? "Mid" : st.startsWith("end") ? "End" : (st.startsWith("top") ? "Top" : "Bot");
+    return `${half} ${g.inning}${g.outs != null ? ` · ${g.outs} out` : ""}`;
+  },
+};
+function hitterRow(g, d, p, i) {
+  const rec = d.hitters && d.hitters[p.id];
+  const stat = rec && rec.season, l15 = rec && rec.l15, bvp = rec && rec.bvp;
+  const sProxy = stat && stat.ab ? (stat.h / stat.ab) + (stat.tb / stat.ab) : null;
+  const oppLast = rec && rec.oppName ? rec.oppName.split(" ").slice(-1)[0] : null;
+  const badges = [];
+  if (rec && rec.bats && rec.oppThrows) {
+    const f = calculatePlatoonAdjustment({ kind: "hitter", bats: rec.bats, oppThrows: rec.oppThrows, splits: rec.splits, season: rec.season });
+    badges.push({ text: `${rec.bats}v${rec.oppThrows} ×${f.toFixed(2)}`, tone: f < 0.99 ? "bad" : f > 1.01 ? "good" : "muted", title: `bats ${rec.bats} vs ${rec.oppThrows}HP` });
+  }
+  return {
+    id: p.id, idx: i + 1, name: rec ? rec.name : "—", badges,
+    stat: stat ? `${stat.avg != null ? stat.avg : "—"}/${stat.ops != null ? stat.ops : "—"}` : "—",
+    hot: l15 && sProxy != null ? l15.ops - sProxy : null,
+    detail: [
+      `season: ${stat ? `${stat.h}-${stat.ab}, ${stat.hr}HR, ${stat.slg != null ? stat.slg : "—"}SLG` : "n/a"}`,
+      ...(l15 ? [`L15: ${l15.h}-${l15.ab}, ${l15.hr}HR, ${l15.avg.toFixed(3)}`] : []),
+      ...(oppLast ? [`vs ${oppLast}: ${bvp ? `${bvp.h}-${bvp.ab}${bvp.hr ? `, ${bvp.hr}HR` : ""}` : (bvp === null ? "no history" : "…")}`] : []),
+    ],
+    player: p, draft: { kind: "hitter", id: p.id, name: rec && rec.name },
+  };
 }
-function SlateDetail({ g, d, draftFromGame, goToAnalysis }) {
-  return (
-    <>
-      <div className="flex flex-wrap gap-2 mt-3 text-[11px]" style={mono}>
-        <Env label="PARK RF" v={d.park.rf.toFixed(2)} hot={d.park.rf >= 1.05} cold={d.park.rf <= 0.96} />
-        <Env label="ELEV" v={`${d.park.elev}ft`} hot={d.park.elev >= 3000} />
-        {d.park.dome && <Env label="DOME" v="yes" />}
-        {d.weather && !d.park.dome && <Env label="TEMP" v={`${d.weather.temp}°`} hot={d.weather.temp >= 85} cold={d.weather.temp <= 60} />}
-        {d.weather && !d.park.dome && <Env label="WIND" v={`${d.weather.wind}mph`} hot={d.weather.wind >= 12} />}
-        {d.weather && !d.park.dome && <Env label="RAIN" v={`${d.weather.pop}%`} hot={d.weather.pop >= 50} />}
-      </div>
-      <div className="mt-3 bg-slate-950/60 border border-slate-800 rounded-lg p-3">
-        <div className="text-[10px] text-slate-500 font-bold tracking-wide mb-2">MODEL GAME LINE</div>
-        {(() => { const gp = gameProbs(d.lambdaH, d.lambdaA); return (
-          <div className="flex flex-wrap items-center gap-x-6 gap-y-1 text-[13px]" style={mono}>
-            <span className="text-slate-300">proj score <b className="text-sky-300">{g.away} {d.lambdaA.toFixed(1)} – {d.lambdaH.toFixed(1)} {g.home}</b></span>
-            <span>{g.home} <b className="text-emerald-400">{pct(gp.home)}</b> <span className="text-slate-600">({probToAmerican(gp.home)})</span></span>
-            <span>{g.away} <b className="text-emerald-400">{pct(gp.away)}</b> <span className="text-slate-600">({probToAmerican(gp.away)})</span></span>
-            <span>total <b className="text-sky-300">{gp.totalLambda.toFixed(1)}</b></span>
-          </div>); })()}
-        <div className="text-[10px] text-slate-600 mt-1.5">model line from team run env × park (read-only) — compare to market for game edges once moneyline odds are wired in.</div>
-      </div>
-      <div className="grid sm:grid-cols-2 gap-3 mt-3">
-        <LineupCol title={`${g.away} (away)`} g={g} lineup={g.awayLineup} d={d} onAdd={(pid) => draftFromGame(g, "hitter", pid, d.hitters[pid] && d.hitters[pid].name)} onPlayerClick={goToAnalysis} />
-        <LineupCol title={`${g.home} (home)`} g={g} lineup={g.homeLineup} d={d} onAdd={(pid) => draftFromGame(g, "hitter", pid, d.hitters[pid] && d.hitters[pid].name)} onPlayerClick={goToAnalysis} />
-      </div>
-      <div className="grid sm:grid-cols-2 gap-3 mt-3">
-        <SPCard label={`${g.away} SP`} sp={g.awaySP} st={g.awaySP && d.spStats[g.awaySP.id]} onAdd={() => g.awaySP && draftFromGame(g, "pitcher", g.awaySP.id, g.awaySP.name)} onPlayerClick={g.awaySP ? () => goToAnalysis(g.awaySP) : null} />
-        <SPCard label={`${g.home} SP`} sp={g.homeSP} st={g.homeSP && d.spStats[g.homeSP.id]} onAdd={() => g.homeSP && draftFromGame(g, "pitcher", g.homeSP.id, g.homeSP.name)} onPlayerClick={g.homeSP ? () => goToAnalysis(g.homeSP) : null} />
-      </div>
-    </>
-  );
+function starterRow(sp, st) {
+  return {
+    id: sp.id, name: sp.name, nameBadge: st && st.role === "swing" ? { text: "SWING", tone: "warn" } : null,
+    sub: st ? `${st.era} ERA · ${st.k9.toFixed(1)} K/9 · ~${st.expIp.toFixed(1)} IP${st.recentLog && st.recentLog.games >= 3 ? ` (L${st.recentLog.games} avg ${st.recentLog.avgIp.toFixed(1)})` : ""}` : "—",
+    player: sp, draft: { kind: "pitcher", id: sp.id, name: sp.name },
+  };
+}
+function slateView(g, d) {
+  const gp = gameProbs(d.lambdaH, d.lambdaA);
+  const wx = d.weather && !d.park.dome;
+  const sp = (s, label) => ({ title: `${label} SP`, empty: "TBD", rows: s ? [starterRow(s, d.spStats[s.id])] : [] });
+  return {
+    env: [
+      { label: "PARK RF", v: d.park.rf.toFixed(2), hot: d.park.rf >= 1.05, cold: d.park.rf <= 0.96 },
+      { label: "ELEV", v: `${d.park.elev}ft`, hot: d.park.elev >= 3000 },
+      ...(d.park.dome ? [{ label: "DOME", v: "yes" }] : []),
+      ...(wx ? [{ label: "TEMP", v: `${d.weather.temp}°`, hot: d.weather.temp >= 85, cold: d.weather.temp <= 60 }, { label: "WIND", v: `${d.weather.wind}mph`, hot: d.weather.wind >= 12 }, { label: "RAIN", v: `${d.weather.pop}%`, hot: d.weather.pop >= 50 }] : []),
+    ],
+    gameLine: { lambdaA: d.lambdaA, lambdaH: d.lambdaH, home: gp.home, away: gp.away, total: gp.totalLambda, note: "team run environment × park. Compare to the market for game-line edges." },
+    sections: [
+      [{ title: `${g.away} (away)`, legend: "AVG/OPS", empty: "— not posted —", rows: (g.awayLineup || []).map((p, i) => hitterRow(g, d, p, i)) },
+       { title: `${g.home} (home)`, legend: "AVG/OPS", empty: "— not posted —", rows: (g.homeLineup || []).map((p, i) => hitterRow(g, d, p, i)) }],
+      [sp(g.awaySP, g.away), sp(g.homeSP, g.home)],
+    ],
+  };
 }
 
 const MLB = {
   id: "mlb",
   meta: {
-    title: "MLB", emoji: "⚾", tagline: "live odds · de-vigged edge · Monte-Carlo props", league: "MLB",
+    title: "MLB", emoji: "⚾", league: "MLB",
     statsSource: "MLB Stats API", searchPlaceholder: "Mike Trout",
-    analysisHint: "MLB-wide profile lookup. If the player is on the selected slate, this tab adds matchup context, model projections, and any pulled",
     csvPrefix: "mlb-edge-finder", boardLogCsvPrefix: "mlb-board-log", backupApp: "mlb-edge-finder",
     overrideTitle: "Per-market book overrides — e.g. pull Home Run odds from a different book than the rest of the board",
     diagnosticsType: "Home Run", diagnosticsMarketKey: "batter_home_runs",
     draftKindLabel: (kind) => (kind === "pitcher" ? "PITCHER" : "HITTER"),
     searchResultLine: (p) => `${p.teamAbbr || p.team || "FA"} · ${p.position || "—"} · bats ${p.bats || "—"} / throws ${p.throws || "—"}`,
   },
-  config: { ALL_PROPS, BOOKS, BOOK_LABELS, CATEGORY_ORDER, DEFAULT_LINE, ODDS_TESTING_LIMIT, isLineType, matchesQuery, STAT_ORDER, TREND_PROPS },
+  config: { ALL_PROPS, BOOKS, BOOK_LABELS, CATEGORY_ORDER, DEFAULT_LINE, ODDS_TESTING_LIMIT, isLineType, matchesQuery, STAT_ORDER: CATEGORY_ORDER, TREND_PROPS, SIGNAL_RULES },
   storage,
-  api: { fetchSchedule, fetchOddsEvents, fetchEventOdds, matchEvent, oddsDebug, parseEventOdds, parseGameOdds, matchCurrentOdds, buildGameLineEntries, fetchGameResult, searchPlayers, fetchPlayerAnalysisProfile, findPlayerInSlate, buildTrendCard, getDeltaSignal },
+  api: { fetchSchedule, fetchOddsEvents, fetchEventOdds, matchEvent, oddsDebug, parseEventOdds, parseGameOdds, matchCurrentOdds, buildGameLineEntries, fetchGameResult, searchPlayers, fetchPlayerAnalysisProfile, findPlayerInSlate, buildTrendCard },
   model: { projectProp },
   loadGameDetail, buildPropEntries, analysisCtx, trendSubjects, propsForKind,
   gradeLineResult, gradeTrackedProp, gradeLogProp, draftCtx, draftDefaults,
-  ui: { Chip, ScoreLine, GameSubtitle, SlateDetail, BoardRow, MyBetRow, TrendCard, PlayerAnalysisIntro, PlayerProfilePanel },
+  game, slateView, playerView,
 };
 export default MLB;

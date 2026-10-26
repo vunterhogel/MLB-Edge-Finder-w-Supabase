@@ -14,6 +14,8 @@ export function probabilityOver(family, line, side, seed, params) {
 // per-market calibration: DAY-1 PRIOR. No settled-bet history for basketball yet, so every
 // category starts at a conservative, uniform "trust the market a lot" weight — same posture
 // NFL launched with. Retune per-category from the Stats tab; don't hand-tune from vibes.
+export const MODEL_VERSION = "nba-v2-2026-10-19";   // bump on every model change (part of every board-log id)
+
 export const CALIB_KEEP = {
   "Points": 0.45, "Rebounds": 0.45, "Assists": 0.45, "Three-Pointers Made": 0.40, "Steals": 0.35, "Blocks": 0.35, "Turnovers": 0.35,
   "Pts+Reb+Ast": 0.45, "Pts+Reb": 0.45, "Pts+Ast": 0.45, "Reb+Ast": 0.40, "Blocks+Steals": 0.35,

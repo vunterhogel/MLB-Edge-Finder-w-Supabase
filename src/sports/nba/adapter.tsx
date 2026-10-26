@@ -1,16 +1,16 @@
 /* NBA sport adapter for the shared SportApp shell (same shape as the MLB and NHL adapters).
    The projection model is the existing NBA engine, moved unchanged except for the fixes noted in
    engine.ts / data.ts (3PM parsing, preseason rows, season-boundary logs, OT ties, DNP settling). */
-import { ALL_PLAYER_PROPS, BOOKS, BOOK_LABELS, CATEGORY_ORDER, DEFAULT_LINE, HOME_COURT_MULT, LG_PACE, LG_PPG, ODDS_SPORT, ODDS_TESTING_LIMIT, isLineType, isYesNoType, matchesQuery } from "./config";
-import { actualFor, buildGameLineEntries, buildPlayerLog, buildTrendCard, computeRest, espnIdForTeamName, fetchDepthChart, fetchEventOdds, fetchGameSummary, fetchOddsEvents, fetchRoster, fetchSchedule, fetchSeasonRows, fetchStandings, fetchTeamSchedule, fetchTeamStats, matchCurrentOdds, matchEvent, nbaSeasonFor, parseEventOdds, parseGameOdds, playerTeam, searchPlayers as espnSearch, gradeLine } from "./data";
-import { calculateInjuryAvailability, evalBet, posGroup, projectPlayer } from "./engine";
+import { ALL_PLAYER_PROPS, BOOKS, BOOK_LABELS, CATEGORY_ORDER, DEFAULT_LINE, HOME_COURT_MULT, LG_PACE, LG_PPG, ODDS_SPORT, ODDS_TESTING_LIMIT, SIGNAL_RULES, isLineType, isYesNoType, matchesQuery } from "./config";
+import { actualFor, buildGameLineEntries, buildPlayerLog, buildTrendCard, computeRest, espnIdForTeamName, fetchDepthChart, fetchEventOdds, fetchGameSummary, fetchOddsEvents, fetchRoster, fetchSchedule, fetchSeasonRows, fetchStandings, fetchTeamSchedule, fetchTeamStats, matchCurrentOdds, matchEvent, nbaSeasonFor, parseEventOdds, parseGameOdds, playerTeam, searchPlayers as espnSearch, gradeLine, trendValueForGame } from "./data";
+import { MODEL_VERSION, calculateInjuryAvailability, evalBet, gameProbs, posGroup, projectPlayer } from "./engine";
 import { clamp, gradeBet } from "../../core/math";
 import { jget, espnWeb } from "../../core/espn";
 import { normName } from "../../core/odds";
 import { createStorage } from "../../core/storage";
-import { BoardRow, Chip, GameSubtitle, MyBetRow, PlayerAnalysisIntro, PlayerProfilePanel, ScoreLine, SlateDetail, TrendCard, getDeltaSignal } from "./ui";
+import { logSections } from "../../core/playerLog";
+import { injuryBadge } from "../../core/slate";
 
-export const MODEL_VERSION = "nba-v2-2026-10-19";
 // same keys as the old NBA page (nbaef_*), so existing bets and board log carry over
 const storage = createStorage("nbaef", MODEL_VERSION, {});
 const STAT_ORDER = CATEGORY_ORDER;
@@ -162,6 +162,88 @@ function analysisCtx(d, spot, profile) {
   return playerCtx(d, side, p, d.logs[pid] || profile.log);
 }
 
+
+/* ---- Slate: what the shared game panel shows for a basketball game ---- */
+const game = {
+  subtitle: (g) => g.venue || "TBD",
+  finalSuffix: (g) => (g.period && g.period > 4 ? `/${g.period === 5 ? "OT" : `${g.period - 4}OT`}` : ""),
+  liveLabel: (g) => `${g.period > 4 ? "OT" : `Q${g.period}`} ${g.clock || ""}`,
+};
+const perG = (log, k) => (log && log.season && log.season.g ? log.season[k] / log.season.g : null);
+const f1 = (x) => (x == null || isNaN(x) ? "—" : Number(x).toFixed(1));
+function nbaRow(d, p, i) {
+  const lg = d.logs[p.id];
+  return {
+    id: p.id, idx: i + 1, tag: `${p.pos}${p.isStarter ? "*" : ""}`,
+    tagWarn: p.depthConfirmed === false ? "No confirmed depth chart for this team, so the order is the roster listing, not verified starters" : null,
+    name: p.name, badges: [injuryBadge(p.injuryStatus)].filter(Boolean),
+    stat: `${f1(perG(lg, "min"))} · ${f1(perG(lg, "pts"))} · ${f1(perG(lg, "reb"))} · ${f1(perG(lg, "ast"))} · ${f1(perG(lg, "fg3m"))}`,
+    player: { id: p.id, name: p.name }, draft: { kind: "player", id: p.id, name: p.name },
+  };
+}
+function teamColumn(title, team, d) {
+  const featuredIds = new Set((team.featured || []).map((p) => p.id));
+  const rest = (team.roster || []).filter((p) => !featuredIds.has(p.id)).sort((a, b) => (perG(d.logs[b.id], "min") || 0) - (perG(d.logs[a.id], "min") || 0));
+  const n = (team.featured || []).length;
+  return { title, legend: "MIN · PTS · REB · AST · 3PM", empty: "— roster unavailable —", rows: (team.featured || []).map((p, i) => nbaRow(d, p, i)), moreRows: rest.map((p, i) => nbaRow(d, p, n + i)) };
+}
+function slateView(g, d) {
+  const gp = gameProbs(d.lambdaH, d.lambdaA);
+  const rest = (r) => (r.backToBack ? "B2B" : `${r.daysRest}d`);
+  const ppg = (s) => (s && s.ppgFor ? `${f1(s.ppgFor)}/${f1(s.ppgAgainst)}` : null);
+  return {
+    env: [
+      { label: `${g.away} REST`, v: rest(d.away.rest), hot: d.away.rest.backToBack },
+      { label: `${g.home} REST`, v: rest(d.home.rest), hot: d.home.rest.backToBack },
+      ...(ppg(d.away.standings) ? [{ label: `${g.away} PPG`, v: ppg(d.away.standings) }] : []),
+      ...(ppg(d.home.standings) ? [{ label: `${g.home} PPG`, v: ppg(d.home.standings) }] : []),
+    ],
+    gameLine: { lambdaA: d.lambdaA, lambdaH: d.lambdaH, home: gp.home, away: gp.away, total: gp.totalLambda, note: "team scoring environment (points for / against per game, shrunk to league) × home court. Win % splits regulation ties evenly for OT." },
+    sections: [[teamColumn(`${g.away} (away)`, d.away, d), teamColumn(`${g.home} (home)`, d.home, d)]],
+  };
+}
+
+
+/* ---- Player Analysis data (rendered by the shared core/analysis.tsx) ---- */
+const NBA_ABBR = { "Points": "PTS", "Rebounds": "REB", "Assists": "AST", "Three-Pointers Made": "3PM", "Pts+Reb+Ast": "PRA", "Steals": "STL", "Blocks": "BLK", "Turnovers": "TOV" };
+const NBA_FORM_TYPES = ["Points", "Rebounds", "Assists", "Three-Pointers Made", "Pts+Reb+Ast"];
+function playerView({ profile, spot, detail }) {
+  const p = profile.player;
+  const log = profile.log, s = log.season;
+  const pg = (k) => (s && s.g ? (s[k] / s.g).toFixed(1) : "—");
+  const ready = spot && detail && detail.ready;
+  const ctx = ready ? analysisCtx(detail, spot, profile) : null;
+  const roster = ready ? rosterEntry(detail, String(p.id)) : null;
+  const team = spot ? (spot.side === "home" ? detail && detail.home : detail && detail.away) : null;
+  const rows = [...(profile.logs.cur || []), ...(profile.logs.prior || [])].filter((r) => r.min > 0);
+  const curCount = (profile.logs.cur || []).filter((r) => r.min > 0).length;
+  return {
+    headshot: `https://a.espncdn.com/i/headshots/nba/players/full/${p.id}.png`,
+    subtitle: `${p.teamAbbr || "FA"} · ${p.pos || "—"}${p.jersey ? ` · #${p.jersey}` : ""} · ${log.curGames} gm this season + ${log.priorGames} last season in the model base`,
+    metrics: [["PTS/G", pg("pts")], ["REB/G", pg("reb")], ["AST/G", pg("ast")], ["MIN/G", pg("min")]],
+    cards: [
+      !spot ? { title: "SLATE MATCHUP", empty: "Not found on the selected date." } : {
+        title: "SLATE MATCHUP", headline: { text: `${spot.game.away} @ ${spot.game.home}` },
+        note: `${spot.side === "home" ? spot.game.home : spot.game.away} · vs ${spot.side === "home" ? spot.game.away : spot.game.home}`,
+        lines: ready ? [
+          `model score ${spot.game.away} ${detail.lambdaA.toFixed(1)} – ${detail.lambdaH.toFixed(1)} ${spot.game.home}`,
+          `rest ${team.rest.backToBack ? "back-to-back" : `${team.rest.daysRest}d`}`,
+          roster && roster.injuryStatus ? { text: `status ${roster.injuryStatus.replace(/_/g, " ")}`, tone: "warn" } : { text: "no injury designation", tone: "muted" },
+        ] : [{ text: "loading detail…", tone: "muted" }],
+      },
+      { title: "SEASON BASELINE", empty: s && s.g ? null : "No games in the model base yet.", grid: [["G", s.g ? Math.round(s.g) : 0], ["MIN", pg("min")], ["PTS", pg("pts"), "sky"], ["REB", pg("reb"), "sky"], ["AST", pg("ast"), "sky"], ["3PM", pg("fg3m"), "sky"], ["STL", pg("stl")], ["BLK", pg("blk")], ["TOV", pg("tov")], ["FGM", pg("fgm")]] },
+      !ctx ? { title: "MODEL CONTEXT", empty: spot ? "loading matchup context…" : "Available when the player is on the selected slate." } : {
+        title: "MODEL CONTEXT", note: "inputs the projection uses for this game",
+        grid: [["implied pts", ctx.impliedTeamPts != null ? ctx.impliedTeamPts.toFixed(1) : "—", "sky"], ["proj spread", ctx.projSpreadAbs != null ? ctx.projSpreadAbs.toFixed(1) : "—"],
+          ["starter", ctx.isStarter ? "yes" : "no"], ["depth", ctx.depthRank && ctx.depthRank < 90 ? `#${ctx.depthRank}` : "—"],
+          ["days rest", ctx.daysRest ?? "—"], ["B2B", ctx.backToBack ? "yes" : "no", ctx.backToBack ? "warn" : null],
+          ["usage freed", ctx.missingUsageShare ? `${Math.round(ctx.missingUsageShare * 100)}%` : "0%"], ["L10 games", ctx.recent && ctx.recent.games != null ? ctx.recent.games : "—"]],
+      },
+    ],
+    ...logSections({ rows, curCount, types: NBA_FORM_TYPES, valueFor: trendValueForGame, abbr: (t) => NBA_ABBR[t] || t, defaultLines: DEFAULT_LINE, title: "Scoring Form" }),
+  };
+}
+
 /* settlement */
 function gradeLineResult(type, side, line, res) { return gradeLine(type, side, line, res.homeScore, res.awayScore); }
 function gradeProp(b, res, dnpActual) {
@@ -181,16 +263,15 @@ function draftCtx(d, g, kind, pid) {
 const NBA = {
   id: "nba",
   meta: {
-    title: "NBA", emoji: "🏀", tagline: "live odds · de-vigged edge · minutes × per-36 props", league: "NBA",
+    title: "NBA", emoji: "🏀", league: "NBA",
     statsSource: "ESPN", searchPlaceholder: "Jayson Tatum",
-    analysisHint: "NBA-wide profile lookup. If the player's team is on the selected slate, this tab adds game context, model projections, and any pulled",
     csvPrefix: "nba-edge-finder", boardLogCsvPrefix: "nba-board-log", backupApp: "nba-edge-finder",
     overrideTitle: "Per-market book overrides: pull one market from a different book when your main book doesn't carry it",
     diagnosticsType: "Double-Double", diagnosticsMarketKey: "player_double_double",
     draftKindLabel: () => "PLAYER",
     searchResultLine: (p) => `${p.teamName || "FA"}`,
   },
-  config: { ALL_PROPS: ALL_PLAYER_PROPS, BOOKS, BOOK_LABELS, CATEGORY_ORDER, DEFAULT_LINE, ODDS_TESTING_LIMIT, isLineType, matchesQuery, STAT_ORDER, TREND_PROPS },
+  config: { ALL_PROPS: ALL_PLAYER_PROPS, BOOKS, BOOK_LABELS, CATEGORY_ORDER, DEFAULT_LINE, ODDS_TESTING_LIMIT, isLineType, isYesNoType, matchesQuery, STAT_ORDER, TREND_PROPS, SIGNAL_RULES },
   storage,
   api: {
     fetchSchedule, fetchOddsEvents: () => fetchOddsEvents(ODDS_SPORT), fetchEventOdds: (id, book) => fetchEventOdds(ODDS_SPORT, id, book), matchEvent,
@@ -203,7 +284,6 @@ const NBA = {
     searchPlayers: async (q) => (await espnSearch(q)).map((p) => ({ ...p, teamId: p.teamId || espnIdForTeamName(p.teamName) })),
     fetchPlayerAnalysisProfile, findPlayerInSlate,
     buildTrendCard: (p, pid, type, games, g, isHome, entries, n) => buildTrendCard({ ...p, id: pid }, type, { games }, g, isHome, entries, n),
-    getDeltaSignal,
   },
   model: { projectProp: projectPlayer },
   loadGameDetail, buildPropEntries, analysisCtx, trendSubjects,
@@ -213,6 +293,6 @@ const NBA = {
   gradeLogProp: (e, res) => gradeProp(e, res, null),
   draftCtx,
   draftDefaults: () => ({ type: "Points", line: DEFAULT_LINE.Points || "19.5" }),
-  ui: { Chip, ScoreLine, GameSubtitle, SlateDetail, BoardRow, MyBetRow, TrendCard, PlayerAnalysisIntro, PlayerProfilePanel },
+  game, slateView, playerView,
 };
 export default NBA;

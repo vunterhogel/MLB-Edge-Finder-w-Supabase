@@ -1,11 +1,11 @@
 /* NHL sport adapter for the shared SportApp shell (same shape as sports/mlb/adapter.tsx). */
-import { ALL_PROPS, BOOKS, BOOK_LABELS, CATEGORY_ORDER, DEFAULT_LINE, GOALIE_PROPS, ODDS_TESTING_LIMIT, SKATER_PROPS, STAT_ORDER, TREND_PROPS, isLineType, matchesQuery } from "./config";
-import { buildGameLineEntries, buildTrendCard, espnSeasonFor, fetchEventOdds, fetchGameResult, fetchOddsEvents, fetchPlayerAnalysisProfile, fetchPlayerLogs, fetchRoster, fetchSchedule, fetchTeamStats, findPlayerInSlate, matchCurrentOdds, matchEvent, oddsDebug, parseEventOdds, parseGameOdds, playerTeam, searchPlayers, statFor } from "./data";
-import { MODEL_VERSION, evalBet, fractionRemaining, gameLambdas, goalieRates, projectProp, skaterRates, teamRates } from "./engine";
-import { gradeBet } from "../../core/math";
+import { ALL_PROPS, BOOKS, BOOK_LABELS, CATEGORY_ORDER, DEFAULT_LINE, GOALIE_PROPS, ODDS_TESTING_LIMIT, SKATER_PROPS, STAT_ORDER, TREND_PROPS, SIGNAL_RULES, isLineType, matchesQuery } from "./config";
+import { buildGameLineEntries, buildTrendCard, espnSeasonFor, fetchEventOdds, fetchGameResult, fetchOddsEvents, fetchPlayerAnalysisProfile, fetchPlayerLogs, fetchRoster, fetchSchedule, fetchTeamStats, findPlayerInSlate, matchCurrentOdds, matchEvent, oddsDebug, parseEventOdds, parseGameOdds, playerTeam, searchPlayers, statFor, trendValueForGame } from "./data";
+import { MODEL_VERSION, evalBet, fractionRemaining, gameProbs, gameLambdas, goalieRates, projectProp, skaterRates, teamRates } from "./engine";
+import { gradeBet, pct } from "../../core/math";
 import { normName } from "../../core/odds";
 import { createStorage } from "../../core/storage";
-import { BoardRow, Chip, GameSubtitle, MyBetRow, PlayerAnalysisIntro, PlayerProfilePanel, ScoreLine, SlateDetail, TrendCard, getDeltaSignal } from "./ui";
+import { logSections } from "../../core/playerLog";
 
 const storage = createStorage("nhlef", MODEL_VERSION, {});
 
@@ -95,6 +95,113 @@ function trendSubjects(g, d) {
   return out;
 }
 
+
+/* ---- Slate: what the shared game panel shows for a hockey game ---- */
+const periodLabel = (p) => (p == null ? "" : p <= 3 ? `P${p}` : p === 4 ? "OT" : "SO");
+const game = {
+  subtitle: (g) => `G: ${g.awayGoalie ? g.awayGoalie.name : "TBD"} vs ${g.homeGoalie ? g.homeGoalie.name : "TBD"}`,
+  finalSuffix: (g) => (g.period && g.period > 3 ? `/${periodLabel(g.period)}` : ""),
+  liveLabel: (g) => `${periodLabel(g.period)} ${g.clock || ""}`,
+};
+const f1 = (x) => (x == null || isNaN(x) ? "—" : Number(x).toFixed(1));
+const f2 = (x) => (x == null || isNaN(x) ? "—" : Number(x).toFixed(2));
+const svFmt = (x) => (x == null ? "—" : x.toFixed(3).replace(/^0/, ""));
+function skaterRow(p, i) {
+  return {
+    id: p.id, idx: i + 1, tag: p.pos, name: p.name,
+    badges: p.injury ? [{ text: p.injury, tone: "bad" }] : [],
+    stat: `${p.gp} · ${p.season.g}-${p.season.a}-${p.season.g + p.season.a} · ${f1(p.rates.sog)} · ${f1(p.rates.recentToi || p.rates.toi)}`,
+    player: { id: p.id, name: p.name }, draft: { kind: "skater", id: p.id, name: p.name },
+  };
+}
+function skaterColumn(title, list) {
+  // regulars (anyone with games this season or last) first, by ice time; the rest behind "show all"
+  const active = list.filter((p) => p.gp > 0 || p.rates.priorGames > 0).slice(0, 20);
+  const activeIds = new Set(active.map((p) => p.id));
+  const rest = list.filter((p) => !activeIds.has(p.id));
+  return { title, legend: "GP · G-A-P · SOG/g · TOI", empty: "— roster unavailable —", rows: active.map((p, i) => skaterRow(p, i)), moreRows: rest.map((p, i) => skaterRow(p, active.length + i)) };
+}
+function goalieColumn(title, goalies, expShots) {
+  const starter = goalies.find((x) => x.starter) || null;
+  const others = goalies.filter((x) => x !== starter);
+  if (!starter) return { title, empty: `starter not posted${others.length ? ` · ${others.map((o) => o.name).join(", ")}` : ""}`, rows: [] };
+  return {
+    title,
+    rows: [{
+      id: starter.id, name: starter.name, nameBadge: { text: starter.starterStatus || "PROBABLE", tone: "good" },
+      sub: `${svFmt(starter.rates.rawSvPct)} SV% (${starter.rates.starts} GS) · model ${svFmt(starter.rates.svPct)} · ${f2(starter.rates.gaa)} GAA · ~${f1(expShots * starter.rates.svPct * 0.97)} saves${others.length ? ` · backup: ${others.map((o) => o.name).join(", ")}` : ""}`,
+      player: { id: starter.id, name: starter.name }, draft: { kind: "goalie", id: starter.id, name: starter.name },
+    }],
+  };
+}
+function slateView(g, d) {
+  const gp = gameProbs(d.lambdaH, d.lambdaA);
+  // forwards first, then defense, each by ice time
+  const side = (s) => Object.values(d.skaters).filter((p) => p.side === s).sort((a, b) => (a.group === "D" ? 1 : 0) - (b.group === "D" ? 1 : 0) || (b.rates.recentToi || b.rates.toi || 0) - (a.rates.recentToi || a.rates.toi || 0));
+  const gl = (s) => Object.values(d.goalies).filter((p) => p.side === s).sort((a, b) => Number(b.starter) - Number(a.starter) || b.rates.starts - a.rates.starts);
+  const T = d.teams;
+  return {
+    env: [
+      { label: `${g.away} GF/G`, v: f2(T.away.gf), hot: T.away.gf >= 3.4, cold: T.away.gf <= 2.7 },
+      { label: `${g.away} GA/G`, v: f2(T.away.ga), hot: T.away.ga >= 3.4, cold: T.away.ga <= 2.7 },
+      { label: `${g.home} GF/G`, v: f2(T.home.gf), hot: T.home.gf >= 3.4, cold: T.home.gf <= 2.7 },
+      { label: `${g.home} GA/G`, v: f2(T.home.ga), hot: T.home.ga >= 3.4, cold: T.home.ga <= 2.7 },
+      { label: "EXP SOG", v: `${f1(d.shotsA)}–${f1(d.shotsH)}`, hot: d.shotsA + d.shotsH >= 62, cold: d.shotsA + d.shotsH <= 52 },
+    ],
+    gameLine: { lambdaA: d.lambdaA, lambdaH: d.lambdaH, home: gp.home, away: gp.away, total: gp.totalLambda, extra: [["OT", pct(gp.regTie)]], note: "team goal rates (shrunk to league) × opponent defense and starting goalie × home ice. Win % includes OT/shootout." },
+    sections: [
+      [skaterColumn(`${g.away} (away)`, side("away")), skaterColumn(`${g.home} (home)`, side("home"))],
+      [goalieColumn(`${g.away} G`, gl("away"), d.shotsH), goalieColumn(`${g.home} G`, gl("home"), d.shotsA)],
+    ],
+  };
+}
+
+
+/* ---- Player Analysis data (rendered by the shared core/analysis.tsx) ---- */
+function windowAgg(rows, n, goalie) {
+  const r = rows.slice(0, n);
+  const sum = (f) => r.reduce((a, x) => a + (f(x.s) || 0), 0);
+  if (goalie) { const sa = sum((s) => s.shotsAgainst), sv = sum((s) => s.saves); return { n: r.length, starts: sum((s) => s.gameStarted), sv: sa ? sv / sa : null, saves: r.length ? sv / r.length : null, gaa: r.length ? sum((s) => s.goalsAgainst) / r.length : null }; }
+  return { n: r.length, g: sum((s) => s.goals), a: sum((s) => s.assists), sog: r.length ? sum((s) => s.shotsTotal) / r.length : null, ppp: sum((s) => (s.powerPlayGoals || 0) + (s.powerPlayAssists || 0)), toi: r.length ? sum((s) => s.timeOnIcePerGame) / r.length : null };
+}
+const NHL_ABBR = { "Shots on Goal": "SOG", "Goals": "G", "Assists": "A", "Points": "P", "Power Play Points": "PPP", "Saves": "SV" };
+function playerView({ profile, spot, detail }) {
+  const p = profile.player;
+  const goalie = profile.kind === "goalie";
+  const cur = (profile.logs.cur || []).filter((r) => !r.postseason);
+  const prior = (profile.logs.prior || []).filter((r) => !r.postseason);
+  const season = windowAgg(cur, 999, goalie), last = windowAgg(prior, 999, goalie);
+  const ready = spot && detail && detail.ready;
+  const ctx = ready ? analysisCtx(detail, spot, profile) : null;
+  const sideTeams = ready ? (spot.side === "home" ? { us: detail.teams.home, them: detail.teams.away } : { us: detail.teams.away, them: detail.teams.home }) : null;
+  return {
+    headshot: `https://a.espncdn.com/i/headshots/nhl/players/full/${p.id}.png`,
+    subtitle: [p.teamAbbr || "FA", p.pos, p.jersey ? `#${p.jersey}` : "", p.age ? `age ${p.age}` : ""].filter(Boolean).join(" · "),
+    metrics: goalie
+      ? [["GP / GS", `${season.n} / ${season.starts}`], ["SV%", svFmt(season.sv), season.sv != null ? season.sv >= 0.905 : undefined], ["GAA", f2(season.gaa)], ["Saves / GP", f1(season.saves)]]
+      : [["GP", season.n], ["G-A-P", `${season.g}-${season.a}-${season.g + season.a}`], ["SOG / GP", f2(season.sog)], ["TOI", f1(season.toi)]],
+    cards: [
+      !spot ? { title: "SLATE MATCHUP", empty: "Not found on the selected date." } : {
+        title: "SLATE MATCHUP", headline: { text: `${spot.game.away} @ ${spot.game.home}` },
+        note: `${spot.side === "home" ? spot.game.home : spot.game.away} ${goalie ? "goalie" : "skater"} · vs ${spot.side === "home" ? spot.game.away : spot.game.home}`,
+        lines: ready ? [
+          `model score ${spot.game.away} ${detail.lambdaA.toFixed(1)} – ${detail.lambdaH.toFixed(1)} ${spot.game.home}`,
+          `exp shots ${spot.game.away} ${f1(detail.shotsA)} – ${f1(detail.shotsH)} ${spot.game.home}`,
+          `opp GF/G ${f2(sideTeams.them.gf)} · GA/G ${f2(sideTeams.them.ga)}`,
+        ] : [{ text: "loading detail…", tone: "muted" }],
+      },
+      goalie
+        ? { title: "SEASON BASELINE", grid: [["GP", season.n], ["GS", season.starts], ["SV%", svFmt(season.sv), "sky"], ["GAA", f2(season.gaa), "sky"], ["SV/G", f1(season.saves)], ["last season GP", last.n], ["last SV%", svFmt(last.sv)], ["last GAA", f2(last.gaa)]] }
+        : { title: "SEASON BASELINE", grid: [["GP", season.n], ["G", season.g, "sky"], ["A", season.a, "sky"], ["P/G", season.n ? f2((season.g + season.a) / season.n) : "—", "sky"], ["SOG/G", f2(season.sog)], ["PPP", season.ppp], ["TOI", f1(season.toi)], ["last season P/G", last.n ? f2((last.g + last.a) / last.n) : "—"]] },
+      !ctx ? { title: "MODEL CONTEXT", empty: spot ? "loading matchup context…" : "Available when the player is on the selected slate." }
+        : goalie
+          ? { title: "MODEL CONTEXT", note: "inputs the projection uses for this game", grid: [["starter", ctx.starter ? "yes" : "no", ctx.starter ? "good" : "warn"], ["exp SA", f1(ctx.expShotsAgainst), "sky"], ["model SV%", svFmt(ctx.rates && ctx.rates.svPct)], ["raw SV%", svFmt(ctx.rates && ctx.rates.rawSvPct)], ["starts", ctx.rates ? ctx.rates.starts : "—"], ["eff starts", ctx.rates && ctx.rates.effStarts != null ? f1(ctx.rates.effStarts) : "—"]] }
+          : { title: "MODEL CONTEXT", note: "inputs the projection uses for this game", grid: [["team goals", f2(ctx.teamLambda), "sky"], ["team shots", f1(ctx.teamShots)], ["SOG rate", f2(ctx.rates && ctx.rates.sog)], ["TOI", f1(ctx.rates && (ctx.rates.recentToi || ctx.rates.toi))], ["G rate", f2(ctx.rates && ctx.rates.g)], ["A rate", f2(ctx.rates && ctx.rates.a)], ["injury", ctx.injury || "none", ctx.injury ? "bad" : null], ["eff games", ctx.rates && ctx.rates.effGames != null ? f1(ctx.rates.effGames) : "—"]] },
+    ],
+    ...logSections({ rows: [...cur, ...prior], curCount: cur.length, types: goalie ? ["Saves"] : ["Shots on Goal", "Goals", "Assists", "Points"], valueFor: trendValueForGame, abbr: (t) => NHL_ABBR[t] || t, defaultLines: DEFAULT_LINE, title: goalie ? "Goaltending Form" : "Scoring Form" }),
+  };
+}
+
 /* ---- settlement ---- */
 function gradeLineResult(type, side, line, res) {
   const h = res.homeScore, a = res.awayScore;
@@ -124,18 +231,17 @@ function draftCtx(d, g, kind, pid) {
 const NHL = {
   id: "nhl",
   meta: {
-    title: "NHL", emoji: "🏒", tagline: "live odds · de-vigged edge · Poisson props + goalie model", league: "NHL",
+    title: "NHL", emoji: "🏒", league: "NHL",
     statsSource: "ESPN", searchPlaceholder: "Connor McDavid",
-    analysisHint: "NHL-wide profile lookup. If the player's team is on the selected slate, this tab adds game context, model projections, and any pulled",
     csvPrefix: "nhl-edge-finder", boardLogCsvPrefix: "nhl-board-log", backupApp: "nhl-edge-finder",
     overrideTitle: "Per-market book overrides: pull one market (e.g. Saves) from a different book than the rest of the board",
     diagnosticsType: "Saves", diagnosticsMarketKey: "player_total_saves",
     draftKindLabel: (kind) => (kind === "goalie" ? "GOALIE" : "SKATER"),
     searchResultLine: (p) => `${p.teamName || "FA"}`,
   },
-  config: { ALL_PROPS, BOOKS, BOOK_LABELS, CATEGORY_ORDER, DEFAULT_LINE, ODDS_TESTING_LIMIT, isLineType, matchesQuery, STAT_ORDER, TREND_PROPS },
+  config: { ALL_PROPS, BOOKS, BOOK_LABELS, CATEGORY_ORDER, DEFAULT_LINE, ODDS_TESTING_LIMIT, isLineType, matchesQuery, STAT_ORDER, TREND_PROPS, SIGNAL_RULES },
   storage,
-  api: { fetchSchedule, fetchOddsEvents, fetchEventOdds, matchEvent, oddsDebug, parseEventOdds, parseGameOdds, matchCurrentOdds, buildGameLineEntries, fetchGameResult, searchPlayers, fetchPlayerAnalysisProfile, findPlayerInSlate, buildTrendCard, getDeltaSignal },
+  api: { fetchSchedule, fetchOddsEvents, fetchEventOdds, matchEvent, oddsDebug, parseEventOdds, parseGameOdds, matchCurrentOdds, buildGameLineEntries, fetchGameResult, searchPlayers, fetchPlayerAnalysisProfile, findPlayerInSlate, buildTrendCard },
   model: { projectProp },
   loadGameDetail, buildPropEntries, analysisCtx, trendSubjects,
   propsForKind: (kind) => (kind === "goalie" ? GOALIE_PROPS : SKATER_PROPS),
@@ -144,6 +250,6 @@ const NHL = {
   gradeLogProp: (e, res) => gradeProp(e, res, null),
   draftCtx,
   draftDefaults: (kind) => (kind === "goalie" ? { type: "Saves", line: DEFAULT_LINE.Saves } : { type: "Shots on Goal", line: DEFAULT_LINE["Shots on Goal"] }),
-  ui: { Chip, ScoreLine, GameSubtitle, SlateDetail, BoardRow, MyBetRow, TrendCard, PlayerAnalysisIntro, PlayerProfilePanel },
+  game, slateView, playerView,
 };
 export default NHL;
