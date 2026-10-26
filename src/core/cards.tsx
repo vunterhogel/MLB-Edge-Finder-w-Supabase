@@ -41,7 +41,7 @@ export function BoardRow({ e, tracked, onTrack, showProjBar = true, isLineType, 
           </div>
         </div>
         <div className="text-right text-[11px]" style={mono}>
-          <div className="text-slate-400">model {pct(e.modelP)} · fair {e.fair}</div>
+          <div className="text-slate-400">model {pct(e.modelP)} · fair {e.fair}{e.experimental && <span className="ml-1.5 text-amber-400" title="Experimental market: not yet calibrated against settled results">exp</span>}</div>
           {(e.outsSanityFailed || e.suppressNote)
             ? <div className="text-amber-400 font-bold">⚠ {e.suppressNote || "stale IP data"} · edge suppressed</div>
             : <div className={evGood ? "text-emerald-400 font-bold" : "text-rose-400 font-bold"}>EV {evGood ? "+" : ""}{(e.ev * 100).toFixed(1)}% · edge {e.edge >= 0 ? "+" : ""}{(e.edge * 100).toFixed(1)}%</div>

@@ -1,13 +1,13 @@
 import React, { useState } from "react";
 import MLBApp from "./App";
-import NFLApp from "./nfl/NFLApp";
+import NFLApp from "./sports/nfl/Page";
 import NBAApp from "./sports/nba/Page";
 import NHLApp from "./sports/nhl/Page";
 import ParlayBuilder from "./parlay/ParlayBuilder";
 
 /* Root — the ONLY new top-level wiring the NFL/NBA integrations needed (see
    INTEGRATION.md / NBA_INTEGRATION.md). A tiny sport switcher above the existing
-   apps; MLB's App.tsx and NFL's NFLApp.tsx are untouched by the NBA addition.
+   apps; All four sports render through the shared SportApp shell (src/core/SportApp.tsx).
    Parlay Builder is a 4th, sport-agnostic tab — it doesn't touch any of the
    three app files either, it just reads the CSVs they already export. */
 export default function Root() {
