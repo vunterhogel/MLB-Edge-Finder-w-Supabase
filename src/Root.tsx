@@ -4,6 +4,9 @@ import NFLApp from "./sports/nfl/Page";
 import NBAApp from "./sports/nba/Page";
 import NHLApp from "./sports/nhl/Page";
 import ParlayBuilder from "./parlay/ParlayBuilder";
+import MyBets from "./hub/MyBets";
+import MyStats from "./hub/MyStats";
+import { useHubBets } from "./hub/useHubBets";
 import { useRoute } from "./core/route";
 
 /* Root: the app frame. A sidebar (a slide-out menu on phones) switches pages, and the page address
@@ -11,7 +14,11 @@ import { useRoute } from "./core/route";
    SportApp shell. A page stays mounted after its first visit and is only hidden when you switch
    away, so a loaded slate and pulled odds survive switching sports. */
 const NAV = [
-  { section: "HUB", items: [{ page: "parlay", label: "Parlay Builder", icon: "🧩" }] },
+  { section: "HUB", items: [
+    { page: "bets", label: "My Bets", icon: "📋" },
+    { page: "stats", label: "My Stats", icon: "📈" },
+    { page: "parlay", label: "Parlay Builder", icon: "🧩" },
+  ] },
   { section: "EDGE FINDER", items: [
     { page: "mlb", label: "MLB", icon: "⚾" },
     { page: "nfl", label: "NFL", icon: "🏈" },
@@ -20,9 +27,12 @@ const NAV = [
   ] },
 ];
 const LABEL = Object.fromEntries(NAV.flatMap((s) => s.items).map((i) => [i.page, i]));
-const TAB_LABEL = { slate: "Slate", board: "Board", trends: "Trends", analysis: "Player Analysis", mybets: "My Bets", stats: "Stats" };
+const TAB_LABEL = { slate: "Slate", board: "Board", trends: "Trends", analysis: "Player Analysis", log: "Board Log" };
 
 function Sidebar({ route, navigate, onPick }) {
+  // open tracked bets across every sport, shown next to My Bets
+  const all = useHubBets();
+  const open = Object.values(all).reduce((n, bets) => n + bets.filter((b) => b.status === "open").length, 0);
   return (
     <nav className="flex flex-col h-full">
       <div className="px-4 pt-5 pb-4 border-b border-slate-800">
@@ -41,6 +51,7 @@ function Sidebar({ route, navigate, onPick }) {
                   className={`w-full flex items-center gap-2.5 px-4 py-2 text-sm font-semibold text-left border-l-2 ${active ? "border-emerald-400 bg-slate-900 text-emerald-400" : "border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-900/60"}`}
                 >
                   <span className="w-5 text-center">{i.icon}</span>{i.label}
+                  {i.page === "bets" && open > 0 && <span className="ml-auto text-[10px] font-bold text-emerald-300 bg-emerald-900/40 border border-emerald-800 rounded-full px-1.5 py-0.5" title={`${open} open tracked bet(s)`}>{open}</span>}
                 </button>
               );
             })}
@@ -87,6 +98,8 @@ export default function Root() {
         {page("nfl", <NFLApp {...tabProps("nfl")} />)}
         {page("nba", <NBAApp {...tabProps("nba")} />)}
         {page("nhl", <NHLApp {...tabProps("nhl")} />)}
+        {page("bets", <MyBets />)}
+        {page("stats", <MyStats />)}
         {page("parlay", <ParlayBuilder />)}
       </main>
     </div>

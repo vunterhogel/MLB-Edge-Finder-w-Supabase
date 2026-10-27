@@ -4,8 +4,10 @@
 import { useEffect, useRef, useState } from "react";
 
 export const SPORT_PAGES = ["mlb", "nfl", "nba", "nhl"];
-export const HUB_PAGES = ["parlay"];
-export const SPORT_TABS = ["slate", "board", "trends", "analysis", "mybets", "stats"];
+export const HUB_PAGES = ["bets", "stats", "parlay"];
+export const SPORT_TABS = ["slate", "board", "trends", "analysis", "log"];
+// addresses from before the hub: a sport's My Bets tab moved to Hub My Bets, its Stats tab is now Board Log
+const MOVED_TABS = { mybets: { page: "bets" }, stats: { tab: "log" } };
 const DEFAULT_ROUTE = { page: "mlb", tab: "slate" };
 const LS_LAST = "ef_last_route_v1";
 const LS_TABS = "ef_sport_tabs_v1";
@@ -14,10 +16,12 @@ const readJson = (k, fb) => { try { const v = JSON.parse(localStorage.getItem(k)
 const writeJson = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* storage unavailable */ } };
 
 const sportTabs = readJson(LS_TABS, {});
+for (const k of Object.keys(sportTabs)) if (MOVED_TABS[sportTabs[k]]) sportTabs[k] = MOVED_TABS[sportTabs[k]].tab || "slate";
 
 function valid(r) {
   if (!r || !r.page) return null;
   if (HUB_PAGES.includes(r.page)) return { page: r.page, tab: null };
+  if (SPORT_PAGES.includes(r.page) && MOVED_TABS[r.tab]) return valid({ page: r.page, ...MOVED_TABS[r.tab] });
   if (SPORT_PAGES.includes(r.page)) return { page: r.page, tab: SPORT_TABS.includes(r.tab) ? r.tab : (sportTabs[r.page] || "slate") };
   return null;
 }
@@ -38,7 +42,11 @@ export function useRoute() {
   useEffect(() => {
     if (toHash(route) !== window.location.hash) window.history.replaceState(null, "", toHash(route));
     // an unknown address keeps the current page and corrects the address bar
-    const onHash = () => { const r = parseHash(window.location.hash); if (r) setRoute(r); else window.history.replaceState(null, "", toHash(cur.current)); };
+    const onHash = () => {
+      const r = parseHash(window.location.hash);
+      if (r) { setRoute(r); if (toHash(r) !== window.location.hash) window.history.replaceState(null, "", toHash(r)); } // e.g. an old #/nba/mybets becomes #/bets
+      else window.history.replaceState(null, "", toHash(cur.current));
+    };
     window.addEventListener("hashchange", onHash);
     return () => window.removeEventListener("hashchange", onHash);
   }, []);

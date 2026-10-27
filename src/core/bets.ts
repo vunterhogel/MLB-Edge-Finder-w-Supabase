@@ -108,7 +108,8 @@ export function betStats(bets, { start = "", end = "" } = {}, typeOrder = []) {
 
 /* ---------------- CSV export (bets + stats summary) ---------------- */
 const esc = (v) => { if (v == null) return ""; const s = String(v); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
-export function betsCsv(bets, stats, typeOrder = []) {
+// sportOf (optional): adds a leading "sport" column to the bet rows (the hub's all-sports export)
+export function betsCsv(bets, stats, typeOrder = [], sportOf = null) {
   const pctOr = (x) => (x == null ? "" : (x * 100).toFixed(1));
   const o = stats.overall;
   const lines = [];
@@ -128,7 +129,7 @@ export function betsCsv(bets, stats, typeOrder = []) {
   for (const t of typeOrder) { const s = stats.byType[t]; if (!s) continue; lines.push([esc(t), s.w, s.l, s.ps, s.winPct != null ? (s.winPct * 100).toFixed(1) : "", s.net.toFixed(2), s.flatNet.toFixed(2)].join(",")); }
   lines.push("");
   lines.push("BETS");
-  lines.push(["date", "game", "name", "type", "line", "side", "odds", "book", "model_pct", "proj", "novig_pct", "edge_pct", "ev_pct", "units", "suggested", "status", "actual", "profit_units", "current_odds", "clv_pts"].join(","));
+  lines.push([...(sportOf ? ["sport"] : []), "date", "game", "name", "type", "line", "side", "odds", "book", "model_pct", "proj", "novig_pct", "edge_pct", "ev_pct", "units", "suggested", "status", "actual", "profit_units", "current_odds", "clv_pts"].join(","));
   // export EVERY tracked bet (open + settled), independent of the My Bets view filters
   const allBets = [...bets].sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")));
   for (const b of allBets) {
@@ -141,7 +142,7 @@ export function betsCsv(bets, stats, typeOrder = []) {
     const profit = (b.status === "won" || b.status === "lost") ? profitUnits(b.status, odds, units).toFixed(2) : "";
     const clv = (b.currentOdds != null && !isNaN(odds)) ? ((impliedProb(b.currentOdds) - impliedProb(odds)) * 100).toFixed(1) : "";
     lines.push([
-      esc(b.date), esc(b.game), esc(b.name), esc(b.type), esc(b.line), esc(b.side), esc(b.odds), esc(b.book),
+      ...(sportOf ? [esc(sportOf(b))] : []), esc(b.date), esc(b.game), esc(b.name), esc(b.type), esc(b.line), esc(b.side), esc(b.odds), esc(b.book),
       b.modelP != null ? (b.modelP * 100).toFixed(1) : "", b.proj != null ? Number(b.proj).toFixed(2) : "",
       b.novig != null ? (b.novig * 100).toFixed(1) : "", pctOr(edge), pctOr(ev),
       units, b.suggested != null ? b.suggested : "", esc(b.status), esc(b.actual), profit,

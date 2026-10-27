@@ -1,15 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { evPerUnit, impliedProb, pct, probToAmerican, profitUnits, suggestedUnits } from "./math";
-import { MultiSel, NumIn, Sel, StatCard, mono } from "./ui";
-import { BoardRow, MyBetRow, TrendCard } from "./cards";
+import { pct, probToAmerican, suggestedUnits } from "./math";
+import { NumIn, Sel, mono } from "./ui";
+import { BoardRow, TrendCard } from "./cards";
 import { makeDeltaSignal } from "./signals";
 import { Chip, GameDetail, GameSubtitle, ScoreLine } from "./slate";
 import { PlayerAnalysis, PlayerAnalysisIntro } from "./analysis";
 import { useBets } from "./betStore";
-import { betFacets, betFiltersActive as anyBetFilters, betStats, betsBackupJson, betsCsv, downloadText, fetchOpenBetResults, filterSortBets, gradeOpenBets, mergeRestored, newFromBackup, parseBetsBackup, refreshBetLines } from "./bets";
 
 
-/* SportApp: the shared Edge Finder shell (Slate / Board / Trends / Player Analysis / My Bets / Stats).
+/* SportApp: the shared Edge Finder shell (Slate / Board / Trends / Player Analysis / Board Log).
+   Tracked bets and their stats live in the hub (src/hub); this page tracks into the same shared store.
    Built from the MLB page, which is the design standard. Everything sport-specific comes from the
    `sport` adapter (see sports/mlb/adapter.tsx); this file holds no sport logic of its own. */
 
@@ -105,39 +105,15 @@ export default function SportApp({ sport, tab: routeTab = null, onTabChange = nu
   const [analysisProfile, setAnalysisProfile] = useState(null);
   const [analysisLoading, setAnalysisLoading] = useState(false);
   const [analysisErr, setAnalysisErr] = useState("");
-  const [betStatusFilter, setBetStatusFilter] = useState("all"); // all|open|won|lost
-  const [betSort, setBetSort] = useState("recent");        // recent|ev_desc|ev_asc|edge_desc|edge_asc
-  const [betDateFilter, setBetDateFilter] = useState("all"); // all | a specific YYYY-MM-DD
-  const [betGameFilters, setBetGameFilters] = useState<string[]>([]);   // [] = all; multi-select games
-  const [betTypeFilters, setBetTypeFilters] = useState<string[]>([]);   // [] = all; multi-select categories
-  const [betBookFilters, setBetBookFilters] = useState<string[]>([]);   // [] = all; multi-select sportsbooks
-  const [betSideFilter, setBetSideFilter] = useState("all");  // all | over | under | home | away
-  const [betSearch, setBetSearch] = useState("");
-  const [showMoreBets, setShowMoreBets] = useState(false);
-  const [betMinModel, setBetMinModel] = useState("");        // min model % on My Bets
-  const [betMinEdge, setBetMinEdge] = useState("");          // min edge % on My Bets
-  const [betMaxEdge, setBetMaxEdge] = useState("");          // max edge % on My Bets
-  const [betMinOdds, setBetMinOdds] = useState("");
-  const [betMaxOdds, setBetMaxOdds] = useState("");
-  const [betMinDelta, setBetMinDelta] = useState("");        // min proj delta (proj - line)
-  const [betMaxDelta, setBetMaxDelta] = useState("");        // max proj delta
-  const [betDirAligned, setBetDirAligned] = useState(false);// only show bets where proj direction matched side
   const [stakeMode, setStakeMode] = useState("flat");      // flat | kelly (default for NEW tracked bets)
-  const [statsStartDate, setStatsStartDate] = useState("");  // YYYY-MM-DD, inclusive
-  const [statsEndDate, setStatsEndDate] = useState("");      // YYYY-MM-DD, inclusive
   // tracked bets live in the shared per-sport store (core/betStore.ts), so the hub and this page
   // edit the same list; the store saves every change and writes settled results into the board log
   const [myBets, setMyBets] = useBets(sport);
   const [draft, setDraft] = useState(null);
   const [showManual, setShowManual] = useState(false);
-  const [settleMsg, setSettleMsg] = useState("");
-  const [lineMsg, setLineMsg] = useState("");
-  const [refreshingLines, setRefreshingLines] = useState(false);
   const eventsRef = useRef({ date: null, events: null });
   const inflight = useRef(new Set());
 
-  // Clear game multi-select when date changes — previously selected games may belong to a different date.
-  useEffect(() => { setBetGameFilters([]); }, [betDateFilter]);
   // Board log persists in IndexedDB and loads async — sync the count once ready.
   useEffect(() => { boardLogReady.then((rows) => setBoardLogCount(rows.length)); }, []);
   useEffect(() => { if (credits != null) { try { localStorage.setItem(LS_CREDITS, String(credits)); } catch { /* ignore */ } } }, [credits]);
@@ -466,13 +442,6 @@ export default function SportApp({ sport, tab: routeTab = null, onTabChange = nu
       return additions.length ? [...additions, ...prev] : prev;
     });
   }
-  function updateBetOdds(key, odds) { setMyBets((p) => p.map((b) => b.key === key ? { ...b, odds: odds === "" ? "" : Number(odds) } : b)); }
-  function updateBetUnits(key, units) { setMyBets((p) => p.map((b) => b.key === key ? { ...b, units: units === "" ? "" : Math.max(0, Number(units)) } : b)); }
-  function removeBet(key) { setMyBets((p) => p.filter((b) => b.key !== key)); }
-  function resetStats() {
-    if (typeof window !== "undefined" && !window.confirm("Clear ALL tracked bets (open + settled)? This cannot be undone. Export a CSV first if you want a copy.")) return;
-    setMyBets([]); setSettleMsg("");
-  }
   function addManualBet() {
     if (!draft || draft.odds === "") return;
     const key = `m-${Date.now()}`;
@@ -482,15 +451,6 @@ export default function SportApp({ sport, tab: routeTab = null, onTabChange = nu
     const units = stakeMode === "kelly" ? (sug > 0 ? sug : 1) : 1;
     const rec = { key, date, gamePk: draft.pk, game: draft.game, playerId: draft.playerId, name: draft.name, type: draft.type, line: draft.line, side: draft.side, odds: Number(draft.odds), book: "manual", modelP, proj, novig: null, units, suggested: sug, status: "open", actual: null };
     setMyBets((p) => [rec, ...p]); setDraft(null);
-  }
-
-  async function settleBets() {
-    if (!myBets.some((b) => b.status === "open")) { setSettleMsg("No open bets to settle."); return; }
-    setSettleMsg("Settling…");
-    const { results } = await fetchOpenBetResults(sport, myBets);
-    let graded = 0;
-    setMyBets((prev) => { const r = gradeOpenBets(sport, prev, results); graded = r.graded; return r.next; });
-    setSettleMsg(`Settled ${graded} bet(s). Unsettled games are still in progress.`);
   }
 
   // ── Full Board Log Settlement ──────────────────────────────────────────────
@@ -553,24 +513,6 @@ export default function SportApp({ sport, tab: routeTab = null, onTabChange = nu
     }
   }
 
-  // pull the current market price for each open tracked bet (line movement / CLV). ~9 credits per game with open bets.
-  async function refreshLines() {
-    const open = myBets.filter((b) => b.status === "open" && b.book && b.book !== "manual");
-    if (!open.length) { setLineMsg("No open tracked bets with a book to refresh (manual bets have no book to pull)."); return; }
-    setRefreshingLines(true); setLineMsg("Refreshing lines…");
-    try {
-      const getEvents = async () => {
-        let events = eventsRef.current && eventsRef.current.events;
-        if (!events) { const ev = await fetchOddsEvents(); events = ev.events || []; eventsRef.current = { date, events }; if (ev.remaining != null) setCredits(ev.remaining); }
-        return events;
-      };
-      const { updates, matched, missed, games: games_, frozen } = await refreshBetLines(sport, open, { getEvents, findGame: (pk) => games.find((x) => String(x.pk) === pk), onCredits: setCredits });
-      setMyBets((prev) => prev.map((b) => updates[b.key] ? { ...b, ...updates[b.key] } : b));
-      setLineMsg(`Updated ${matched} line(s) across ${games_} game(s)${frozen ? ` · ${frozen} frozen at close (game started)` : ""}${missed ? ` · ${missed} not found (scratched, settled, or line moved off your number)` : ""}.`);
-    } catch (e) { setLineMsg(`Line refresh failed: ${String((e && e.message) || e)}`); }
-    setRefreshingLines(false);
-  }
-
   /* draft from a board entry's player (manual line/odds) */
   function draftFromGame(g, kind, pid, name) {
     const ctx = sport.draftCtx(detail[g.pk], g, kind, pid);
@@ -586,24 +528,7 @@ export default function SportApp({ sport, tab: routeTab = null, onTabChange = nu
     setMg({ away: "", home: "", time: "" });
   }
 
-  /* live recompute of My Bets EV (odds editable) */
-  const betFilterSet = { status: betStatusFilter, sort: betSort, date: betDateFilter, games: betGameFilters, types: betTypeFilters, books: betBookFilters, side: betSideFilter, minModel: betMinModel, minEdge: betMinEdge, maxEdge: betMaxEdge, minOdds: betMinOdds, maxOdds: betMaxOdds, minDelta: betMinDelta, maxDelta: betMaxDelta, dirAligned: betDirAligned, search: betSearch };
-  const myBetsView = useMemo(() => filterSortBets(myBets, betFilterSet, matchesQuery),
-    [myBets, betStatusFilter, betSort, betDateFilter, betGameFilters, betTypeFilters, betBookFilters, betSideFilter, betMinModel, betMinEdge, betMaxEdge, betMinOdds, betMaxOdds, betMinDelta, betMaxDelta, betDirAligned, betSearch]);
-  const betFacetLists = useMemo(() => betFacets(myBets, betDateFilter), [myBets, betDateFilter]);
-  const { dates: betDates, games: betGames, types: betTypes, books: betBooks, sides: betSides } = betFacetLists;
   const trackedByGame = useMemo(() => { const m = {}; for (const b of myBets) if (b.status === "open") m[b.gamePk] = (m[b.gamePk] || 0) + 1; return m; }, [myBets]);
-  const betFiltersActive = anyBetFilters(betFilterSet);
-  function clearBetFilters() { setBetStatusFilter("all"); setBetGameFilters([]); setBetTypeFilters([]); setBetBookFilters([]); setBetSideFilter("all"); setBetDateFilter("all"); setBetMinModel(""); setBetMinEdge(""); setBetMaxEdge(""); setBetMinOdds(""); setBetMaxOdds(""); setBetMinDelta(""); setBetMaxDelta(""); setBetDirAligned(false); setBetSearch(""); }
-
-  const statsDates = useMemo(() => [...new Set(myBets.map((b) => b.date).filter(Boolean))].sort(), [myBets]);
-  const stats = useMemo(() => betStats(myBets, { start: statsStartDate, end: statsEndDate }, STAT_ORDER), [myBets, statsStartDate, statsEndDate]);
-
-  /* ---------- CSV export (bets + stats summary) ---------- */
-  function exportCSV() {
-    const stamp = new Date().toISOString().slice(0, 10);
-    downloadText(betsCsv(myBets, stats, STAT_ORDER), `${meta.csvPrefix}-${stamp}.csv`, "text/csv;charset=utf-8;");
-  }
   // Board log CSV export — every candidate ever shown on the board (not just tracked bets).
   // This is the primary calibration dataset: modelVersion, rawModelP, calibratedP, novig, edge,
   // proj, settled flag, actualStat, result, and CLV (once closing line capture is wired).
@@ -638,25 +563,6 @@ export default function SportApp({ sport, tab: routeTab = null, onTabChange = nu
     void idbDel(BOARD_DB_KEY);
     try { localStorage.removeItem(LS_BOARD_LOG); } catch { /* ignore */ }
     setBoardLogCount(0);
-  }
-
-  // lossless backup of the bet log so it survives a host/browser change (localStorage does not)
-  function backupBets() {
-    downloadText(betsBackupJson(myBets, meta.backupApp), `${meta.csvPrefix}-bets-${new Date().toISOString().slice(0, 10)}.json`, "application/json");
-  }
-  function restoreBets(file) {
-    if (!file) return;
-    const reader = new FileReader();
-    reader.onload = () => {
-      try {
-        const incoming = parseBetsBackup(reader.result);
-        if (!incoming) { setSettleMsg("Restore failed: not a valid bet backup file."); return; }
-        const toAdd = newFromBackup(myBets, incoming);
-        setMyBets((cur) => mergeRestored(cur, toAdd));
-        setSettleMsg(`Restored ${toAdd.length} bet(s) from backup (${incoming.length} in file; duplicates skipped).`);
-      } catch { setSettleMsg("Restore failed: could not parse the JSON file."); }
-    };
-    reader.readAsText(file);
   }
 
   /* ============================ UI ============================ */
@@ -707,7 +613,7 @@ export default function SportApp({ sport, tab: routeTab = null, onTabChange = nu
           )}
           <div className="flex items-center justify-between mt-3 flex-wrap gap-2">
             <div className="flex gap-1 flex-wrap">
-              {[["slate", "Slate"], ["board", `Board${boardEntries.length ? ` (${boardEntries.length})` : ""}`], ["trends", `Trends${trendCards.length ? ` (${trendCards.length})` : ""}`], ["analysis", "Player Analysis"], ["mybets", `My Bets${myBets.length ? ` (${myBets.length})` : ""}`], ["stats", "Stats"]].map(([k, l]) => (
+              {[["slate", "Slate"], ["board", `Board${boardEntries.length ? ` (${boardEntries.length})` : ""}`], ["trends", `Trends${trendCards.length ? ` (${trendCards.length})` : ""}`], ["analysis", "Player Analysis"], ["log", "Board Log"]].map(([k, l]) => (
                 <button key={k} onClick={() => setTab(k)} className={`px-3.5 py-1.5 rounded-lg text-sm font-semibold ${tab === k ? "bg-slate-800 text-emerald-400" : "text-slate-400 hover:text-slate-200"}`}>{l}</button>
               ))}
             </div>
@@ -751,7 +657,7 @@ export default function SportApp({ sport, tab: routeTab = null, onTabChange = nu
                   {isOpen && (
                     <div className="px-4 pb-4 border-t border-slate-800">
                       {d && d.loading && <div className="py-6 text-center text-sm text-slate-500" style={mono}>loading stats…</div>}
-                      {g.manual && <div className="py-3 text-xs text-slate-400">Manual game — model context unavailable; track bets by hand from My Bets.</div>}
+                      {g.manual && <div className="py-3 text-xs text-slate-400">Manual game — model context unavailable; track bets by hand from Hub · My Bets.</div>}
                       {d && d.ready && (
                         <>
                           <GameDetail g={g} view={sport.slateView(g, d)} onDraft={(dr) => draftFromGame(g, dr.kind, dr.id, dr.name)} onAnalysis={goToAnalysis} />
@@ -1027,99 +933,9 @@ export default function SportApp({ sport, tab: routeTab = null, onTabChange = nu
         )}
 
         {/* ---------------- MY BETS ---------------- */}
-        {tab === "mybets" && (
+        {/* ---------------- BOARD LOG ---------------- */}
+        {tab === "log" && (
           <div className="mt-3">
-            <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
-              <div className="flex items-center gap-2 flex-wrap">
-                <input value={betSearch} onChange={(e) => setBetSearch(e.target.value)} placeholder="search player or team" className="bg-slate-950 border border-slate-700 rounded px-2.5 py-1.5 text-sm w-44 text-slate-100" />
-                <Sel compact label="show" v={betStatusFilter} opts={["all", "open", "settled", "won", "lost", "push", "void"]} labels={{ all: "All", open: "Open", settled: "Settled", won: "Won", lost: "Lost", push: "Push", void: "Void" }} onChange={setBetStatusFilter} />
-                <Sel compact label="date" v={betDateFilter} opts={["all", ...betDates]} labels={{ all: "All dates" }} onChange={setBetDateFilter} />
-                <MultiSel compact label="game" selected={betGameFilters} opts={betGames} onChange={setBetGameFilters} />
-                <MultiSel compact label="category" selected={betTypeFilters} opts={betTypes} onChange={setBetTypeFilters} />
-                <MultiSel compact label="book" selected={betBookFilters} opts={betBooks} labels={BOOK_LABELS} onChange={setBetBookFilters} />
-                <Sel compact label="side" v={betSideFilter} opts={["all", ...betSides]} labels={{ all: "All sides" }} onChange={setBetSideFilter} />
-                <Sel compact label="sort" v={betSort} opts={["recent", "game", "model_desc", "model_asc", "ev_desc", "ev_asc", "edge_desc", "edge_asc", "clv_desc", "clv_asc", "delta_desc", "delta_asc"]} labels={{ recent: "Most recent", game: "Game", model_desc: "Model % ↓", model_asc: "Model % ↑", ev_desc: "EV ↓", ev_asc: "EV ↑", edge_desc: "Edge ↓", edge_asc: "Edge ↑", clv_desc: "Line move ↓", clv_asc: "Line move ↑", delta_desc: "Proj Δ ↓", delta_asc: "Proj Δ ↑" }} onChange={setBetSort} />
-                {(() => { const n = (betMinModel !== "" ? 1 : 0) + (betMinEdge !== "" ? 1 : 0) + (betMaxEdge !== "" ? 1 : 0) + (betMinOdds !== "" ? 1 : 0) + (betMaxOdds !== "" ? 1 : 0) + (betMinDelta !== "" ? 1 : 0) + (betMaxDelta !== "" ? 1 : 0) + (betDirAligned ? 1 : 0); return (
-                  <button onClick={() => setShowMoreBets((s) => !s)} className={`text-xs rounded px-2.5 py-1.5 border ${showMoreBets || n ? "border-emerald-700 text-emerald-300" : "border-slate-700 text-slate-400 hover:text-slate-200"}`}>more{n ? ` (${n})` : ""} {showMoreBets ? "▴" : "▾"}</button>
-                ); })()}
-                {betFiltersActive && <button onClick={clearBetFilters} className="text-[11px] text-slate-400 hover:text-rose-300 border border-slate-700 rounded px-2.5 py-1.5">clear</button>}
-              </div>
-              <div className="flex items-center gap-2 self-end">
-                <button onClick={exportCSV} disabled={myBets.length === 0} className="bg-sky-600 hover:bg-sky-500 disabled:opacity-40 text-white font-bold text-sm rounded-lg px-3 py-1.5">Download CSV</button>
-                <button onClick={backupBets} disabled={myBets.length === 0} className="bg-slate-700 hover:bg-slate-600 disabled:opacity-40 text-white font-bold text-sm rounded-lg px-3 py-1.5" title="Save a .json backup you can restore later or on another device">Backup</button>
-                <label className="bg-slate-700 hover:bg-slate-600 text-white font-bold text-sm rounded-lg px-3 py-1.5 cursor-pointer" title="Restore bets from a .json backup">Restore
-                  <input type="file" accept="application/json,.json" className="hidden" onChange={(e) => { restoreBets(e.target.files && e.target.files[0]); e.target.value = ""; }} />
-                </label>
-                <button onClick={refreshLines} disabled={refreshingLines} className="bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white font-bold text-sm rounded-lg px-3 py-1.5" title="Pull the current price for each open tracked bet (line movement / CLV). ~9 credits per game.">{refreshingLines ? "…" : "Refresh lines"}</button>
-                <button onClick={settleBets} className="bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-sm rounded-lg px-3 py-1.5">Settle finished</button>
-              </div>
-            </div>
-            {showMoreBets && (
-              <div className="flex items-end gap-3 flex-wrap mb-3 p-2.5 rounded-lg bg-slate-900/40 border border-slate-800">
-                <label className="text-xs text-slate-400 flex flex-col gap-1">min model %
-                  <input value={betMinModel} onChange={(e) => setBetMinModel(e.target.value)} placeholder="any" inputMode="decimal" className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-20 text-slate-100" />
-                </label>
-                <label className="text-xs text-slate-400 flex flex-col gap-1">min edge %
-                  <input value={betMinEdge} onChange={(e) => setBetMinEdge(e.target.value)} placeholder="any" inputMode="decimal" className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-20 text-slate-100" />
-                </label>
-                <label className="text-xs text-slate-400 flex flex-col gap-1">max edge %
-                  <input value={betMaxEdge} onChange={(e) => setBetMaxEdge(e.target.value)} placeholder="any" inputMode="decimal" className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-20 text-slate-100" />
-                </label>
-                <label className="text-xs text-slate-400 flex flex-col gap-1">min proj Δ
-                  <input value={betMinDelta} onChange={(e) => setBetMinDelta(e.target.value)} placeholder="e.g. 0.5" inputMode="decimal" className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-20 text-slate-100" />
-                </label>
-                <label className="text-xs text-slate-400 flex flex-col gap-1">max proj Δ
-                  <input value={betMaxDelta} onChange={(e) => setBetMaxDelta(e.target.value)} placeholder="e.g. 2.0" inputMode="decimal" className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-20 text-slate-100" />
-                </label>
-                <label className="text-xs text-slate-400 flex flex-col gap-1">min odds
-                  <input value={betMinOdds} onChange={(e) => setBetMinOdds(e.target.value)} placeholder="-300" inputMode="numeric" className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-20 text-slate-100" />
-                </label>
-                <label className="text-xs text-slate-400 flex flex-col gap-1">max odds
-                  <input value={betMaxOdds} onChange={(e) => setBetMaxOdds(e.target.value)} placeholder="+300" inputMode="numeric" className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-20 text-slate-100" />
-                </label>
-                <label className="text-xs text-slate-400 flex flex-col gap-1">proj aligned
-                  <button onClick={() => setBetDirAligned((s) => !s)} className={`text-xs rounded px-3 py-1.5 border font-medium ${betDirAligned ? "border-sky-600 bg-sky-950 text-sky-300" : "border-slate-700 text-slate-500 hover:text-slate-300"}`} title="Only show bets where proj direction matched the bet side">{betDirAligned ? "on" : "off"}</button>
-                </label>
-              </div>
-            )}
-            {settleMsg && <div className="text-[11px] text-slate-400 mb-2">{settleMsg}</div>}
-            {lineMsg && <div className="text-[11px] text-indigo-300 mb-2">{lineMsg}</div>}
-            {myBets.length > 0 && (
-              <div className="text-[11px] text-slate-400 mb-2 flex items-center gap-x-3 gap-y-1 flex-wrap">
-                <span>showing <b className="text-slate-200">{myBetsView.length}</b> of {myBets.length} bets</span>
-                {(() => {
-                  const set = myBetsView.filter((b) => b.status === "won" || b.status === "lost" || b.status === "push" || b.status === "void");
-                  if (!set.length) return null;
-                  const w = set.filter((b) => b.status === "won").length, l = set.filter((b) => b.status === "lost").length, p = set.filter((b) => b.status === "push").length;
-                  const net = set.reduce((s, b) => s + (profitUnits(b.status, Number(b.odds), b.units != null ? b.units : 1) || 0), 0);
-                  const wr = (w + l) ? (w / (w + l) * 100).toFixed(1) : "0.0";
-                  return <span>· settled in view: <b className="text-slate-200">{w}-{l}{p ? `-${p}` : ""}</b> ({wr}%) · net <b className={net >= 0 ? "text-emerald-400" : "text-rose-400"}>{net >= 0 ? "+" : ""}{net.toFixed(2)}u</b></span>;
-                })()}
-              </div>
-            )}
-            {myBets.length === 0 ? (
-              <div className="text-sm text-slate-500 py-10 text-center">No bets tracked. Add from the Board (<span className="text-emerald-400">track</span>) or draft one from a player on the Slate.</div>
-            ) : myBetsView.length === 0 ? (
-              <div className="text-sm text-slate-500 py-10 text-center">No bets match this filter.</div>
-            ) : (
-              <div className="space-y-2">
-                {myBetsView.map((b) => <MyBetRow key={b.key} {...rowCfg} b={b} onOdds={(v) => updateBetOdds(b.key, v)} onUnits={(v) => updateBetUnits(b.key, v)} onRemove={() => removeBet(b.key)} />)}
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* ---------------- STATS ---------------- */}
-        {tab === "stats" && (
-          <div className="mt-3">
-            <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
-              <div className="text-[11px] text-slate-500" style={mono}>net & ROI are stake-weighted (units per bet) · flat-1u shown for comparison</div>
-              <div className="flex items-center gap-2">
-                <button onClick={exportCSV} disabled={myBets.length === 0} className="bg-sky-600 hover:bg-sky-500 disabled:opacity-40 text-white font-bold text-xs rounded-lg px-3 py-1.5">Download CSV</button>
-                <button onClick={resetStats} disabled={myBets.length === 0} className="bg-slate-800 hover:bg-rose-700 disabled:opacity-40 border border-slate-700 text-slate-200 font-bold text-xs rounded-lg px-3 py-1.5">Reset stats</button>
-              </div>
-            </div>
-
             {/* Board Log section — calibration dataset (all board candidates, not just tracked bets) */}
             <div className="mb-4 p-3 rounded-lg bg-slate-900/60 border border-slate-800">
               <div className="flex items-center justify-between flex-wrap gap-2">
@@ -1163,54 +979,6 @@ export default function SportApp({ sport, tab: routeTab = null, onTabChange = nu
               </div>
             </div>
 
-            {/* Date range filter */}
-            <div className="flex items-end gap-3 flex-wrap mb-4 p-2.5 rounded-lg bg-slate-900/40 border border-slate-800">
-              <label className="text-xs text-slate-400 flex flex-col gap-1">start date
-                <input type="date" value={statsStartDate} min={statsDates[0] || ""} max={statsEndDate || statsDates[statsDates.length - 1] || ""} onChange={(e) => setStatsStartDate(e.target.value)} className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm text-slate-100 w-36" />
-              </label>
-              <label className="text-xs text-slate-400 flex flex-col gap-1">end date
-                <input type="date" value={statsEndDate} min={statsStartDate || statsDates[0] || ""} max={statsDates[statsDates.length - 1] || ""} onChange={(e) => setStatsEndDate(e.target.value)} className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm text-slate-100 w-36" />
-              </label>
-              {(statsStartDate || statsEndDate) && (
-                <button onClick={() => { setStatsStartDate(""); setStatsEndDate(""); }} className="text-[11px] text-slate-400 hover:text-rose-300 border border-slate-700 rounded px-2.5 py-1.5">clear</button>
-              )}
-              <div className="text-[11px] text-slate-500 self-end pb-1.5" style={mono}>
-                {statsStartDate || statsEndDate
-                  ? `${statsStartDate || statsDates[0] || "…"} → ${statsEndDate || statsDates[statsDates.length - 1] || "…"}`
-                  : "all time"}
-              </div>
-            </div>
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-4">
-              <StatCard label="Settled" v={stats.overall.n} />
-              <StatCard label="Win %" v={stats.overall.winPct != null ? pct(stats.overall.winPct) : "—"} good={stats.overall.winPct != null && stats.overall.winPct >= 0.524} />
-              <StatCard label="Net (units)" v={`${stats.overall.net >= 0 ? "+" : ""}${stats.overall.net.toFixed(2)}u`} good={stats.overall.net >= 0} />
-              <StatCard label="ROI" v={stats.overall.roi != null ? `${stats.overall.roi >= 0 ? "+" : ""}${(stats.overall.roi * 100).toFixed(1)}%` : "—"} good={stats.overall.roi != null && stats.overall.roi >= 0} />
-            </div>
-            <div className="text-[11px] text-slate-500 mb-3" style={mono}>
-              record {stats.overall.w}-{stats.overall.l}{stats.overall.ps ? `-${stats.overall.ps}` : ""}{stats.overall.v ? ` · ${stats.overall.v} void` : ""} · {stats.overall.staked.toFixed(2)}u staked · {stats.openCount} open · break-even ≈ 52.4% at −110
-            </div>
-            <div className="text-[11px] mb-3 px-3 py-2 rounded-lg bg-slate-900/70 border border-slate-800" style={mono}>
-              <span className="text-slate-500">strategy compare · </span>
-              <span className="text-slate-300">staked: <span className={stats.overall.net >= 0 ? "text-emerald-400 font-bold" : "text-rose-400 font-bold"}>{stats.overall.net >= 0 ? "+" : ""}{stats.overall.net.toFixed(2)}u</span> ({stats.overall.roi != null ? `${(stats.overall.roi * 100).toFixed(1)}%` : "—"} ROI)</span>
-              <span className="text-slate-600"> vs </span>
-              <span className="text-slate-300">flat 1u: <span className={stats.overall.flatNet >= 0 ? "text-emerald-400 font-bold" : "text-rose-400 font-bold"}>{stats.overall.flatNet >= 0 ? "+" : ""}{stats.overall.flatNet.toFixed(2)}u</span> ({stats.overall.flatRoi != null ? `${(stats.overall.flatRoi * 100).toFixed(1)}%` : "—"} ROI)</span>
-            </div>
-            {Object.keys(stats.byType).length === 0 ? (
-              <div className="text-sm text-slate-500 py-8 text-center">No settled bets yet. Track bets, then hit “Settle finished” after games end.</div>
-            ) : (
-              <div className="space-y-2">
-                {STAT_ORDER.filter((t) => stats.byType[t]).map((t) => { const s = stats.byType[t]; return (
-                  <div key={t} className="flex items-center gap-3 bg-slate-900/70 border border-slate-800 rounded-xl px-4 py-2.5 text-[12px]" style={mono}>
-                    <div className="flex-1 font-semibold">{t}</div>
-                    <div className="text-slate-400">{s.w}-{s.l}{s.ps ? `-${s.ps}` : ""}</div>
-                    <div className="text-slate-300 w-16 text-right">{s.winPct != null ? pct(s.winPct) : "—"}</div>
-                    <div className={`w-20 text-right font-bold ${s.net >= 0 ? "text-emerald-400" : "text-rose-400"}`}>{s.net >= 0 ? "+" : ""}{s.net.toFixed(2)}u</div>
-                  </div>); })}
-              </div>
-            )}
-            <div className="mt-5 text-[11px] text-slate-600 leading-relaxed">
-              Net/ROI use each bet’s unit stake; the flat-1u line shows what the same bets return at a flat stake, so you can see whether the ¼-Kelly suggestion actually beats flat. Kelly only helps if the model’s edges are real, so trust the comparison over many bets, not a handful. Once there’s a real sample, also compare win% by edge bucket to tune the priors (RECENT_WEIGHT, NB_PHI, shrinkage).
-            </div>
           </div>
         )}
       </div>
