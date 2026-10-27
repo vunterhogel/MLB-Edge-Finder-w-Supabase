@@ -20,7 +20,7 @@ export function liveProbabilityOver(family, seed, params, currentTotal, line) {
 // for football yet, so every category starts at a conservative, uniform "trust the market a lot"
 // weight. Retune per-category from the Stats tab exactly the way MLB did — do NOT hand-tune
 // these from vibes; wait for graded volume.
-export const MODEL_VERSION = "nfl-v3-2026-10-27";   // bump on every model change (part of every board-log id). v3: opponent positional matchups (NFL Matchup Lab)
+export const MODEL_VERSION = "nfl-v3-2026-10-27";   // bump on every model change (part of every board-log id). v3: opponent positional matchups (nflverse weekly stats)
 
 export const CALIB_KEEP = {
   "Pass Yards": 0.45, "Pass TDs": 0.40, "Interceptions": 0.35, "Pass Completions": 0.45, "Pass Attempts": 0.45, "Longest Completion": 0.35,

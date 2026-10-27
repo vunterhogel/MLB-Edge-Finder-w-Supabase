@@ -1,7 +1,7 @@
 /* NFL sport adapter for the shared MLB shell (same shape as the MLB / NBA / NHL adapters).
    The projection model is the old NFL page's engine, moved without changing a number (nfl-v2).
    Everything else (navigation by date, tracking, settlement, stats, persistence) is the MLB shell's. */
-import { loadMatchupSnapshot, matchupInputs } from "./matchups";
+import { loadMatchupData, matchupInputs } from "./matchups";
 import { ALL_PLAYER_PROPS, BOOKS, BOOK_LABELS, CATEGORY_ORDER, DEFAULT_LINE, HOME_FIELD_MULT, LG_PPG, ODDS_SPORT, ODDS_SPORT_PRESEASON, ODDS_TESTING_LIMIT, STADIUMS, SIGNAL_RULES, isLineType, matchesQuery } from "./config";
 import { GAMELOG_ROWS, ESPN_WEB, TREND_PROPS, actualFor, buildGameLineEntries, buildTrendCard, fetchAthleteGamelog, fetchDepthChart, fetchEventOdds, fetchGameSummary, fetchLongCmpForEventTrySeasons, fetchOddsEvents, fetchRoster, fetchScheduleByDate, fetchStandings, fetchTeamStats, fetchWeather, gradeLine, jget, matchCurrentOdds, matchEvent, normName, parseEventOdds, parseGameOdds, searchPlayers, trendValueForGame } from "./data";
 import { MODEL_VERSION, calculateInjuryAvailability, evalBet, gameProbs, projectProp } from "./engine";
@@ -54,11 +54,11 @@ async function loadGameDetail(g, { date }) {
   const year = nflSeasonFor(date);
   const standings = await standingsFor(year);
   const stadium = STADIUMS[g.homeId] || { lat: null, lon: null, dome: true };
-  const [rosterH, rosterA, depthH, depthA, teamStatsH, teamStatsA, matchupSnap] = await Promise.all([
+  const [rosterH, rosterA, depthH, depthA, teamStatsH, teamStatsA, matchupRows] = await Promise.all([
     fetchRoster(g.homeId).catch(() => []), fetchRoster(g.awayId).catch(() => []),
     fetchDepthChart(g.homeId, year).catch(() => ({})), fetchDepthChart(g.awayId, year).catch(() => ({})),
     fetchTeamStats(g.homeId).catch(() => ({ off: {}, def: {} })), fetchTeamStats(g.awayId).catch(() => ({ off: {}, def: {} })),
-    loadMatchupSnapshot(),
+    loadMatchupData(year),
   ]);
   let wx = null;
   if (!stadium.dome && stadium.lat) wx = await fetchWeather(stadium.lat, stadium.lon).catch(() => null);
@@ -92,8 +92,8 @@ async function loadGameDetail(g, { date }) {
     home: { teamId: g.homeId, roster: rosterH, depth: depthH, featured: featH, teamStats: teamStatsH, standings: sH },
     away: { teamId: g.awayId, roster: rosterA, depth: depthA, featured: featA, teamStats: teamStatsA, standings: sA },
     logs, priorLogs, gamelogs, priorGamelogs, lambdaH, lambdaA,
-    // v3: opponent positional matchup multipliers from the NFL Matchup Lab snapshot (null -> v2 inputs)
-    matchups: matchupInputs(matchupSnap, g),
+    // v3: opponent positional matchup multipliers, computed from nflverse weekly stats (null -> v2 inputs)
+    matchups: matchupInputs(matchupRows, g),
   };
 }
 

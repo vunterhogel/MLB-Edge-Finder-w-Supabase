@@ -1,62 +1,108 @@
 /* NFL opponent matchup inputs for the projection model (nfl-v3). Backend only: nothing here renders.
 
-   Source: NFL Matchup Lab's published research snapshot (github.com/vunterhogel/NFL-Matchup-Lab,
-   public/data/snapshot.json). Matchup Lab builds it from public nflverse play-by-play, rosters and
-   schedules and keeps it as its own project; Edge Finder only reads the file. Every snapshot game
-   carries its ESPN event id, which is Edge Finder's game id (g.pk), so a slate game joins exactly.
+   Edge Finder computes these itself from nflverse's public weekly stat files, fetched through its own
+   nfl-stats-proxy Supabase function, because GitHub release downloads can't be read from a browser:
+     stats_team_week_{season}.csv    team passing per game (attempts, completions, yards, TDs, INTs, sacks)
+     stats_player_week_{season}.csv  player per game with position (targets, catches, yards, TDs, carries)
+   nflverse refreshes both during the season, so nothing here needs a manual refresh.
 
-   For a game, each team's opponent is profiled the way Matchup Lab profiles a defense: final games
-   whose kickoff AND completion are before this game's kickoff (Matchup Lab's cutoff rule), with
-   rates built from summed numerators / denominators, never averages of game rates. Each rate is
-   shrunk toward the league rate over the same games, using Matchup Lab's minimum sample for that
-   metric as the prior weight, and returned as a multiplier (opponent rate / league rate).
+   For a game, each team's opponent is profiled from games played in earlier weeks only (no leakage
+   from the game itself or anything after it). Rates are summed numerators over summed denominators,
+   never averages of game rates, and each is shrunk toward the league rate over the same weeks,
+   then returned as a multiplier (opponent rate / league rate). If the files can't be loaded, or the
+   game has no prior weeks (week 1, preseason), every multiplier is null and the engine keeps its
+   v2 inputs for that game. */
+import { SUPABASE_ANON_KEY, SUPABASE_URL } from "../../core/odds";
 
-   Refresh: the snapshot only changes when Matchup Lab's `npm run data:refresh` is run and pushed.
-   If it can't be fetched, or the game isn't in it (postseason, another season), every multiplier
-   is null and the engine keeps its v2 inputs for that game. */
+const PROXY = `${SUPABASE_URL}/functions/v1/nfl-stats-proxy`;
+const NFLVERSE = "https://github.com/nflverse/nflverse-data/releases/download";
+const CACHE_KEY = "nfief_matchupdata_v1";
+const CACHE_TTL_MS = 6 * 3600 * 1000;
+// ESPN abbreviations -> nflverse abbreviations (every other team matches)
+const ESPN_TO_NFLVERSE = { LAR: "LA", WSH: "WAS" };
 
-export const MATCHUP_SNAPSHOT_URL = "https://raw.githubusercontent.com/vunterhogel/NFL-Matchup-Lab/main/public/data/snapshot.json";
+async function fetchCsv(path) {
+  const url = `${PROXY}?url=${encodeURIComponent(`${NFLVERSE}/${path}`)}`;
+  const r = await fetch(url, { headers: { Authorization: `Bearer ${SUPABASE_ANON_KEY}`, apikey: SUPABASE_ANON_KEY } });
+  if (!r.ok) throw new Error(`nflverse ${path}: ${r.status}`);
+  return r.text();
+}
+function parseCsv(text) {
+  // nflverse files have no quoted commas in the columns read here, but handle quotes anyway
+  const lines = text.split(/\r?\n/).filter(Boolean);
+  const split = (line) => {
+    const out = []; let cur = "", q = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') { if (q && line[i + 1] === '"') { cur += '"'; i++; } else q = !q; }
+      else if (ch === "," && !q) { out.push(cur); cur = ""; }
+      else cur += ch;
+    }
+    out.push(cur); return out;
+  };
+  const head = split(lines[0]);
+  return lines.slice(1).map((l) => { const v = split(l); const o = {}; head.forEach((h, i) => { o[h] = v[i]; }); return o; });
+}
+const num = (x) => { const v = +x; return Number.isFinite(v) ? v : 0; };
 
-let snapshotPromise = null;
-export function loadMatchupSnapshot() {
-  if (!snapshotPromise) {
-    snapshotPromise = fetch(MATCHUP_SNAPSHOT_URL, { cache: "no-cache" })
-      .then((r) => (r.ok ? r.json() : null))
-      .then((s) => (s && Array.isArray(s.games) && Array.isArray(s.teamGames) ? indexSnapshot(s) : null))
-      .catch(() => null);
-    // a failed fetch is retried on the next game load instead of being cached for the session
-    snapshotPromise.then((s) => { if (!s) snapshotPromise = null; });
+/* One compact row per team per game: what that team's OFFENSE did. A defense's allowed numbers are
+   the rows whose opponent is that defense. */
+function buildRows(teamCsv, playerCsv) {
+  const rows = new Map();
+  const rowFor = (r) => {
+    const k = `${r.game_id}:${r.team}`;
+    if (!rows.has(k)) rows.set(k, { team: r.team, opp: r.opponent_team, week: num(r.week), s: {} });
+    return rows.get(k);
+  };
+  const add = (s, k, v) => { s[k] = (s[k] || 0) + v; };
+  for (const r of parseCsv(teamCsv)) {
+    const s = rowFor(r).s;
+    add(s, "completions", num(r.completions)); add(s, "attempts", num(r.attempts));
+    add(s, "passingYards", num(r.passing_yards)); add(s, "passTd", num(r.passing_tds));
+    add(s, "interceptions", num(r.passing_interceptions)); add(s, "sacks", num(r.sacks_suffered));
+    add(s, "dropbacks", num(r.attempts) + num(r.sacks_suffered));
   }
-  return snapshotPromise;
+  for (const r of parseCsv(playerCsv)) {
+    const pos = r.position === "FB" ? "RB" : r.position;
+    if (pos !== "RB" && pos !== "WR" && pos !== "TE") continue;
+    const s = rowFor(r).s;
+    const g = pos.toLowerCase();
+    add(s, `${g}Targets`, num(r.targets)); add(s, `${g}Receptions`, num(r.receptions));
+    add(s, `${g}ReceivingYards`, num(r.receiving_yards)); add(s, `${g}RecTd`, num(r.receiving_tds));
+    if (pos === "RB") { add(s, "rbCarries", num(r.carries)); add(s, "rbRushYards", num(r.rushing_yards)); add(s, "rbRushTd", num(r.rushing_tds)); }
+  }
+  return [...rows.values()];
 }
 
-function indexSnapshot(s) {
-  const gameById = new Map(s.games.map((g) => [g.id, g]));
-  const gameByEspn = new Map(s.games.filter((g) => g.espnId).map((g) => [String(g.espnId), g]));
-  const posById = new Map((s.players || []).map((p) => [p.id, p.position === "FB" ? "RB" : p.position]));
-  // player TDs folded into team-game rows (the team rows carry no TD fields)
-  const tdByTeamGame = new Map();
-  for (const pg of s.playerGames || []) {
-    const pos = posById.get(pg.playerId);
-    const k = `${pg.gameId}:${pg.teamId}`;
-    const t = tdByTeamGame.get(k) || { passTd: 0, rbRushTd: 0, rbRecTd: 0, wrRecTd: 0, teRecTd: 0 };
-    const st = pg.stats || {};
-    t.passTd += st.passingTouchdowns || 0;
-    if (pos === "RB") { t.rbRushTd += st.rushingTouchdowns || 0; t.rbRecTd += st.receivingTouchdowns || 0; }
-    if (pos === "WR") t.wrRecTd += st.receivingTouchdowns || 0;
-    if (pos === "TE") t.teRecTd += st.receivingTouchdowns || 0;
-    tdByTeamGame.set(k, t);
+const loaded = new Map(); // season -> Promise<rows|null>
+export function loadMatchupData(season) {
+  if (!season) return Promise.resolve(null);
+  if (!loaded.has(season)) {
+    const p = (async () => {
+      try {
+        const c = JSON.parse(localStorage.getItem(CACHE_KEY) || "null");
+        if (c && c.season === season && Date.now() - c.at < CACHE_TTL_MS && Array.isArray(c.rows)) return c.rows;
+      } catch { /* storage unavailable */ }
+      const [teamCsv, playerCsv] = await Promise.all([
+        fetchCsv(`stats_team/stats_team_week_${season}.csv`),
+        fetchCsv(`stats_player/stats_player_week_${season}.csv`),
+      ]);
+      const rows = buildRows(teamCsv, playerCsv);
+      try { localStorage.setItem(CACHE_KEY, JSON.stringify({ season, at: Date.now(), rows })); } catch { /* storage full/unavailable */ }
+      return rows;
+    })().catch(() => null);
+    loaded.set(season, p);
+    p.then((rows) => { if (!rows) loaded.delete(season); }); // a failed load retries on the next game
   }
-  const rows = s.teamGames.map((r) => ({ ...r, stats: { ...r.stats, ...(tdByTeamGame.get(`${r.gameId}:${r.teamId}`) || {}) } }));
-  return { meta: s.meta, gameById, gameByEspn, rows, asOf: Date.parse(s.meta && s.meta.asOf) };
+  return loaded.get(season);
 }
 
-// rate = numerator / denominator; k = prior weight toward the league rate, in the denominator's units.
-// Efficiency rates use Matchup Lab's minimum sample for the matching metric. TD and INT rates are
-// rare events (Matchup Lab doesn't measure them), so they get a much heavier prior: a few plays
-// can't swing them far. These are starting values; calibration from graded bets decides from here.
+// rate = numerator / denominator; k = prior weight toward the league rate, in the denominator's
+// units. Efficiency rates use the minimum sample at which each rate is usable (40 to 60
+// opportunities for most). TD and INT rates are rare events, so they get a much heavier prior: a few
+// plays can't swing them far. Starting values; calibration from graded bets decides from here.
 const RATES = {
-  // what a DEFENSE allowed (summed over the opposing offenses' rows)
+  // what a DEFENSE allowed (summed over the offenses that faced it)
   compPct: ["completions", "attempts", 60],
   ypCmp: ["passingYards", "completions", 40],
   passTdRate: ["passTd", "attempts", 200],
@@ -81,53 +127,46 @@ const OFF_KEYS = ["sackRate", "offIntRate"];
 
 const sum = (rows) => {
   const t = {};
-  for (const r of rows) for (const [k, v] of Object.entries(r.stats)) if (Number.isFinite(v)) t[k] = (t[k] || 0) + v;
+  for (const r of rows) for (const [k, v] of Object.entries(r.s)) t[k] = (t[k] || 0) + v;
   return t;
 };
 function multipliers(own, league, keys) {
   const out = {};
   for (const key of keys) {
-    const [num, den, k] = RATES[key];
-    const lgDen = league[den] || 0;
-    if (!lgDen) { out[key] = null; continue; }
-    const lg = (league[num] || 0) / lgDen;
+    const [n, d, k] = RATES[key];
+    const lg = league[d] ? (league[n] || 0) / league[d] : 0;
     if (!lg) { out[key] = null; continue; }
-    const shrunk = ((own[num] || 0) + k * lg) / ((own[den] || 0) + k);
-    out[key] = shrunk / lg;
-    out[`${key}N`] = own[den] || 0; // exposure behind the number
+    out[key] = (((own[n] || 0) + k * lg) / ((own[d] || 0) + k)) / lg;
+    out[`${key}N`] = own[d] || 0; // exposure behind the number
   }
   return out;
+}
+
+// the game's place in nflverse week numbering: REG weeks 1-18, then POST 19 (wild card),
+// 20 (divisional), 21 (conference), 22 (Super Bowl). ESPN numbers postseason weeks 1-5 (4 = Pro Bowl).
+function nflverseWeek(g) {
+  if (g.seasonType === 2) return g.week || null;
+  if (g.seasonType === 3) return g.week ? 18 + (g.week >= 5 ? 4 : g.week) : null;
+  return null; // preseason: no matchup adjustment
 }
 
 /* For one Edge Finder game: { home: { def, off }, away: { def, off }, meta }.
    home.def = how the AWAY team's defense treats the home offense (multipliers for home players);
    home.off = how the AWAY team's offense protects / turns it over (for the home DST). */
-export function matchupInputs(snap, g) {
-  if (!snap || !g) return null;
-  const game = snap.gameByEspn.get(String(g.pk));
-  if (!game) return null;
-  const kickoff = Date.parse(game.kickoff);
-  const cutoff = Math.min(Number.isFinite(kickoff) ? kickoff : Date.now(), snap.asOf || Infinity);
-  const usable = (sg) => {
-    if (sg.status !== "final") return false;
-    const ko = Date.parse(sg.kickoff);
-    const done = Date.parse(sg.completedAt || new Date(ko + 6 * 3600000).toISOString());
-    return ko < cutoff && done < cutoff;
+export function matchupInputs(rows, g) {
+  if (!rows || !g) return null;
+  const wk = nflverseWeek(g);
+  if (!wk) return null;
+  const prior = rows.filter((r) => r.week < wk);
+  if (!prior.length) return null;
+  const league = sum(prior);
+  const homeId = ESPN_TO_NFLVERSE[g.home] || g.home, awayId = ESPN_TO_NFLVERSE[g.away] || g.away;
+  const side = (oppId) => {
+    const vs = prior.filter((r) => r.opp === oppId), own = prior.filter((r) => r.team === oppId);
+    return { oppId, oppGames: own.length, def: multipliers(sum(vs), league, DEF_KEYS), off: multipliers(sum(own), league, OFF_KEYS) };
   };
-  const rows = snap.rows.filter((r) => { const sg = snap.gameById.get(r.gameId); return sg && usable(sg); });
-  const league = sum(rows);
-  const games = new Set(rows.map((r) => r.gameId));
-  if (!games.size) return null;
-  const vsDefense = (teamId) => sum(rows.filter((r) => r.opponentId === teamId)); // offenses that faced this defense
-  const ofOffense = (teamId) => sum(rows.filter((r) => r.teamId === teamId));
-  const gamesFor = (teamId) => rows.filter((r) => r.teamId === teamId).length;
-  const side = (oppId) => ({
-    oppId, oppGames: gamesFor(oppId),
-    def: multipliers(vsDefense(oppId), league, DEF_KEYS),
-    off: multipliers(ofOffense(oppId), league, OFF_KEYS),
-  });
   return {
-    home: side(game.awayTeam), away: side(game.homeTeam),
-    meta: { source: "NFL Matchup Lab", asOf: snap.meta && snap.meta.asOf, latestWeek: snap.meta && snap.meta.latestWeek, games: games.size, cutoff: new Date(cutoff).toISOString() },
+    home: side(awayId), away: side(homeId),
+    meta: { source: "nflverse weekly stats", throughWeek: wk - 1, teamGames: prior.length },
   };
 }
