@@ -5,6 +5,8 @@ import { BoardRow, MyBetRow, TrendCard } from "./cards";
 import { makeDeltaSignal } from "./signals";
 import { Chip, GameDetail, GameSubtitle, ScoreLine } from "./slate";
 import { PlayerAnalysis, PlayerAnalysisIntro } from "./analysis";
+import { useBets } from "./betStore";
+import { betFacets, betFiltersActive as anyBetFilters, betStats, betsBackupJson, betsCsv, downloadText, fetchOpenBetResults, filterSortBets, gradeOpenBets, mergeRestored, newFromBackup, parseBetsBackup, refreshBetLines } from "./bets";
 
 
 /* SportApp: the shared Edge Finder shell (Slate / Board / Trends / Player Analysis / My Bets / Stats).
@@ -123,7 +125,9 @@ export default function SportApp({ sport, tab: routeTab = null, onTabChange = nu
   const [stakeMode, setStakeMode] = useState("flat");      // flat | kelly (default for NEW tracked bets)
   const [statsStartDate, setStatsStartDate] = useState("");  // YYYY-MM-DD, inclusive
   const [statsEndDate, setStatsEndDate] = useState("");      // YYYY-MM-DD, inclusive
-  const [myBets, setMyBets] = useState(loadBets());
+  // tracked bets live in the shared per-sport store (core/betStore.ts), so the hub and this page
+  // edit the same list; the store saves every change and writes settled results into the board log
+  const [myBets, setMyBets] = useBets(sport);
   const [draft, setDraft] = useState(null);
   const [showManual, setShowManual] = useState(false);
   const [settleMsg, setSettleMsg] = useState("");
@@ -132,10 +136,6 @@ export default function SportApp({ sport, tab: routeTab = null, onTabChange = nu
   const eventsRef = useRef({ date: null, events: null });
   const inflight = useRef(new Set());
 
-  useEffect(() => { saveBets(myBets); }, [myBets]);
-  // When myBets changes and any bets have settled, write results back into the board log
-  // so ALL board candidates (not just tracked bets) get graded via settleBoardLog.
-  useEffect(() => { void settleBoardLog(myBets); }, [myBets]);
   // Clear game multi-select when date changes — previously selected games may belong to a different date.
   useEffect(() => { setBetGameFilters([]); }, [betDateFilter]);
   // Board log persists in IndexedDB and loads async — sync the count once ready.
@@ -485,28 +485,11 @@ export default function SportApp({ sport, tab: routeTab = null, onTabChange = nu
   }
 
   async function settleBets() {
-    const openByGame = {};
-    for (const b of myBets) if (b.status === "open") (openByGame[b.gamePk] = openByGame[b.gamePk] || []).push(b);
-    const pks = Object.keys(openByGame);
-    if (!pks.length) { setSettleMsg("No open bets to settle."); return; }
+    if (!myBets.some((b) => b.status === "open")) { setSettleMsg("No open bets to settle."); return; }
     setSettleMsg("Settling…");
-    const results = {};
-    for (const pk of pks) { results[pk] = await fetchGameResult(pk); }
-    if (sport.augmentResults) await sport.augmentResults(myBets.filter((b) => b.status === "open"), results);
+    const { results } = await fetchOpenBetResults(sport, myBets);
     let graded = 0;
-    setMyBets((prev) => prev.map((b) => {
-      if (b.status !== "open") return b;
-      const res = results[b.gamePk];
-      if (res && res.canceled) { graded++; return { ...b, status: "void", actual: "CANCELED" }; }   // postponed / canceled game: no action
-      if (!res || !res.final) return b;
-      if (isLineType(b.type)) {
-        const { status, actual } = sport.gradeLineResult(b.type, b.side, parseFloat(b.line), res);
-        if (!status) return b; graded++; return { ...b, status, actual };
-      }
-      const r = sport.gradeTrackedProp(b, res);
-      if (r == null) return b;
-      graded++; return { ...b, status: r.status, actual: r.actual };
-    }));
+    setMyBets((prev) => { const r = gradeOpenBets(sport, prev, results); graded = r.graded; return r.next; });
     setSettleMsg(`Settled ${graded} bet(s). Unsettled games are still in progress.`);
   }
 
@@ -574,38 +557,14 @@ export default function SportApp({ sport, tab: routeTab = null, onTabChange = nu
   async function refreshLines() {
     const open = myBets.filter((b) => b.status === "open" && b.book && b.book !== "manual");
     if (!open.length) { setLineMsg("No open tracked bets with a book to refresh (manual bets have no book to pull)."); return; }
-    const byGame = {};
-    for (const b of open) { (byGame[b.gamePk] = byGame[b.gamePk] || []).push(b); }
     setRefreshingLines(true); setLineMsg("Refreshing lines…");
     try {
-      let events = eventsRef.current && eventsRef.current.events;
-      if (!events) { const ev = await fetchOddsEvents(); events = ev.events || []; eventsRef.current = { date, events }; if (ev.remaining != null) setCredits(ev.remaining); }
-      const updates = {}; let matched = 0, missed = 0, games_ = 0, frozen = 0;
-      const at = new Date().toISOString();
-      for (const pkStr in byGame) {
-        const bets = byGame[pkStr];
-        const g = games.find((x) => String(x.pk) === pkStr);
-        const ev = g ? matchEvent(events, g) : null;
-        if (!ev) { for (const b of bets) { updates[b.key] = { oddsCheckedAt: at, currentOdds: null, lineMissing: true }; missed++; } continue; }
-        // has first pitch passed? prefer the book's commence_time; fall back to slate status
-        const started = ev.commence_time ? (Date.parse(ev.commence_time) <= Date.now()) : (g && (g.status === "LIVE" || g.status === "FINAL"));
-        // pregame bets freeze at the closing line once the game starts (live re-prices aren't comparable). live bets keep updating.
-        for (const b of bets) { if (!b.live && started && b.currentOdds != null && !b.closing) { updates[b.key] = { closing: true, oddsCheckedAt: at }; frozen++; } }
-        const toPull = bets.filter((b) => b.live || !started);
-        if (!toPull.length) continue; // nothing to fetch for this game (all pregame bets are frozen) -> saves credits
-        // ONE fetch per game covering every book we track on it. Up to 10 books = 1 region cost, so this halves credits vs per-book calls.
-        const books = [...new Set(toPull.map((b) => b.book))];
-        const res = await fetchEventOdds(ev.id, books.join(",")); games_++;
-        if (res.remaining != null) setCredits(res.remaining);
-        const parsed = {};
-        for (const bk of books) parsed[bk] = { rows: parseEventOdds(res.data, bk), gl: parseGameOdds(res.data, bk, g) };
-        for (const b of toPull) {
-          const p = parsed[b.book];
-          const cur = p ? matchCurrentOdds(b, p.rows, p.gl) : null;
-          if (cur != null) { updates[b.key] = { currentOdds: cur, oddsCheckedAt: at, lineMissing: false, closing: false }; matched++; }
-          else { updates[b.key] = { oddsCheckedAt: at, currentOdds: null, lineMissing: true }; missed++; }
-        }
-      }
+      const getEvents = async () => {
+        let events = eventsRef.current && eventsRef.current.events;
+        if (!events) { const ev = await fetchOddsEvents(); events = ev.events || []; eventsRef.current = { date, events }; if (ev.remaining != null) setCredits(ev.remaining); }
+        return events;
+      };
+      const { updates, matched, missed, games: games_, frozen } = await refreshBetLines(sport, open, { getEvents, findGame: (pk) => games.find((x) => String(x.pk) === pk), onCredits: setCredits });
       setMyBets((prev) => prev.map((b) => updates[b.key] ? { ...b, ...updates[b.key] } : b));
       setLineMsg(`Updated ${matched} line(s) across ${games_} game(s)${frozen ? ` · ${frozen} frozen at close (game started)` : ""}${missed ? ` · ${missed} not found (scratched, settled, or line moved off your number)` : ""}.`);
     } catch (e) { setLineMsg(`Line refresh failed: ${String((e && e.message) || e)}`); }
@@ -628,139 +587,22 @@ export default function SportApp({ sport, tab: routeTab = null, onTabChange = nu
   }
 
   /* live recompute of My Bets EV (odds editable) */
-  const myBetsView = useMemo(() => {
-    let arr = myBets.map((b, i) => {
-      const odds = Number(b.odds);
-      const modelP = b.modelP, imp = isNaN(odds) ? null : impliedProb(odds);
-      const fairRef = b.novig != null ? b.novig : imp;
-      const edge = (modelP != null && fairRef != null) ? modelP - fairRef : null;
-      const ev = (modelP != null && !isNaN(odds)) ? evPerUnit(modelP, odds) : null;
-      const units = b.units != null ? b.units : 1;        // back-compat for older bets
-      const suggested = b.suggested != null ? b.suggested : suggestedUnits(modelP, odds);
-      // CLV: positive = market moved toward your side since you bet (your side's price shortened) = you beat the line
-      const clv = (b.currentOdds != null && !isNaN(odds)) ? impliedProb(b.currentOdds) - impliedProb(odds) : null;
-      return { ...b, imp, edge, ev, units, suggested, clv, _i: i };
-    });
-    if (betStatusFilter === "settled") arr = arr.filter((b) => b.status !== "open");
-    else if (betStatusFilter !== "all") arr = arr.filter((b) => b.status === betStatusFilter);
-    if (betDateFilter !== "all") arr = arr.filter((b) => b.date === betDateFilter);
-    if (betGameFilters.length) arr = arr.filter((b) => betGameFilters.includes(b.game));
-    if (betTypeFilters.length) arr = arr.filter((b) => betTypeFilters.includes(b.type));
-    if (betBookFilters.length) arr = arr.filter((b) => betBookFilters.includes(b.book));
-    if (betSideFilter !== "all") arr = arr.filter((b) => b.side === betSideFilter);
-    if (betSearch.trim()) arr = arr.filter((b) => matchesQuery(b, betSearch));
-    const bmM = parseFloat(betMinModel);
-    if (!isNaN(bmM)) arr = arr.filter((b) => b.modelP != null && b.modelP * 100 >= bmM);
-    const bmE = parseFloat(betMinEdge);
-    if (!isNaN(bmE)) arr = arr.filter((b) => b.edge != null && b.edge * 100 >= bmE);
-    const bxE = parseFloat(betMaxEdge);
-    if (!isNaN(bxE)) arr = arr.filter((b) => b.edge != null && b.edge * 100 <= bxE);
-    const minOB = betMinOdds === "" || isNaN(Number(betMinOdds)) ? null : amToB(Number(betMinOdds));
-    const maxOB = betMaxOdds === "" || isNaN(Number(betMaxOdds)) ? null : amToB(Number(betMaxOdds));
-    if (minOB != null || maxOB != null) arr = arr.filter((b) => { const bb = amToB(Number(b.odds)); if (isNaN(bb)) return false; if (minOB != null && bb < minOB) return false; if (maxOB != null && bb > maxOB) return false; return true; });
-    const getBetDelta = (b) => (b.proj ?? 0) - parseFloat(b.line ?? 0);
-    const bmD = parseFloat(betMinDelta);
-    const bxD = parseFloat(betMaxDelta);
-    if (!isNaN(bmD)) arr = arr.filter((b) => getBetDelta(b) >= bmD);
-    if (!isNaN(bxD)) arr = arr.filter((b) => getBetDelta(b) <= bxD);
-    if (betDirAligned) arr = arr.filter((b) => { const d = getBetDelta(b); return b.side === "over" ? d > 0 : d < 0; });
-    const cmp = {
-      recent: (a, b) => a._i - b._i,
-      game: (a, b) => String(a.game || "").localeCompare(String(b.game || "")) || a._i - b._i,
-      model_desc: (a, b) => (b.modelP ?? -9) - (a.modelP ?? -9), model_asc: (a, b) => (a.modelP ?? 9) - (b.modelP ?? 9),
-      ev_desc: (a, b) => (b.ev ?? -9) - (a.ev ?? -9), ev_asc: (a, b) => (a.ev ?? 9) - (b.ev ?? 9),
-      edge_desc: (a, b) => (b.edge ?? -9) - (a.edge ?? -9), edge_asc: (a, b) => (a.edge ?? 9) - (b.edge ?? 9),
-      clv_desc: (a, b) => (b.clv ?? -9) - (a.clv ?? -9), clv_asc: (a, b) => (a.clv ?? 9) - (b.clv ?? 9),
-      delta_desc: (a, b) => getBetDelta(b) - getBetDelta(a), delta_asc: (a, b) => getBetDelta(a) - getBetDelta(b),
-    }[betSort] || ((a, b) => a._i - b._i);
-    return arr.sort(cmp);
-  }, [myBets, betStatusFilter, betSort, betDateFilter, betGameFilters, betTypeFilters, betBookFilters, betSideFilter, betMinModel, betMinEdge, betMaxEdge, betMinOdds, betMaxOdds, betMinDelta, betMaxDelta, betDirAligned, betSearch]);
-  const betDates = useMemo(() => [...new Set(myBets.map((b) => b.date).filter(Boolean))].sort().reverse(), [myBets]);
-  // Scope game list to the selected date so TEX@LAA from 8/9 doesn't appear when filtering to 8/11.
-  const betGames = useMemo(() => {
-    const base = betDateFilter !== "all" ? myBets.filter((b) => b.date === betDateFilter) : myBets;
-    return [...new Set(base.map((b) => b.game).filter(Boolean))].sort();
-  }, [myBets, betDateFilter]);
-  const betTypes = useMemo(() => [...new Set(myBets.map((b) => b.type).filter(Boolean))].sort(), [myBets]);
-  const betBooks = useMemo(() => [...new Set(myBets.map((b) => b.book).filter(Boolean))].sort(), [myBets]);
-  const betSides = useMemo(() => [...new Set(myBets.map((b) => b.side).filter(Boolean))].sort(), [myBets]);
+  const betFilterSet = { status: betStatusFilter, sort: betSort, date: betDateFilter, games: betGameFilters, types: betTypeFilters, books: betBookFilters, side: betSideFilter, minModel: betMinModel, minEdge: betMinEdge, maxEdge: betMaxEdge, minOdds: betMinOdds, maxOdds: betMaxOdds, minDelta: betMinDelta, maxDelta: betMaxDelta, dirAligned: betDirAligned, search: betSearch };
+  const myBetsView = useMemo(() => filterSortBets(myBets, betFilterSet, matchesQuery),
+    [myBets, betStatusFilter, betSort, betDateFilter, betGameFilters, betTypeFilters, betBookFilters, betSideFilter, betMinModel, betMinEdge, betMaxEdge, betMinOdds, betMaxOdds, betMinDelta, betMaxDelta, betDirAligned, betSearch]);
+  const betFacetLists = useMemo(() => betFacets(myBets, betDateFilter), [myBets, betDateFilter]);
+  const { dates: betDates, games: betGames, types: betTypes, books: betBooks, sides: betSides } = betFacetLists;
   const trackedByGame = useMemo(() => { const m = {}; for (const b of myBets) if (b.status === "open") m[b.gamePk] = (m[b.gamePk] || 0) + 1; return m; }, [myBets]);
-  const betFiltersActive = betStatusFilter !== "all" || betGameFilters.length > 0 || betTypeFilters.length > 0 || betBookFilters.length > 0 || betSideFilter !== "all" || betDateFilter !== "all" || betMinModel !== "" || betMinEdge !== "" || betMaxEdge !== "" || betMinOdds !== "" || betMaxOdds !== "" || betMinDelta !== "" || betMaxDelta !== "" || betDirAligned || betSearch !== "";
+  const betFiltersActive = anyBetFilters(betFilterSet);
   function clearBetFilters() { setBetStatusFilter("all"); setBetGameFilters([]); setBetTypeFilters([]); setBetBookFilters([]); setBetSideFilter("all"); setBetDateFilter("all"); setBetMinModel(""); setBetMinEdge(""); setBetMaxEdge(""); setBetMinOdds(""); setBetMaxOdds(""); setBetMinDelta(""); setBetMaxDelta(""); setBetDirAligned(false); setBetSearch(""); }
 
   const statsDates = useMemo(() => [...new Set(myBets.map((b) => b.date).filter(Boolean))].sort(), [myBets]);
-  const stats = useMemo(() => {
-    let settled = myBets.filter((b) => b.status === "won" || b.status === "lost" || b.status === "push" || b.status === "void");
-    if (statsStartDate) settled = settled.filter((b) => b.date && b.date >= statsStartDate);
-    if (statsEndDate) settled = settled.filter((b) => b.date && b.date <= statsEndDate);
-    const unitsOf = (b) => (b.units != null && !isNaN(b.units) ? Number(b.units) : 1);
-    const agg = (arr) => {
-      const w = arr.filter((b) => b.status === "won").length, l = arr.filter((b) => b.status === "lost").length, ps = arr.filter((b) => b.status === "push").length, v = arr.filter((b) => b.status === "void").length;
-      // stake-weighted (uses each bet's units). push + void are no-action: 0 profit, not staked.
-      const net = arr.reduce((s, b) => s + profitUnits(b.status, Number(b.odds), unitsOf(b)), 0);
-      const staked = arr.filter((b) => b.status !== "push" && b.status !== "void").reduce((s, b) => s + unitsOf(b), 0);
-      // flat 1u baseline (for comparison)
-      const flatNet = arr.reduce((s, b) => s + profitUnits(b.status, Number(b.odds), 1), 0);
-      const flatRisked = w + l;
-      return {
-        n: arr.length, w, l, ps, v, winPct: flatRisked ? w / flatRisked : null,
-        net, staked, roi: staked ? net / staked : null,
-        flatNet, flatRoi: flatRisked ? flatNet / flatRisked : null,
-      };
-    };
-    const byType = {}; for (const t of STAT_ORDER) { const a = settled.filter((b) => b.type === t); if (a.length) byType[t] = agg(a); }
-    return { overall: agg(settled), byType, openCount: myBets.filter((b) => b.status === "open").length };
-  }, [myBets, statsStartDate, statsEndDate]);
+  const stats = useMemo(() => betStats(myBets, { start: statsStartDate, end: statsEndDate }, STAT_ORDER), [myBets, statsStartDate, statsEndDate]);
 
   /* ---------- CSV export (bets + stats summary) ---------- */
   function exportCSV() {
-    const esc = (v) => { if (v == null) return ""; const s = String(v); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
-    const pctOr = (x) => (x == null ? "" : (x * 100).toFixed(1));
-    const o = stats.overall;
-    const lines = [];
-    lines.push("SUMMARY");
-    lines.push(["metric", "value"].join(","));
-    lines.push(["settled", o.n].join(","));
-    lines.push(["record", `${o.w}-${o.l}${o.ps ? `-${o.ps}` : ""}`].join(","));
-    lines.push(["win_pct", o.winPct != null ? (o.winPct * 100).toFixed(1) + "%" : ""].join(","));
-    lines.push(["net_units_staked", o.net.toFixed(2)].join(","));
-    lines.push(["roi_staked_pct", o.roi != null ? (o.roi * 100).toFixed(1) + "%" : ""].join(","));
-    lines.push(["net_units_flat1u", o.flatNet.toFixed(2)].join(","));
-    lines.push(["roi_flat1u_pct", o.flatRoi != null ? (o.flatRoi * 100).toFixed(1) + "%" : ""].join(","));
-    lines.push(["open", stats.openCount].join(","));
-    lines.push("");
-    lines.push("BY TYPE");
-    lines.push(["type", "won", "lost", "push", "win_pct", "net_staked", "net_flat1u"].join(","));
-    for (const t of STAT_ORDER) { const s = stats.byType[t]; if (!s) continue; lines.push([esc(t), s.w, s.l, s.ps, s.winPct != null ? (s.winPct * 100).toFixed(1) : "", s.net.toFixed(2), s.flatNet.toFixed(2)].join(",")); }
-    lines.push("");
-    lines.push("BETS");
-    lines.push(["date", "game", "name", "type", "line", "side", "odds", "book", "model_pct", "proj", "novig_pct", "edge_pct", "ev_pct", "units", "suggested", "status", "actual", "profit_units", "current_odds", "clv_pts"].join(","));
-    // export EVERY tracked bet (open + settled), independent of the My Bets view filters
-    const allBets = [...myBets].sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")));
-    for (const b of allBets) {
-      const odds = Number(b.odds);
-      const imp = isNaN(odds) ? null : impliedProb(odds);
-      const fairRef = b.novig != null ? b.novig : imp;
-      const edge = (b.modelP != null && fairRef != null) ? b.modelP - fairRef : null;
-      const ev = (b.modelP != null && !isNaN(odds)) ? evPerUnit(b.modelP, odds) : null;
-      const units = b.units != null ? b.units : 1;
-      const profit = (b.status === "won" || b.status === "lost") ? profitUnits(b.status, odds, units).toFixed(2) : "";
-      const clv = (b.currentOdds != null && !isNaN(odds)) ? ((impliedProb(b.currentOdds) - impliedProb(odds)) * 100).toFixed(1) : "";
-      lines.push([
-        esc(b.date), esc(b.game), esc(b.name), esc(b.type), esc(b.line), esc(b.side), esc(b.odds), esc(b.book),
-        b.modelP != null ? (b.modelP * 100).toFixed(1) : "", b.proj != null ? Number(b.proj).toFixed(2) : "",
-        b.novig != null ? (b.novig * 100).toFixed(1) : "", pctOr(edge), pctOr(ev),
-        units, b.suggested != null ? b.suggested : "", esc(b.status), esc(b.actual), profit,
-        b.currentOdds != null ? b.currentOdds : "", clv,
-      ].join(","));
-    }
-    const blob = new Blob([lines.join("\n")], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
     const stamp = new Date().toISOString().slice(0, 10);
-    a.href = url; a.download = `${meta.csvPrefix}-${stamp}.csv`;
-    document.body.appendChild(a); a.click(); document.body.removeChild(a);
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    downloadText(betsCsv(myBets, stats, STAT_ORDER), `${meta.csvPrefix}-${stamp}.csv`, "text/csv;charset=utf-8;");
   }
   // Board log CSV export — every candidate ever shown on the board (not just tracked bets).
   // This is the primary calibration dataset: modelVersion, rawModelP, calibratedP, novig, edge,
@@ -800,25 +642,17 @@ export default function SportApp({ sport, tab: routeTab = null, onTabChange = nu
 
   // lossless backup of the bet log so it survives a host/browser change (localStorage does not)
   function backupBets() {
-    const data = JSON.stringify({ app: meta.backupApp, v: 1, exported: new Date().toISOString(), bets: myBets }, null, 2);
-    const blob = new Blob([data], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url; a.download = `${meta.csvPrefix}-bets-${new Date().toISOString().slice(0, 10)}.json`;
-    document.body.appendChild(a); a.click(); document.body.removeChild(a);
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    downloadText(betsBackupJson(myBets, meta.backupApp), `${meta.csvPrefix}-bets-${new Date().toISOString().slice(0, 10)}.json`, "application/json");
   }
   function restoreBets(file) {
     if (!file) return;
     const reader = new FileReader();
     reader.onload = () => {
       try {
-        const parsed = JSON.parse(reader.result);
-        const incoming = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.bets) ? parsed.bets : null);
+        const incoming = parseBetsBackup(reader.result);
         if (!incoming) { setSettleMsg("Restore failed: not a valid bet backup file."); return; }
-        const have = new Set(myBets.map((b) => b.key));
-        const toAdd = incoming.filter((b) => b && b.key != null && !have.has(b.key));
-        setMyBets((cur) => { const k = new Set(cur.map((b) => b.key)); return [...cur, ...toAdd.filter((b) => !k.has(b.key))]; });
+        const toAdd = newFromBackup(myBets, incoming);
+        setMyBets((cur) => mergeRestored(cur, toAdd));
         setSettleMsg(`Restored ${toAdd.length} bet(s) from backup (${incoming.length} in file; duplicates skipped).`);
       } catch { setSettleMsg("Restore failed: could not parse the JSON file."); }
     };
