@@ -75,6 +75,9 @@ export function playerCtx(d, g, side, p, logOverride = null) {
     touchShare: p.pos === "RB" ? (p.depthRank === 1 ? 0.55 : 0.25) : undefined,
     touchShareMult: 1, goalLineShareMult: p.depthRank === 1 ? 1.15 : 0.7, redZoneShareMult: 1,
     shortWeek: !!g.shortWeek, crossCountryTravel: !!g.crossCountryTravel, onBye: false,
+    // v3: this team's matchup vs the opponent (matchups.ts). mx.def = what the opposing defense allows
+    // per opportunity by position; mx.off = the opposing offense's sack / INT rates (DST). null -> v2.
+    mx: d && d.matchups ? d.matchups[side] : null,
   };
 }
 

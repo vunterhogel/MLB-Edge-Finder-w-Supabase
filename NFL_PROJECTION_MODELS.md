@@ -172,6 +172,22 @@ Each ported 1:1 in spirit from an MLB function, NFL-flavored:
 - `calculateRestTravelAdjustment`: small, well-documented mult for short weeks (Thursday night off a Sunday game) and cross-country travel — MLB has no analog (every game is daily-cadence), this is purely additive for NFL.
 - `calculateRecentFormAdjustment`: L4-game blend, same shrinkage math as MLB's L15 (`blendRate`, `MIN_L15_AB`-style gate — rename to `MIN_L4_SNAPS`), just a shorter window because the season is shorter.
 
+### v3 (nfl-v3-2026-10-27): opponent positional matchups from NFL Matchup Lab
+
+Backend only; nothing on the page changes. Code: `src/sports/nfl/matchups.ts`, wired through `loadGameDetail` (`d.matchups`), `playerCtx` (`ctx.mx`) and the projectors in `engine.ts`.
+
+- **Source.** NFL Matchup Lab's published snapshot (`public/data/snapshot.json` in vunterhogel/NFL-Matchup-Lab), built by that project from public nflverse play-by-play, rosters and schedules. Edge Finder reads the file and never writes to it. Each snapshot game has its ESPN event id, so it joins Edge Finder's games (`g.pk`) exactly.
+- **Freshness.** The snapshot only updates when Matchup Lab's `npm run data:refresh -- --season YYYY` is run and pushed, so refresh it weekly after the Monday game.
+- **Sample.** For each game, the opponent is profiled on final games whose kickoff and completion are before this game's kickoff (Matchup Lab's cutoff rule), capped at the snapshot's `asOf`. Rates are summed numerators over summed denominators.
+- **Shrinkage.** Each rate is shrunk toward the league rate over the same games: `(num + k·lg) / (den + k)`. `k` is Matchup Lab's minimum sample for efficiency rates; TD and INT rates use a heavier prior (120 to 250 opportunities) because they are rare events. Each result is a multiplier, opponent rate / league rate, clamped in the engine.
+- **QB:** completion % allowed × yards per completion allowed (together, yards per attempt allowed, applied once; v2 applied its factor to completions and again to yards), pass TDs per attempt, INTs per attempt.
+- **RB:** yards and TDs per RB carry allowed, catch rate, yards and TDs per RB target allowed.
+- **WR / TE:** catch rate, yards per target and TDs per target allowed to that position group specifically (v2 used the team-wide pass yards allowed per game for every position, and never adjusted receptions).
+- **DST:** the opposing offense's sacks per dropback and INTs per attempt.
+- **Fallback.** If the snapshot can't load, or the game isn't in it (postseason, a different season), every multiplier is null and that game uses its v2 inputs.
+- **Volume.** Pass and rush volume is unchanged: game script and implied team points still drive it.
+- **Calibration.** It starts fresh under the v3 model version, the same way as MLB (no backtest against v2 rows).
+
 ## 5. Calibration & pricing (reused verbatim from MLB — sport-agnostic)
 
 `impliedProb`, `probToAmerican`, `evPerUnit`, `noVigProb`, `calibrateToMarket`,

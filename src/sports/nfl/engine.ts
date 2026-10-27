@@ -20,7 +20,7 @@ export function liveProbabilityOver(family, seed, params, currentTotal, line) {
 // for football yet, so every category starts at a conservative, uniform "trust the market a lot"
 // weight. Retune per-category from the Stats tab exactly the way MLB did — do NOT hand-tune
 // these from vibes; wait for graded volume.
-export const MODEL_VERSION = "nfl-v2-2026-10-18";   // bump on every model change (part of every board-log id)
+export const MODEL_VERSION = "nfl-v3-2026-10-27";   // bump on every model change (part of every board-log id). v3: opponent positional matchups (NFL Matchup Lab)
 
 export const CALIB_KEEP = {
   "Pass Yards": 0.45, "Pass TDs": 0.40, "Interceptions": 0.35, "Pass Completions": 0.45, "Pass Attempts": 0.45, "Longest Completion": 0.35,
@@ -198,6 +198,12 @@ export function calculateOppDefenseAdjustment(oppAllowedRate, leagueAvgRate, lo 
   if (!oppAllowedRate || !leagueAvgRate) return 1;
   return clamp(oppAllowedRate / leagueAvgRate, lo, hi);
 }
+// v3: a matchup multiplier from ctx.mx (matchups.ts: opponent rate per opportunity / league rate,
+// already shrunk by sample), clamped. null when this game has no matchup data -> caller keeps v2.
+export function mxMult(ctx, group, key, lo = 0.80, hi = 1.25) {
+  const v = ctx && ctx.mx && ctx.mx[group] ? ctx.mx[group][key] : null;
+  return v == null || !Number.isFinite(v) ? null : clamp(v, lo, hi);
+}
 
 // -------- injury adjustment (doc §4, NEW vs MLB) --------
 // status: "OUT" | "DOUBTFUL" | "QUESTIONABLE" | "IR" | null (healthy/no report)
@@ -242,13 +248,23 @@ export function projectQB(ctx, type, line) {
   const gs = gameScriptPassMult(ctx.teamSpread);
   const wx = calculateWeatherAdjustmentPass(ctx);
   const oppPass = calculateOppDefenseAdjustment(ctx.oppPassYdsAllowed, ctx.lgPassYdsAllowed);
-  const oppTd = calculateOppDefenseAdjustment(ctx.oppPassTdAllowed, ctx.lgPassTdAllowed);
-  const oppInt = calculateOppDefenseAdjustment(ctx.oppDefTakeaways, ctx.lgDefTakeaways, 0.8, 1.25);
+  // v3: the opposing defense's completion %, yards per completion, pass TDs and INTs allowed per
+  // attempt (matchups.ts). Completion % and yards/completion multiply to yards/attempt allowed, so
+  // the pass defense counts once (v2 applied its one factor to completions AND to yards).
+  const mCmp = mxMult(ctx, "def", "compPct", 0.90, 1.10);
+  const mYpc = mxMult(ctx, "def", "ypCmp", 0.85, 1.18);
+  const mTd = mxMult(ctx, "def", "passTdRate", 0.70, 1.40);
+  const mInt = mxMult(ctx, "def", "intRate", 0.70, 1.40);
+  const v3 = mCmp != null;
+  const oppCmp = v3 ? mCmp : clamp(oppPass, 0.85, 1.15);
+  const oppYpc = v3 ? mYpc : oppPass;
+  const oppTd = mTd != null ? mTd : calculateOppDefenseAdjustment(ctx.oppPassTdAllowed, ctx.lgPassTdAllowed);
+  const oppInt = mInt != null ? mInt : calculateOppDefenseAdjustment(ctx.oppDefTakeaways, ctx.lgDefTakeaways, 0.8, 1.25);
   const avail = calculateInjuryAvailability(ctx.injuryStatus);
   const rest = calculateRestAdjustment(ctx);
   const passAtt = base.passAtt * gs * rest * avail;
-  const passCmp = passAtt * base.compPct * clamp(oppPass, 0.85, 1.15);
-  const passYds = passCmp * base.ypc * wx * oppPass;
+  const passCmp = passAtt * base.compPct * oppCmp;
+  const passYds = passCmp * base.ypc * wx * oppYpc;
   const passTd = passAtt * base.passTdRate * oppTd;
   const ints = passAtt * base.intRate * oppInt * clamp(2 - wx, 0.95, 1.15); // bad weather -> more picks
   const table = {
@@ -262,7 +278,7 @@ export function projectQB(ctx, type, line) {
   const t = table[type]; if (!t) return { pOver: null, proj: null, calc: null };
   const seed = hashSeed(`qb|${type}|${line}|${passAtt.toFixed(2)}`);
   const pOver = probabilityOver("nb", line, "over", seed, t);
-  return { pOver, proj: t.mean, calc: fullCalc("Neg.Binom", `μ=${t.mean.toFixed(2)}, φ=${t.phi}`, t.mean, `${base.passAtt.toFixed(1)} att/g season base`, [["game script", gs], ["weather", wx], ["opp pass D", oppPass], ["opp pass TD", oppTd], ["availability", avail], ["rest", rest]]) };
+  return { pOver, proj: t.mean, calc: fullCalc("Neg.Binom", `μ=${t.mean.toFixed(2)}, φ=${t.phi}`, t.mean, `${base.passAtt.toFixed(1)} att/g season base`, [["game script", gs], ["weather", wx], ...(v3 ? [["opp comp% allowed", oppCmp], ["opp yds/cmp allowed", oppYpc]] : [["opp pass D", oppPass]]), ["opp pass TD", oppTd], ["opp INT rate", oppInt], ["availability", avail], ["rest", rest]]) };
 }
 
 /* ---- RB projections ---- */
@@ -292,16 +308,23 @@ export function projectRB(ctx, type, line) {
   const gsPass = gameScriptPassMult(ctx.teamSpread); // RB receiving work rides the team's pass-volume game script
   const wxRush = calculateWeatherAdjustmentRush(ctx);
   const wxPass = calculateWeatherAdjustmentPass(ctx);
-  const oppRun = calculateOppDefenseAdjustment(ctx.oppRushYdsAllowed, ctx.lgRushYdsAllowed);
-  const oppRunTd = calculateOppDefenseAdjustment(ctx.oppRushTdAllowed, ctx.lgRushTdAllowed);
-  const oppPass = calculateOppDefenseAdjustment(ctx.oppPassYdsAllowedToRB, ctx.lgPassYdsAllowedToRB);
+  // v3: what the opposing defense allows to RBs specifically: yards and TDs per RB carry, catch
+  // rate, yards and TDs per RB target (matchups.ts). v2's team-wide per-game numbers are the fallback.
+  const mYpc = mxMult(ctx, "def", "rbYpc", 0.85, 1.18);
+  const mRushTd = mxMult(ctx, "def", "rbRushTdRate", 0.70, 1.40);
+  const mCatch = mxMult(ctx, "def", "rbCatch", 0.92, 1.08);
+  const mYpt = mxMult(ctx, "def", "rbYpt", 0.80, 1.25);
+  const oppRun = mYpc != null ? mYpc : clamp(calculateOppDefenseAdjustment(ctx.oppRushYdsAllowed, ctx.lgRushYdsAllowed), 0.8, 1.25);
+  const oppRunTd = mRushTd != null ? mRushTd : clamp(calculateOppDefenseAdjustment(ctx.oppRushTdAllowed, ctx.lgRushTdAllowed), 0.75, 1.35);
+  const oppCatch = mCatch != null ? mCatch : 1;
+  const oppPass = mYpt != null ? mYpt : calculateOppDefenseAdjustment(ctx.oppPassYdsAllowedToRB, ctx.lgPassYdsAllowedToRB);
   const avail = calculateInjuryAvailability(ctx.injuryStatus);
   const rest = calculateRestAdjustment(ctx);
   const rushAtt = base.rushAtt * gsRush * wxRush * rest * avail * (ctx.touchShareMult || 1);
-  const rushYds = rushAtt * base.ypc * clamp(oppRun, 0.8, 1.25);
-  const rushTd = rushAtt * base.rushTdRate * clamp(oppRunTd, 0.75, 1.35) * (ctx.goalLineShareMult || 1);
+  const rushYds = rushAtt * base.ypc * oppRun;
+  const rushTd = rushAtt * base.rushTdRate * oppRunTd * (ctx.goalLineShareMult || 1);
   const targets = base.targets * gsPass * rest * avail;
-  const rec = targets * base.catchRate;
+  const rec = targets * base.catchRate * oppCatch;
   const recYds = targets * base.ypt * wxPass * oppPass;
   // RB1s (lead back, more explosive-run volume) break longer runs on average than a committee
   // RB2/change-of-pace back — role-varying prior instead of one flat number for every runner.
@@ -316,7 +339,7 @@ export function projectRB(ctx, type, line) {
   const t = table[type]; if (!t) return { pOver: null, proj: null, calc: null };
   const seed = hashSeed(`rb|${type}|${line}|${rushAtt.toFixed(2)}`);
   const pOver = probabilityOver("nb", line, "over", seed, t);
-  return { pOver, proj: t.mean, calc: fullCalc("Neg.Binom", `μ=${t.mean.toFixed(2)}, φ=${t.phi}`, t.mean, `${base.rushAtt.toFixed(1)} car/g season base`, [["game script", gsRush], ["weather", wxRush], ["opp run D", oppRun], ["touch share", ctx.touchShareMult || 1], ["availability", avail]]) };
+  return { pOver, proj: t.mean, calc: fullCalc("Neg.Binom", `μ=${t.mean.toFixed(2)}, φ=${t.phi}`, t.mean, `${base.rushAtt.toFixed(1)} car/g season base`, [["game script", gsRush], ["weather", wxRush], ["opp run D", oppRun], ["opp rush TD", oppRunTd], ["opp catch% vs RB", oppCatch], ["opp yds/tgt vs RB", oppPass], ["touch share", ctx.touchShareMult || 1], ["availability", avail]]) };
 }
 
 /* ---- WR/TE projections ---- */
@@ -340,12 +363,19 @@ export function projectWR(ctx, type, line) {
   const base = wrBaseRates(ctx);
   const gs = gameScriptPassMult(ctx.teamSpread);
   const wx = calculateWeatherAdjustmentPass(ctx);
-  const oppYds = calculateOppDefenseAdjustment(ctx.oppPassYdsAllowedToPos, ctx.lgPassYdsAllowedToPos);
-  const oppTd = calculateOppDefenseAdjustment(ctx.oppPassTdAllowedToPos, ctx.lgPassTdAllowedToPos);
+  // v3: what the opposing defense allows to this position group (WR or TE separately): catch rate,
+  // yards per target, receiving TDs per target (matchups.ts). v2's team-wide number is the fallback.
+  const grp = ctx.pos === "TE" ? "te" : ctx.pos === "RB" ? "rb" : "wr"; // RB: Anytime TD prices RB receiving TDs here
+  const mCatch = mxMult(ctx, "def", `${grp}Catch`, 0.92, 1.08);
+  const mYpt = mxMult(ctx, "def", `${grp}Ypt`, 0.80, 1.25);
+  const mTd = mxMult(ctx, "def", `${grp}RecTdRate`, 0.70, 1.40);
+  const oppCatch = mCatch != null ? mCatch : 1;
+  const oppYds = mYpt != null ? mYpt : calculateOppDefenseAdjustment(ctx.oppPassYdsAllowedToPos, ctx.lgPassYdsAllowedToPos);
+  const oppTd = mTd != null ? mTd : calculateOppDefenseAdjustment(ctx.oppPassTdAllowedToPos, ctx.lgPassTdAllowedToPos);
   const avail = calculateInjuryAvailability(ctx.injuryStatus);
   const rest = calculateRestAdjustment(ctx);
   const targets = base.targets * gs * rest * avail * (ctx.injuredTeammateBoost || 1); // a hurt WR1 bumps WR2/3 target share
-  const rec = targets * base.catchRate;
+  const rec = targets * base.catchRate * oppCatch;
   const recYds = targets * base.ypt * wx * oppYds;
   const recTd = targets * base.recTdRate * oppTd * (ctx.redZoneShareMult || 1);
   // Prior varies by role instead of being one flat constant — a WR1 or a deep-threat's long catches
@@ -360,7 +390,7 @@ export function projectWR(ctx, type, line) {
   const t = table[type]; if (!t) return { pOver: null, proj: null, calc: null };
   const seed = hashSeed(`wr|${type}|${line}|${targets.toFixed(2)}`);
   const pOver = probabilityOver("nb", line, "over", seed, t);
-  return { pOver, proj: t.mean, calc: fullCalc("Neg.Binom", `μ=${t.mean.toFixed(2)}, φ=${t.phi}`, t.mean, `${base.targets.toFixed(1)} tgt/g season base`, [["game script", gs], ["weather", wx], ["opp pass D vs pos", oppYds], ["availability", avail], ["target-share boost", ctx.injuredTeammateBoost || 1]]) };
+  return { pOver, proj: t.mean, calc: fullCalc("Neg.Binom", `μ=${t.mean.toFixed(2)}, φ=${t.phi}`, t.mean, `${base.targets.toFixed(1)} tgt/g season base`, [["game script", gs], ["weather", wx], ["opp catch% vs pos", oppCatch], ["opp yds/tgt vs pos", oppYds], ["opp rec TD vs pos", oppTd], ["availability", avail], ["target-share boost", ctx.injuredTeammateBoost || 1]]) };
 }
 
 // -------- Anytime TD: union of a player's rushing-TD and receiving-TD probability --------
@@ -411,8 +441,11 @@ export function projectDST(ctx, type, line) {
   const oppPassAtt = ctx.oppPassAtt != null ? ctx.oppPassAtt : LG.teamPassAtt;
   const sackRate = ctx.teamSackRate != null ? ctx.teamSackRate : LG.sackRatePerPassAtt;
   const intRate = ctx.teamDefIntRate != null ? ctx.teamDefIntRate : LG.defIntRatePerPassAtt;
-  const oppOlineMult = clamp(ctx.oppSackRateAllowed && ctx.lgSackRateAllowed ? ctx.oppSackRateAllowed / ctx.lgSackRateAllowed : 1, 0.75, 1.3);
-  const oppQbIntMult = clamp(ctx.oppQbIntRate && ctx.lgQbIntRate ? ctx.oppQbIntRate / ctx.lgQbIntRate : 1, 0.75, 1.3);
+  // v3: the opposing offense's sacks per dropback and INTs per attempt (matchups.ts); v2 fallback
+  const mSack = mxMult(ctx, "off", "sackRate", 0.75, 1.30);
+  const mInt = mxMult(ctx, "off", "offIntRate", 0.75, 1.30);
+  const oppOlineMult = mSack != null ? mSack : clamp(ctx.oppSackRateAllowed && ctx.lgSackRateAllowed ? ctx.oppSackRateAllowed / ctx.lgSackRateAllowed : 1, 0.75, 1.3);
+  const oppQbIntMult = mInt != null ? mInt : clamp(ctx.oppQbIntRate && ctx.lgQbIntRate ? ctx.oppQbIntRate / ctx.lgQbIntRate : 1, 0.75, 1.3);
   const sacks = oppPassAtt * sackRate * oppOlineMult;
   const ints = oppPassAtt * intRate * oppQbIntMult;
   const table = { "Sacks": { mean: sacks, phi: NB_PHI.sacks }, "Def. Interceptions": { mean: ints, phi: NB_PHI.defInt } };
