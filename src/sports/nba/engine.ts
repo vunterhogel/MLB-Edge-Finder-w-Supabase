@@ -14,7 +14,7 @@ export function probabilityOver(family, line, side, seed, params) {
 // per-market calibration: DAY-1 PRIOR. No settled-bet history for basketball yet, so every
 // category starts at a conservative, uniform "trust the market a lot" weight — same posture
 // NFL launched with. Retune per-category from the Stats tab; don't hand-tune from vibes.
-export const MODEL_VERSION = "nba-v2-2026-10-19";   // bump on every model change (part of every board-log id)
+export const MODEL_VERSION = "nba-v3-2026-10-27";   // bump on every model change (part of every board-log id). v3: opponent defense by position + real pace (matchups.ts)
 
 export const CALIB_KEEP = {
   "Points": 0.45, "Rebounds": 0.45, "Assists": 0.45, "Three-Pointers Made": 0.40, "Steals": 0.35, "Blocks": 0.35, "Turnovers": 0.35,
@@ -175,19 +175,29 @@ export function playerBaseRates(ctx) {
     stl36: per36("stl"), blk36: per36("blk"), tov36: per36("tov"), fg3m36: per36("fg3m"),
   };
 }
+// v3: a matchup multiplier for this player's position from ctx.mx (matchups.ts: what this opponent
+// allows to the position per possession of floor time / league), clamped; null -> keep the v2 input
+export function mxDef(ctx, stat, lo, hi) {
+  const v = ctx && ctx.mx && ctx.mx.def ? (ctx.mx.def[posGroup(ctx.pos)] || {})[stat] : null;
+  return v == null || !Number.isFinite(v) ? null : clamp(v, lo, hi);
+}
 export function projectPlayer(ctx, type, line) {
   const base = playerBaseRates(ctx);
-  const pace = calculatePaceAdjustment(ctx.teamPace, ctx.oppPace, ctx.lgPace);
+  const mxPace = ctx && ctx.mx && Number.isFinite(ctx.mx.pace) ? clamp(ctx.mx.pace, 0.92, 1.08) : null;
+  const pace = mxPace != null ? mxPace : calculatePaceAdjustment(ctx.teamPace, ctx.oppPace, ctx.lgPace);
   const rest = calculateRestAdjustment(ctx);
   const blowout = calculateBlowoutRiskAdjustment(ctx.projSpreadAbs, !!ctx.isStarter);
   const avail = calculateInjuryAvailability(ctx.injuryStatus);
   const usage = calculateUsageBoost(ctx.missingUsageShare);
-  const oppPtsD = calculateOppDefenseAdjustment(ctx.oppDRTG, ctx.lgDRTG);
-  const oppReb = calculateOppDefenseAdjustment(ctx.oppRebRateAllowed, ctx.lgRebRateAllowed);
-  const oppAst = calculateOppDefenseAdjustment(ctx.oppAstAllowed, ctx.lgAstAllowed);
-  const opp3pt = calculateOppDefenseAdjustment(ctx.opp3ptPctAllowed, ctx.lg3ptPctAllowed);
-  const oppStl = calculateOppDefenseAdjustment(ctx.oppTovForced, ctx.lgTovForced);
-  const oppBlk = calculateOppDefenseAdjustment(ctx.oppFgaRimAllowed, ctx.lgFgaRimAllowed);
+  // v3: what this opponent allows to the player's position (G / F / C), per possession; v2 fallback
+  const or = (v, fb) => (v != null ? v : fb);
+  const oppPtsD = or(mxDef(ctx, "pts", 0.88, 1.12), calculateOppDefenseAdjustment(ctx.oppDRTG, ctx.lgDRTG));
+  const oppReb = or(mxDef(ctx, "reb", 0.85, 1.15), calculateOppDefenseAdjustment(ctx.oppRebRateAllowed, ctx.lgRebRateAllowed));
+  const oppAst = or(mxDef(ctx, "ast", 0.85, 1.15), calculateOppDefenseAdjustment(ctx.oppAstAllowed, ctx.lgAstAllowed));
+  const opp3pt = or(mxDef(ctx, "fg3m", 0.80, 1.20), calculateOppDefenseAdjustment(ctx.opp3ptPctAllowed, ctx.lg3ptPctAllowed));
+  const oppStl = or(mxDef(ctx, "stl", 0.75, 1.25), calculateOppDefenseAdjustment(ctx.oppTovForced, ctx.lgTovForced));
+  const oppBlk = or(mxDef(ctx, "blk", 0.75, 1.25), calculateOppDefenseAdjustment(ctx.oppFgaRimAllowed, ctx.lgFgaRimAllowed));
+  const oppTov = or(mxDef(ctx, "tov", 0.80, 1.20), 1);
 
   const minutes = base.minutes0 * rest * blowout * avail;
   const m36 = minutes / 36;
@@ -197,27 +207,28 @@ export function projectPlayer(ctx, type, line) {
   const fg3m = m36 * base.fg3m36 * pace * opp3pt;
   const stl = m36 * base.stl36 * pace * oppStl;
   const blk = m36 * base.blk36 * pace * oppBlk;
-  const tov = m36 * base.tov36 * pace * clamp(usage, 1, 1.25);
+  const tov = m36 * base.tov36 * pace * clamp(usage, 1, 1.25) * oppTov;
 
+  const pg = posGroup(ctx.pos);
   const mults = [["pace", pace], ["rest/B2B", rest], ["blowout risk", blowout], ["availability", avail], ["usage boost", usage]];
   const baseStr = `${base.minutes0.toFixed(1)} min/g season base (${posGroup(ctx.pos)} prior)`;
   const single = {
-    "Points": { mean: pts, phi: NB_PHI.pts, mults: [...mults, ["opp DRTG", oppPtsD]] },
-    "Rebounds": { mean: reb, phi: NB_PHI.reb, mults: [...mults, ["opp reb rate allowed", oppReb]] },
-    "Assists": { mean: ast, phi: NB_PHI.ast, mults: [...mults, ["opp ast allowed", oppAst]] },
-    "Three-Pointers Made": { mean: fg3m, phi: NB_PHI.fg3m, mults: [...mults, ["opp 3PT D", opp3pt]] },
-    "Steals": { mean: stl, phi: NB_PHI.stl, mults: [...mults, ["opp TOs forced", oppStl]] },
-    "Blocks": { mean: blk, phi: NB_PHI.blk, mults: [...mults, ["opp rim pressure", oppBlk]] },
-    "Turnovers": { mean: tov, phi: NB_PHI.tov, mults: [...mults, ["usage (TOs rise w/ usage)", clamp(usage, 1, 1.25)]] },
+    "Points": { mean: pts, phi: NB_PHI.pts, mults: [...mults, [`opp pts allowed vs ${pg}`, oppPtsD]] },
+    "Rebounds": { mean: reb, phi: NB_PHI.reb, mults: [...mults, [`opp reb allowed vs ${pg}`, oppReb]] },
+    "Assists": { mean: ast, phi: NB_PHI.ast, mults: [...mults, [`opp ast allowed vs ${pg}`, oppAst]] },
+    "Three-Pointers Made": { mean: fg3m, phi: NB_PHI.fg3m, mults: [...mults, [`opp 3PM allowed vs ${pg}`, opp3pt]] },
+    "Steals": { mean: stl, phi: NB_PHI.stl, mults: [...mults, [`opp steals given vs ${pg}`, oppStl]] },
+    "Blocks": { mean: blk, phi: NB_PHI.blk, mults: [...mults, [`opp blocks given vs ${pg}`, oppBlk]] },
+    "Turnovers": { mean: tov, phi: NB_PHI.tov, mults: [...mults, ["usage (TOs rise w/ usage)", clamp(usage, 1, 1.25)], [`opp TOs forced vs ${pg}`, oppTov]] },
   };
   // combo props: sum of means, inflated phi to approximate positive correlation across
   // stats that all scale off the same minutes/usage swings (doc §3 step 4)
   const combo = {
-    "Pts+Reb+Ast": { mean: pts + reb + ast, phi: NB_PHI.combo, mults },
-    "Pts+Reb": { mean: pts + reb, phi: NB_PHI.combo, mults },
-    "Pts+Ast": { mean: pts + ast, phi: NB_PHI.combo, mults },
-    "Reb+Ast": { mean: reb + ast, phi: NB_PHI.combo, mults },
-    "Blocks+Steals": { mean: blk + stl, phi: NB_PHI.combo, mults },
+    "Pts+Reb+Ast": { mean: pts + reb + ast, phi: NB_PHI.combo, mults: [...mults, [`opp pts allowed vs ${pg}`, oppPtsD], [`opp reb allowed vs ${pg}`, oppReb], [`opp ast allowed vs ${pg}`, oppAst]] },
+    "Pts+Reb": { mean: pts + reb, phi: NB_PHI.combo, mults: [...mults, [`opp pts allowed vs ${pg}`, oppPtsD], [`opp reb allowed vs ${pg}`, oppReb]] },
+    "Pts+Ast": { mean: pts + ast, phi: NB_PHI.combo, mults: [...mults, [`opp pts allowed vs ${pg}`, oppPtsD], [`opp ast allowed vs ${pg}`, oppAst]] },
+    "Reb+Ast": { mean: reb + ast, phi: NB_PHI.combo, mults: [...mults, [`opp reb allowed vs ${pg}`, oppReb], [`opp ast allowed vs ${pg}`, oppAst]] },
+    "Blocks+Steals": { mean: blk + stl, phi: NB_PHI.combo, mults: [...mults, [`opp blocks given vs ${pg}`, oppBlk], [`opp steals given vs ${pg}`, oppStl]] },
   };
   if (single[type]) {
     const t = single[type];

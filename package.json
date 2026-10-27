@@ -10,6 +10,8 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "hyparquet": "^1.31.5",
+    "hyparquet-compressors": "^1.1.2",
     "react": "^19.2.7",
     "react-dom": "^19.2.7"
   },

@@ -220,6 +220,18 @@ mutually exclusive the way rush-TD/rec-TD are for one player.
   minutes cut as the game gets out of hand. `blowoutRiskMult`: neutral until
   `|projSpread| ≥ 10`, then scales down to about −8% minutes at `|projSpread| ≥ 20`.
 
+### v3 (nba-v3-2026-10-27): opponent defense by position + real pace
+
+Before v3, every opponent input reached the engine empty, so every opponent multiplier was 1.0: no pace and no defense. v3 fills them in. It's backend only; the page doesn't change. Code: `src/sports/nba/matchups.ts`, wired through `loadGameDetail` (`d.matchups`), `playerCtx` (`ctx.mx`) and `projectPlayer`.
+
+- **Source.** sportsdataverse / hoopR public NBA box scores (ESPN data; ESPN team ids, the same as Edge Finder's): `player_box_{season}` with each player's position (G / F / C), minutes and opponent, and `team_box_{season}` for possessions. They're read as compact parquet season files (about 600KB for a full season) through Edge Finder's own `nfl-stats-proxy`, and cached 6 hours (last season 7 days). sportsdataverse updates them during the season.
+- **Defense by position.** For each opponent and each position, it measures what that position produced against them per possession of floor time (minutes × game pace / 48), so neither playing time nor pace leaks into the defensive number. Stats: points, rebounds, assists, threes, steals, blocks, turnovers. Combo props and double / triple-doubles inherit them through the stat means.
+- **Sample.** Only games before the slate date count. Last season counts early and fades to zero by a team's 20th game (this season starts with no sample).
+- **Shrinkage.** Each rate is shrunk toward the league rate for that position with a prior of 6 games (points / rebounds / assists), 8 (threes, turnovers) or 10 (steals, blocks). It becomes a multiplier: opponent / league, clamped in the engine (points ±12%, rebounds / assists ±15%, threes ±20%, steals / blocks ±25%).
+- **Pace.** Each team's possessions per game is shrunk 5 games toward league. The multiplier is (team pace + opponent pace) / (team pace + league pace): a player's own rates already reflect his team's pace against average opponents, so only the matchup's difference counts. Clamped ±8%.
+- **Fallback.** If the files can't load, every multiplier is null and that game uses its v2 inputs (neutral).
+- **Calibration.** It starts fresh under the v3 model version; CALIB_KEEP stays at its day-1 values until graded volume says otherwise.
+
 ## 5. Calibration & pricing (reused verbatim from MLB/NFL — sport-agnostic)
 
 `impliedProb`, `probToAmerican`, `evPerUnit`, `noVigProb`, `calibrateToMarket`,

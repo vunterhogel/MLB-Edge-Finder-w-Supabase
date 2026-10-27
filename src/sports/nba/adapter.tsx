@@ -1,6 +1,7 @@
 /* NBA sport adapter for the shared SportApp shell (same shape as the MLB and NHL adapters).
    The projection model is the existing NBA engine, moved unchanged except for the fixes noted in
    engine.ts / data.ts (3PM parsing, preseason rows, season-boundary logs, OT ties, DNP settling). */
+import { loadNbaMatchupData, nbaMatchupInputs } from "./matchups";
 import { ALL_PLAYER_PROPS, BOOKS, BOOK_LABELS, CATEGORY_ORDER, DEFAULT_LINE, HOME_COURT_MULT, LG_PACE, LG_PPG, ODDS_SPORT, ODDS_TESTING_LIMIT, SIGNAL_RULES, isLineType, isYesNoType, matchesQuery } from "./config";
 import { actualFor, buildGameLineEntries, buildPlayerLog, buildTrendCard, computeRest, espnIdForTeamName, fetchDepthChart, fetchEventOdds, fetchGameSummary, fetchOddsEvents, fetchRoster, fetchSchedule, fetchSeasonRows, fetchStandings, fetchTeamSchedule, fetchTeamStats, matchCurrentOdds, matchEvent, nbaSeasonFor, parseEventOdds, parseGameOdds, playerTeam, searchPlayers as espnSearch, gradeLine, trendValueForGame } from "./data";
 import { MODEL_VERSION, calculateInjuryAvailability, evalBet, gameProbs, posGroup, projectPlayer } from "./engine";
@@ -52,11 +53,12 @@ function teamPpg(cur, prior) {
 async function loadGameDetail(g, { date }) {
   const year = nbaSeasonFor(date);
   const [stCur, stPrior] = await Promise.all([standingsFor(year), standingsFor(year - 1)]);
-  const [rosterH, rosterA, depthH, depthA, teamStatsH, teamStatsA, schedH, schedA] = await Promise.all([
+  const [rosterH, rosterA, depthH, depthA, teamStatsH, teamStatsA, schedH, schedA, matchupData] = await Promise.all([
     fetchRoster(g.homeId).catch(() => []), fetchRoster(g.awayId).catch(() => []),
     fetchDepthChart(g.homeId, year).catch(() => ({})), fetchDepthChart(g.awayId, year).catch(() => ({})),
     fetchTeamStats(g.homeId).catch(() => ({ off: {}, def: {} })), fetchTeamStats(g.awayId).catch(() => ({ off: {}, def: {} })),
     schedFor(g.homeId, year), schedFor(g.awayId, year),
+    loadNbaMatchupData(year),
   ]);
   const withDepth = (roster, depth) => roster.map((p) => ({ ...p, depthRank: depth[p.id] ? depth[p.id].rank : 99, isStarter: !!(depth[p.id] && depth[p.id].rank === 1) }));
   const rH = withDepth(rosterH, depthH), rA = withDepth(rosterA, depthA);
@@ -78,6 +80,8 @@ async function loadGameDetail(g, { date }) {
     home: { roster: rH, depth: depthH, featured: featH, teamStats: teamStatsH, standings: sH, rest: computeRest(schedH, gameDate) },
     away: { roster: rA, depth: depthA, featured: featA, teamStats: teamStatsA, standings: sA, rest: computeRest(schedA, gameDate) },
     logs, gamelogs, priorGamelogs, lambdaH, lambdaA,
+    // v3: opponent defense by position + matchup pace, from hoopR box scores (null -> v2 inputs)
+    matchups: nbaMatchupInputs(matchupData, g, date),
   };
 }
 
@@ -96,6 +100,8 @@ function playerCtx(d, side, p, logOverride) {
     oppDRTG: null, lgDRTG: null, oppRebRateAllowed: null, lgRebRateAllowed: null, oppAstAllowed: null, lgAstAllowed: null,
     opp3ptPctAllowed: null, lg3ptPctAllowed: null, oppTovForced: null, lgTovForced: null, oppFgaRimAllowed: null, lgFgaRimAllowed: null,
     missingUsageShare,
+    // v3: this team's matchup (matchups.ts): opponent defense by position and the pace multiplier
+    mx: d.matchups ? d.matchups[side] : null,
     daysRest: teamData.rest.daysRest, backToBack: teamData.rest.backToBack, crossCountryTravel: false,
   };
 }
