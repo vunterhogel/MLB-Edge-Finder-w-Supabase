@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { evPerUnit, impliedProb, pct, probToAmerican, profitUnits, suggestedUnits } from "./math";
 import { MultiSel, NumIn, Sel, StatCard, mono } from "./ui";
-import { Chip, DATE_SLATE, GameDetail, GameSubtitle, ScoreLine } from "./slate";
 import { BoardRow, MyBetRow, TrendCard } from "./cards";
 import { makeDeltaSignal } from "./signals";
+import { Chip, GameDetail, GameSubtitle, ScoreLine } from "./slate";
 import { PlayerAnalysis, PlayerAnalysisIntro } from "./analysis";
+
 
 /* SportApp: the shared Edge Finder shell (Slate / Board / Trends / Player Analysis / My Bets / Stats).
    Built from the MLB page, which is the design standard. Everything sport-specific comes from the
@@ -16,33 +17,25 @@ export default function SportApp({ sport }) {
   const { BOARD_DB_KEY, LS_BOARD_LOG, LS_CREDITS, MODEL_VERSION, appendBoardLog, boardLogReady, getBoardLogSaveError, idbDel, loadBets, loadBoardLog, loadBookOverrides, loadCredits, loadShowCoverage, resetBoardLogCache, saveBets, saveBoardLog, saveBookOverrides, saveShowCoverage, settleBoardLog } = sport.storage;
   const { fetchSchedule, fetchOddsEvents, fetchEventOdds, matchEvent, oddsDebug, parseEventOdds, parseGameOdds, matchCurrentOdds, buildGameLineEntries, fetchGameResult, searchPlayers, fetchPlayerAnalysisProfile, findPlayerInSlate, buildTrendCard } = sport.api;
   const { projectProp } = sport.model;
-  // Board / Trends / My Bets rows are the shared components; a sport only supplies which markets are
-  // game lines, which are yes/no, and its calibrated signal thresholds (config.SIGNAL_RULES)
+  // Every page element is the shared MLB-shell component; a sport supplies only data. Rows get the sport's
+  // game-line / yes-no market lists and its calibrated signal thresholds (config.SIGNAL_RULES).
   const isYesNoType = sport.config.isYesNoType || null;
   const getDeltaSignal = useMemo(() => makeDeltaSignal(sport.config.SIGNAL_RULES), [sport]);
-  const hasSignals = Object.keys(sport.config.SIGNAL_RULES || {}).length > 0;
   const rowCfg = { isLineType, isYesNoType, getDeltaSignal };
   const meta = sport.meta;
-  // Slate navigation. Every sport gets the same ◂ [picker] ▸ [today] control; `date` holds the sport's
-  // slate key (a calendar date by default, an NFL week key like "2026-2-8"), and the sport's `slate`
-  // (core DATE_SLATE unless it supplies its own) owns stepping, labels, ordering and season for that key.
-  const slate = sport.slate || DATE_SLATE;
-  const slateOrder = (k) => (k ? slate.order(k) : k);
-  const slateLabel = (k) => (k ? slate.label(k) : k);
-  const [date, setDate] = useState(() => slate.initial());
-  // a slate whose synchronous initial() is only a best guess can confirm it against the live feed once,
-  // as long as the user hasn't already navigated away while the lookup was in flight
-  useEffect(() => {
-    if (!slate.resolveCurrent) return;
-    let cancelled = false;
-    const initial = date;
-    slate.resolveCurrent().then((k) => { if (!cancelled && k) setDate((cur) => (cur === initial ? k : cur)); }).catch(() => { /* keep the guess */ });
-    return () => { cancelled = true; };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-  function shiftDate(n) { setDate((cur) => slate.shift(cur, n)); }
-  async function goToday() { try { const k = await slate.today(); if (k) setDate(k); } catch { /* keep the selected slate */ } }
-  const season = slate.season(date);
+  const todayStr = () => { const d = new Date(); return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`; };
+  const [date, setDate] = useState(todayStr());
+  // ◂/▸ day-step + "today" shortcut (ported from the NBA Edge Finder's date nav) — shifts by
+  // calendar day using Date's own rollover so month/year boundaries are handled for free.
+  function shiftDate(days) {
+    setDate((cur) => {
+      const [y, m, d] = cur.split("-").map(Number);
+      const nd = new Date(y, (m || 1) - 1, d || 1);
+      nd.setDate(nd.getDate() + days);
+      return `${nd.getFullYear()}-${String(nd.getMonth() + 1).padStart(2, "0")}-${String(nd.getDate()).padStart(2, "0")}`;
+    });
+  }
+  const season = date.slice(0, 4);
   const [games, setGames] = useState([]);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
@@ -94,7 +87,6 @@ export default function SportApp({ sport }) {
   const [trendGameFilter, setTrendGameFilter] = useState("all");
   const [trendSideFilter, setTrendSideFilter] = useState("all"); // all | over | under
   const [trendSplit, setTrendSplit] = useState("recentForm"); // which of the 3 splits drives min-hit/sort
-  const TREND_SAMPLES = [5, 8, 10, 15, 20];
   const [trendRecentN, setTrendRecentN] = useState(10); // "recent form" sample size
   const [trendMinHit, setTrendMinHit] = useState("");
   const [trendSourceFilter, setTrendSourceFilter] = useState("all"); // all | book | model
@@ -153,7 +145,7 @@ export default function SportApp({ sport }) {
     eventsRef.current = { date: null, events: null };
     try {
       const gs = await fetchSchedule(d); setGames(gs); setStamp(new Date());
-      if (!gs.length) setErr("No games on this slate.");
+      if (!gs.length) setErr("No games on this date.");
     } catch (e) { setErr(`Schedule fetch blocked (${e.message}).`); setGames([]); }
     finally { setLoading(false); }
   }
@@ -496,7 +488,7 @@ export default function SportApp({ sport }) {
     setSettleMsg("Settling…");
     const results = {};
     for (const pk of pks) { results[pk] = await fetchGameResult(pk); }
-    const augNote = sport.augmentResults ? await sport.augmentResults(myBets.filter((b) => b.status === "open"), results) : "";
+    if (sport.augmentResults) await sport.augmentResults(myBets.filter((b) => b.status === "open"), results);
     let graded = 0;
     setMyBets((prev) => prev.map((b) => {
       if (b.status !== "open") return b;
@@ -511,7 +503,7 @@ export default function SportApp({ sport }) {
       if (r == null) return b;
       graded++; return { ...b, status: r.status, actual: r.actual };
     }));
-    setSettleMsg(`Settled ${graded} bet(s). Unsettled games are still in progress.${augNote || ""}`);
+    setSettleMsg(`Settled ${graded} bet(s). Unsettled games are still in progress.`);
   }
 
   // ── Full Board Log Settlement ──────────────────────────────────────────────
@@ -536,7 +528,7 @@ export default function SportApp({ sport }) {
       for (const pk of pks) {
         results[pk] = await fetchGameResult(Number(pk));
       }
-      const augNote = sport.augmentResults ? await sport.augmentResults(unsettled, results) : "";
+      if (sport.augmentResults) await sport.augmentResults(unsettled, results);
 
       let graded = 0;
       const updated = log.map((e) => {
@@ -565,7 +557,7 @@ export default function SportApp({ sport }) {
       setBoardLogCount(updated.length);
       setBoardLogSettleMsg(
         `Graded ${graded} board log entr${graded === 1 ? "y" : "ies"} across ${pks.length} game(s). ` +
-        `${totalSettled.toLocaleString()} / ${updated.length.toLocaleString()} total entries now settled.${augNote || ""}`
+        `${totalSettled.toLocaleString()} / ${updated.length.toLocaleString()} total entries now settled.`
       );
     } catch (err) {
       setBoardLogSettleMsg(`Settlement failed: ${String((err && (err as Error).message) || err)}`);
@@ -679,7 +671,7 @@ export default function SportApp({ sport }) {
     }[betSort] || ((a, b) => a._i - b._i);
     return arr.sort(cmp);
   }, [myBets, betStatusFilter, betSort, betDateFilter, betGameFilters, betTypeFilters, betBookFilters, betSideFilter, betMinModel, betMinEdge, betMaxEdge, betMinOdds, betMaxOdds, betMinDelta, betMaxDelta, betDirAligned, betSearch]);
-  const betDates = useMemo(() => [...new Set(myBets.map((b) => b.date).filter(Boolean))].sort((a, b) => (slateOrder(a) < slateOrder(b) ? -1 : slateOrder(a) > slateOrder(b) ? 1 : 0)).reverse(), [myBets]);
+  const betDates = useMemo(() => [...new Set(myBets.map((b) => b.date).filter(Boolean))].sort().reverse(), [myBets]);
   // Scope game list to the selected date so TEX@LAA from 8/9 doesn't appear when filtering to 8/11.
   const betGames = useMemo(() => {
     const base = betDateFilter !== "all" ? myBets.filter((b) => b.date === betDateFilter) : myBets;
@@ -692,11 +684,11 @@ export default function SportApp({ sport }) {
   const betFiltersActive = betStatusFilter !== "all" || betGameFilters.length > 0 || betTypeFilters.length > 0 || betBookFilters.length > 0 || betSideFilter !== "all" || betDateFilter !== "all" || betMinModel !== "" || betMinEdge !== "" || betMaxEdge !== "" || betMinOdds !== "" || betMaxOdds !== "" || betMinDelta !== "" || betMaxDelta !== "" || betDirAligned || betSearch !== "";
   function clearBetFilters() { setBetStatusFilter("all"); setBetGameFilters([]); setBetTypeFilters([]); setBetBookFilters([]); setBetSideFilter("all"); setBetDateFilter("all"); setBetMinModel(""); setBetMinEdge(""); setBetMaxEdge(""); setBetMinOdds(""); setBetMaxOdds(""); setBetMinDelta(""); setBetMaxDelta(""); setBetDirAligned(false); setBetSearch(""); }
 
-  const statsDates = useMemo(() => [...new Set(myBets.map((b) => b.date).filter(Boolean))].sort((a, b) => (slateOrder(a) < slateOrder(b) ? -1 : slateOrder(a) > slateOrder(b) ? 1 : 0)), [myBets]);
+  const statsDates = useMemo(() => [...new Set(myBets.map((b) => b.date).filter(Boolean))].sort(), [myBets]);
   const stats = useMemo(() => {
     let settled = myBets.filter((b) => b.status === "won" || b.status === "lost" || b.status === "push" || b.status === "void");
-    if (statsStartDate) settled = settled.filter((b) => b.date && slateOrder(b.date) >= slateOrder(statsStartDate));
-    if (statsEndDate) settled = settled.filter((b) => b.date && slateOrder(b.date) <= slateOrder(statsEndDate));
+    if (statsStartDate) settled = settled.filter((b) => b.date && b.date >= statsStartDate);
+    if (statsEndDate) settled = settled.filter((b) => b.date && b.date <= statsEndDate);
     const unitsOf = (b) => (b.units != null && !isNaN(b.units) ? Number(b.units) : 1);
     const agg = (arr) => {
       const w = arr.filter((b) => b.status === "won").length, l = arr.filter((b) => b.status === "lost").length, ps = arr.filter((b) => b.status === "push").length, v = arr.filter((b) => b.status === "void").length;
@@ -740,7 +732,7 @@ export default function SportApp({ sport }) {
     lines.push("BETS");
     lines.push(["date", "game", "name", "type", "line", "side", "odds", "book", "model_pct", "proj", "novig_pct", "edge_pct", "ev_pct", "units", "suggested", "status", "actual", "profit_units", "current_odds", "clv_pts"].join(","));
     // export EVERY tracked bet (open + settled), independent of the My Bets view filters
-    const allBets = [...myBets].sort((a, b) => { const x = slateOrder(a.date || ""), y = slateOrder(b.date || ""); return x < y ? 1 : x > y ? -1 : 0; });
+    const allBets = [...myBets].sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")));
     for (const b of allBets) {
       const odds = Number(b.odds);
       const imp = isNaN(odds) ? null : impliedProb(odds);
@@ -773,19 +765,17 @@ export default function SportApp({ sport }) {
     const log = loadBoardLog();
     if (!log.length) { alert("No board log entries yet. Load a game to start logging."); return; }
     const esc = (v) => { if (v == null) return ""; const s = String(v); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
-    // identical columns for every sport; `date` is the slate key (a date, or an NFL week key like 2026-2-8)
-    const headers = ["logId","loggedAt","modelVersion","date","game","gameTimeIso","gamePk","playerId","name","type","line","side","odds","novig","rawModelP","calibratedP","edge","ev","proj","settled","actualStat","result","closingNovig","clv","live","preStart","suppressed"];
+    const headers = ["logId","loggedAt","modelVersion","date","game","gameTimeIso","gamePk","playerId","name","type","line","side","odds","novig","rawModelP","calibratedP","edge","ev","proj","settled","actualStat","result","closingNovig","clv","live"];
     const rows = [headers.join(",")];
     for (const e of log) {
       rows.push([
-        esc(e.logId), esc(e.loggedAt), esc(e.modelVersion), esc(e.date ?? e.week),
+        esc(e.logId), esc(e.loggedAt), esc(e.modelVersion), esc(e.date),
         esc(e.game), esc(e.gameTimeIso), esc(e.gamePk), esc(e.playerId), esc(e.name),
         esc(e.type), esc(e.line), esc(e.side), esc(e.odds),
         e.novig ?? "", e.rawModelP ?? "", e.calibratedP ?? "",
         e.edge ?? "", e.ev ?? "", e.proj ?? "",
         e.settled ? "true" : "false",
         e.actualStat ?? "", esc(e.result), e.closingNovig ?? "", e.clv ?? "", e.live == null ? "" : (e.live ? "true" : "false"),
-        e.preStart == null ? "" : (e.preStart ? "true" : "false"), esc(e.suppressed ?? (e.roleCheck ? "role check" : "")),
       ].join(","));
     }
     const blob = new Blob([rows.join("\n")], { type: "text/csv;charset=utf-8;" });
@@ -839,14 +829,14 @@ export default function SportApp({ sport }) {
           <div className="flex items-end justify-between flex-wrap gap-3">
             <div>
               <h1 className="text-2xl font-black tracking-tight">{`${meta.emoji} ${meta.title} `}<span className="text-emerald-400">EDGE</span> FINDER</h1>
-              <p className="text-[11px] text-slate-500 mt-0.5" style={mono}>live odds · de-vigged edge · model projections</p>
+              <p className="text-[11px] text-slate-500 mt-0.5" style={mono}>{meta.tagline}</p>
             </div>
             <div className="flex items-center gap-2 flex-wrap">
               <div className="flex items-center gap-1">
                 <button onClick={() => shiftDate(-1)} className="bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-sm hover:bg-slate-800">◂</button>
-                <slate.Picker value={date} onChange={setDate} />
+                <input type="date" value={date} onChange={(e) => setDate(e.target.value)} className="bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-sm text-slate-100" />
                 <button onClick={() => shiftDate(1)} className="bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-sm hover:bg-slate-800">▸</button>
-                <button onClick={goToday} className="bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs hover:bg-slate-800 text-slate-400">today</button>
+                <button onClick={() => setDate(todayStr())} className="bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-xs hover:bg-slate-800 text-slate-400">today</button>
               </div>
               <select value={book} onChange={(e) => setBook(e.target.value)} className="bg-slate-900 border border-slate-700 rounded-lg px-2 py-1.5 text-sm">
                 {BOOKS.map((b) => <option key={b.key} value={b.key}>{b.label}</option>)}
@@ -901,10 +891,7 @@ export default function SportApp({ sport }) {
                 <div key={g.pk} className="bg-slate-900/70 border border-slate-800 rounded-xl overflow-hidden">
                   <div className="w-full flex items-center gap-3 px-4 py-3">
                     <button onClick={() => expand(g)} className="flex-1 flex items-center gap-3 text-left min-w-0">
-                      <div className="w-16 shrink-0 leading-tight" style={mono}>
-                        {g.dateLabel && <div className="text-[10px] text-slate-600 truncate">{g.dateLabel}</div>}
-                        <div className="text-[11px] text-slate-500">{g.time}</div>
-                      </div>
+                      <div className="text-[11px] text-slate-500 w-16 shrink-0" style={mono}>{g.time}</div>
                       <div className="flex-1 min-w-0">
                         <div className="font-bold truncate">{g.away} <span className="text-slate-600">@</span> {g.home}</div>
                         {(g.status === "LIVE" || g.status === "FINAL") && g.homeScore != null
@@ -958,11 +945,11 @@ export default function SportApp({ sport }) {
           <div className="mt-3">
             <div className="flex items-center gap-2 flex-wrap mb-3">
               <input value={boardSearch} onChange={(e) => setBoardSearch(e.target.value)} placeholder="search player or team" className="bg-slate-950 border border-slate-700 rounded px-2.5 py-1.5 text-sm w-44 text-slate-100" />
-              <Sel compact w="w-28" label="sort" v={boardSort} opts={["ev_desc", "ev_asc", "edge_desc", "edge_asc", "proj_desc", "proj_asc", "delta_desc", "delta_asc"]} labels={{ ev_desc: "EV ↓", ev_asc: "EV ↑", edge_desc: "Edge ↓", edge_asc: "Edge ↑", proj_desc: "Projection ↓", proj_asc: "Projection ↑", delta_desc: "Proj Δ ↓", delta_asc: "Proj Δ ↑" }} onChange={setBoardSort} />
-              <Sel compact w="w-32" label="market" v={classFilter} opts={["all", "props", "lines"]} labels={{ all: "All markets", props: "Player props", lines: "Game lines" }} onChange={setClassFilter} />
-              <Sel compact w="w-40" label="category" v={catFilter} opts={["all", ...CATEGORY_ORDER]} labels={{ all: "All categories" }} onChange={setCatFilter} />
-              <Sel compact w="w-36" label="game" v={gameFilter} opts={["all", ...boardGames.map((x) => x.pk)]} labels={{ all: "All games", ...Object.fromEntries(boardGames.map((x) => [x.pk, x.label])) }} onChange={setGameFilter} />
-              <Sel compact w="w-24" label="side" v={sideFilter} opts={["all", "over", "under", "home", "away"]} labels={{ all: "Both", over: "Over", under: "Under", home: "Home", away: "Away" }} onChange={setSideFilter} />
+              <Sel compact label="sort" v={boardSort} opts={["ev_desc", "ev_asc", "edge_desc", "edge_asc", "proj_desc", "proj_asc", "delta_desc", "delta_asc"]} labels={{ ev_desc: "EV ↓", ev_asc: "EV ↑", edge_desc: "Edge ↓", edge_asc: "Edge ↑", proj_desc: "Projection ↓", proj_asc: "Projection ↑", delta_desc: "Proj Δ ↓", delta_asc: "Proj Δ ↑" }} onChange={setBoardSort} />
+              <Sel compact label="market" v={classFilter} opts={["all", "props", "lines"]} labels={{ all: "All markets", props: "Player props", lines: "Game lines" }} onChange={setClassFilter} />
+              <Sel compact label="category" v={catFilter} opts={["all", ...CATEGORY_ORDER]} labels={{ all: "All categories" }} onChange={setCatFilter} />
+              <Sel compact label="game" v={gameFilter} opts={["all", ...boardGames.map((x) => x.pk)]} labels={{ all: "All games", ...Object.fromEntries(boardGames.map((x) => [x.pk, x.label])) }} onChange={setGameFilter} />
+              <Sel compact label="side" v={sideFilter} opts={["all", "over", "under"]} labels={{ all: "Both", over: "Over", under: "Under" }} onChange={setSideFilter} />
               {(() => { const n = [minEdge, minModel, minEV, minOdds, maxOdds, minDelta, maxDelta].filter((x) => x !== "").length + (dirAligned ? 1 : 0) + (signalFilter !== "all" ? 1 : 0); return (
                 <button onClick={() => setShowMoreBoard((s) => !s)} className={`text-xs rounded px-2.5 py-1.5 border ${showMoreBoard || n ? "border-emerald-700 text-emerald-300" : "border-slate-700 text-slate-400 hover:text-slate-200"}`}>filters{n ? ` (${n})` : ""} {showMoreBoard ? "▴" : "▾"}</button>
               ); })()}
@@ -1004,7 +991,7 @@ export default function SportApp({ sport }) {
                 <label className="text-xs text-slate-400 flex flex-col gap-1">signal
                   <div className="flex gap-1">
                     {(["all", "moderate", "strong"] as const).map((v) => (
-                      <button key={v} disabled={!hasSignals && v !== "all"} title={hasSignals ? undefined : "No calibrated signal thresholds for this sport yet. They get fit from settled board-log data, as MLB's were."} onClick={() => setSignalFilter(v)} className={`text-xs rounded px-2 py-1.5 border font-medium ${signalFilter === v ? (v === "strong" ? "border-emerald-600 bg-emerald-950 text-emerald-300" : v === "moderate" ? "border-yellow-600 bg-yellow-950 text-yellow-300" : "border-sky-600 bg-sky-950 text-sky-300") : "border-slate-700 text-slate-500 hover:text-slate-300"}`}>{v === "all" ? "all" : v === "moderate" ? "🟡 mod+" : "🟢 strong"}</button>
+                      <button key={v} onClick={() => setSignalFilter(v)} className={`text-xs rounded px-2 py-1.5 border font-medium ${signalFilter === v ? (v === "strong" ? "border-emerald-600 bg-emerald-950 text-emerald-300" : v === "moderate" ? "border-yellow-600 bg-yellow-950 text-yellow-300" : "border-sky-600 bg-sky-950 text-sky-300") : "border-slate-700 text-slate-500 hover:text-slate-300"}`}>{v === "all" ? "all" : v === "moderate" ? "🟡 mod+" : "🟢 strong"}</button>
                     ))}
                   </div>
                 </label>
@@ -1057,11 +1044,11 @@ export default function SportApp({ sport }) {
           <div className="mt-3">
             <div className="flex items-center gap-2 flex-wrap mb-3">
               <input value={trendSearch} onChange={(e) => setTrendSearch(e.target.value)} placeholder="search player or team" className="bg-slate-950 border border-slate-700 rounded px-2.5 py-1.5 text-sm w-44 text-slate-100" />
-              <Sel compact w="w-40" label="prop" v={trendCatFilter} opts={["all", ...TREND_PROPS]} labels={{ all: "All props" }} onChange={setTrendCatFilter} />
-              <Sel compact w="w-36" label="game" v={trendGameFilter} opts={["all", ...trendGames.map((g) => g.pk)]} labels={{ all: "All games", ...Object.fromEntries(trendGames.map((g) => [g.pk, g.label])) }} onChange={setTrendGameFilter} />
-              <Sel compact w="w-24" label="side" v={trendSideFilter} opts={["all", "over", "under"]} labels={{ all: "Both" }} onChange={setTrendSideFilter} />
-              <Sel compact w="w-32" label="split" v={trendSplit} opts={["recentForm", "vsOpp", "homeAway"]} labels={{ recentForm: "Recent Form", vsOpp: "Head to Head", homeAway: "Home/Away" }} onChange={setTrendSplit} />
-              <Sel compact w="w-24" label="sample" v={trendRecentN} opts={TREND_SAMPLES} labels={Object.fromEntries(TREND_SAMPLES.map((n) => [n, `last ${n}`]))} onChange={(v) => setTrendRecentN(+v)} />
+              <Sel compact label="prop" v={trendCatFilter} opts={["all", ...TREND_PROPS]} labels={{ all: "All props" }} onChange={setTrendCatFilter} />
+              <Sel compact label="game" v={trendGameFilter} opts={["all", ...trendGames.map((g) => g.pk)]} labels={{ all: "All games", ...Object.fromEntries(trendGames.map((g) => [g.pk, g.label])) }} onChange={setTrendGameFilter} />
+              <Sel compact label="side" v={trendSideFilter} opts={["all", "over", "under"]} labels={{ all: "Both" }} onChange={setTrendSideFilter} />
+              <Sel compact label="split" v={trendSplit} opts={["recentForm", "vsOpp", "homeAway"]} labels={{ recentForm: "Recent Form", vsOpp: "Head to Head", homeAway: "Home/Away" }} onChange={setTrendSplit} />
+              <Sel compact label="sample" v={trendRecentN} opts={[5, 8, 10, 15, 20]} labels={{ 5: "last 5", 8: "last 8", 10: "last 10", 15: "last 15", 20: "last 20" }} onChange={(v) => setTrendRecentN(+v)} />
               {(() => { const n = (trendMinHit !== "" ? 1 : 0) + (trendSourceFilter !== "all" ? 1 : 0); return (
                 <button onClick={() => setShowMoreTrends((s) => !s)} className={`text-xs rounded px-2.5 py-1.5 border ${showMoreTrends || n ? "border-emerald-700 text-emerald-300" : "border-slate-700 text-slate-400 hover:text-slate-200"}`}>filters{n ? ` (${n})` : ""} {showMoreTrends ? "▴" : "▾"}</button>
               ); })()}
@@ -1073,8 +1060,8 @@ export default function SportApp({ sport }) {
                 <label className="text-xs text-slate-400 flex flex-col gap-1">min hit rate %
                   <input value={trendMinHit} onChange={(e) => setTrendMinHit(e.target.value)} placeholder="any" inputMode="decimal" className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm w-20 text-slate-100" />
                 </label>
-                <Sel compact w="w-28" label="line source" v={trendSourceFilter} opts={["all", "book", "model"]} labels={{ all: "Any", book: "Book line", model: "Model-free" }} onChange={setTrendSourceFilter} />
-                <Sel compact w="w-28" label="sort" v={trendSort} opts={["hit_desc", "hit_asc", "name_asc"]} labels={{ hit_desc: "Hit rate ↓", hit_asc: "Hit rate ↑", name_asc: "Name A-Z" }} onChange={setTrendSort} />
+                <Sel compact label="line source" v={trendSourceFilter} opts={["all", "book", "model"]} labels={{ all: "Any", book: "Book line", model: "Model-free" }} onChange={setTrendSourceFilter} />
+                <Sel compact label="sort" v={trendSort} opts={["hit_desc", "hit_asc", "name_asc"]} labels={{ hit_desc: "Hit rate ↓", hit_asc: "Hit rate ↑", name_asc: "Name A-Z" }} onChange={setTrendSort} />
               </div>
             )}
             {games.length === 0 ? (
@@ -1150,7 +1137,7 @@ export default function SportApp({ sport }) {
                 )}
               </div>
               <div className="text-[11px] text-slate-500 mt-2" style={mono}>
-                {meta.league}-wide player lookup. If the player is on the selected slate, this tab adds matchup context, model projections, and any pulled {book} odds.
+                {meta.analysisHint} {book} odds.
               </div>
             </div>
 
@@ -1174,7 +1161,7 @@ export default function SportApp({ sport }) {
             )}
 
             {!analysisProfile && !analysisLoading && analysisResults.length === 0 && (
-              <PlayerAnalysisIntro games={games} boardCount={boardEntries.length} league={meta.league} />
+              <PlayerAnalysisIntro games={games} boardCount={boardEntries.length} intro={meta.intro} />
             )}
 
             {analysisLoading && <div className="py-10 text-center text-sm text-slate-500" style={mono}>loading player profile…</div>}
@@ -1207,14 +1194,13 @@ export default function SportApp({ sport }) {
             <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
               <div className="flex items-center gap-2 flex-wrap">
                 <input value={betSearch} onChange={(e) => setBetSearch(e.target.value)} placeholder="search player or team" className="bg-slate-950 border border-slate-700 rounded px-2.5 py-1.5 text-sm w-44 text-slate-100" />
-                <Sel compact w="w-28" label="show" v={betStatusFilter} opts={["all", "open", "settled", "won", "lost", "push", "void"]} labels={{ all: "All", open: "Open", settled: "Settled", won: "Won", lost: "Lost", push: "Push", void: "Void" }} onChange={setBetStatusFilter} />
-                <Sel compact w="w-32" label="date" v={betDateFilter} opts={["all", ...betDates]} labels={{ all: "All dates", ...Object.fromEntries(betDates.map((k) => [k, slateLabel(k)])) }} onChange={setBetDateFilter} />
+                <Sel compact label="show" v={betStatusFilter} opts={["all", "open", "settled", "won", "lost", "push", "void"]} labels={{ all: "All", open: "Open", settled: "Settled", won: "Won", lost: "Lost", push: "Push", void: "Void" }} onChange={setBetStatusFilter} />
+                <Sel compact label="date" v={betDateFilter} opts={["all", ...betDates]} labels={{ all: "All dates" }} onChange={setBetDateFilter} />
                 <MultiSel compact label="game" selected={betGameFilters} opts={betGames} onChange={setBetGameFilters} />
                 <MultiSel compact label="category" selected={betTypeFilters} opts={betTypes} onChange={setBetTypeFilters} />
                 <MultiSel compact label="book" selected={betBookFilters} opts={betBooks} labels={BOOK_LABELS} onChange={setBetBookFilters} />
-                <Sel compact w="w-28" label="side" v={betSideFilter} opts={["all", ...betSides]} labels={{ all: "All sides" }} onChange={setBetSideFilter} />
-                <Sel compact w="w-32" label="sort" v={betSort} opts={["recent", "game", "model_desc", "model_asc", "ev_desc", "ev_asc", "edge_desc", "edge_asc", "clv_desc", "clv_asc", "delta_desc", "delta_asc"]} labels={{ recent: "Most recent", game: "Game", model_desc: "Model % ↓", model_asc: "Model % ↑", ev_desc: "EV ↓", ev_asc: "EV ↑", edge_desc: "Edge ↓", edge_asc: "Edge ↑", clv_desc: "Line move ↓", clv_asc: "Line move ↑", delta_desc: "Proj Δ ↓", delta_asc: "Proj Δ ↑" }} onChange={setBetSort} />
-                <Sel compact w="w-24" label="stake (new bets)" v={stakeMode} opts={["flat", "kelly"]} labels={{ flat: "Flat 1u", kelly: "¼ Kelly" }} onChange={setStakeMode} />
+                <Sel compact label="side" v={betSideFilter} opts={["all", ...betSides]} labels={{ all: "All sides" }} onChange={setBetSideFilter} />
+                <Sel compact label="sort" v={betSort} opts={["recent", "game", "model_desc", "model_asc", "ev_desc", "ev_asc", "edge_desc", "edge_asc", "clv_desc", "clv_asc", "delta_desc", "delta_asc"]} labels={{ recent: "Most recent", game: "Game", model_desc: "Model % ↓", model_asc: "Model % ↑", ev_desc: "EV ↓", ev_asc: "EV ↑", edge_desc: "Edge ↓", edge_asc: "Edge ↑", clv_desc: "Line move ↓", clv_asc: "Line move ↑", delta_desc: "Proj Δ ↓", delta_asc: "Proj Δ ↑" }} onChange={setBetSort} />
                 {(() => { const n = (betMinModel !== "" ? 1 : 0) + (betMinEdge !== "" ? 1 : 0) + (betMaxEdge !== "" ? 1 : 0) + (betMinOdds !== "" ? 1 : 0) + (betMaxOdds !== "" ? 1 : 0) + (betMinDelta !== "" ? 1 : 0) + (betMaxDelta !== "" ? 1 : 0) + (betDirAligned ? 1 : 0); return (
                   <button onClick={() => setShowMoreBets((s) => !s)} className={`text-xs rounded px-2.5 py-1.5 border ${showMoreBets || n ? "border-emerald-700 text-emerald-300" : "border-slate-700 text-slate-400 hover:text-slate-200"}`}>more{n ? ` (${n})` : ""} {showMoreBets ? "▴" : "▾"}</button>
                 ); })()}
@@ -1342,23 +1328,17 @@ export default function SportApp({ sport }) {
             {/* Date range filter */}
             <div className="flex items-end gap-3 flex-wrap mb-4 p-2.5 rounded-lg bg-slate-900/40 border border-slate-800">
               <label className="text-xs text-slate-400 flex flex-col gap-1">start date
-                <select value={statsStartDate} onChange={(e) => setStatsStartDate(e.target.value)} className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm text-slate-100 w-36">
-                  <option value="">first</option>
-                  {statsDates.map((k) => <option key={k} value={k}>{slateLabel(k)}</option>)}
-                </select>
+                <input type="date" value={statsStartDate} min={statsDates[0] || ""} max={statsEndDate || statsDates[statsDates.length - 1] || ""} onChange={(e) => setStatsStartDate(e.target.value)} className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm text-slate-100 w-36" />
               </label>
               <label className="text-xs text-slate-400 flex flex-col gap-1">end date
-                <select value={statsEndDate} onChange={(e) => setStatsEndDate(e.target.value)} className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm text-slate-100 w-36">
-                  <option value="">latest</option>
-                  {statsDates.map((k) => <option key={k} value={k}>{slateLabel(k)}</option>)}
-                </select>
+                <input type="date" value={statsEndDate} min={statsStartDate || statsDates[0] || ""} max={statsDates[statsDates.length - 1] || ""} onChange={(e) => setStatsEndDate(e.target.value)} className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm text-slate-100 w-36" />
               </label>
               {(statsStartDate || statsEndDate) && (
                 <button onClick={() => { setStatsStartDate(""); setStatsEndDate(""); }} className="text-[11px] text-slate-400 hover:text-rose-300 border border-slate-700 rounded px-2.5 py-1.5">clear</button>
               )}
               <div className="text-[11px] text-slate-500 self-end pb-1.5" style={mono}>
                 {statsStartDate || statsEndDate
-                  ? `${slateLabel(statsStartDate || statsDates[0]) || "…"} → ${slateLabel(statsEndDate || statsDates[statsDates.length - 1]) || "…"}`
+                  ? `${statsStartDate || statsDates[0] || "…"} → ${statsEndDate || statsDates[statsDates.length - 1] || "…"}`
                   : "all time"}
               </div>
             </div>

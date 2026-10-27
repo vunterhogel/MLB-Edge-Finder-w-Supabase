@@ -30,14 +30,16 @@ function InfoCard({ c }) {
       {c.empty ? <div className="text-sm text-slate-500">{c.empty}</div> : (
         <>
           {c.headline && <div className={`text-sm font-bold ${TONE_TEXT[c.headline.tone] || "text-slate-100"}`}>{c.headline.text}</div>}
-          {c.note && <div className="text-[11px] text-slate-500 mt-1" style={mono}>{c.note}</div>}
+          {c.note && (c.grid && c.grid.length
+            ? <div className="text-[10px] text-slate-600 mb-2" style={mono}>{c.note}</div>
+            : <div className="text-[11px] text-slate-500 mt-1" style={mono}>{c.note}</div>)}
           {c.lines && c.lines.length > 0 && (
             <div className="mt-2 space-y-1 text-[11px]" style={mono}>
               {c.lines.map((l, i) => { const o = typeof l === "string" ? { text: l } : l; return <div key={i} className={TONE_TEXT[o.tone] || "text-slate-400"}>{o.text}</div>; })}
             </div>
           )}
           {c.grid && c.grid.length > 0 && (
-            <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[11px] mt-1" style={mono}>
+            <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-[11px]" style={mono}>
               {c.grid.map(([l, v, tone]) => <span key={l} className="text-slate-500">{l} <b className={TONE_TEXT[tone] || TONE_TEXT.default}>{v == null ? "—" : v}</b></span>)}
             </div>
           )}
@@ -198,20 +200,19 @@ function GameLogCard({ log }) {
   );
 }
 
-export function PlayerAnalysisIntro({ games, boardCount, league }) {
-  const live = (games || []).filter((g) => g.status === "LIVE").length;
-  const ready = (games || []).filter((g) => g.status === "POSTED" || g.status === "PARTIAL" || g.status === "GOALIES").length;
+// intro = the sport's text: { file, fileSub, slate(games) -> string, slateSub } (MLB's three intro cards)
+export function PlayerAnalysisIntro({ games, boardCount, intro }) {
   return (
     <div className="grid sm:grid-cols-3 gap-3">
       <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-4">
         <div className="text-[10px] text-slate-500 font-bold tracking-wide mb-1">PLAYER FILE</div>
-        <div className="text-sm text-slate-300">Search any {league} player by name.</div>
-        <div className="text-[11px] text-slate-600 mt-2" style={mono}>season · recent windows · splits · game log</div>
+        <div className="text-sm text-slate-300">{intro.file}</div>
+        <div className="text-[11px] text-slate-600 mt-2" style={mono}>{intro.fileSub}</div>
       </div>
       <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-4">
         <div className="text-[10px] text-slate-500 font-bold tracking-wide mb-1">SLATE CONTEXT</div>
-        <div className="text-sm text-slate-300">{(games || []).length} game(s) on this slate · {ready} confirmed · {live} live.</div>
-        <div className="text-[11px] text-slate-600 mt-2" style={mono}>matchup · game environment · availability</div>
+        <div className="text-sm text-slate-300">{intro.slate(games || [])}</div>
+        <div className="text-[11px] text-slate-600 mt-2" style={mono}>{intro.slateSub}</div>
       </div>
       <div className="bg-slate-900/60 border border-slate-800 rounded-xl p-4">
         <div className="text-[10px] text-slate-500 font-bold tracking-wide mb-1">MARKET CONTEXT</div>
@@ -263,7 +264,7 @@ export function PlayerAnalysis({ view, profile, spot, detail, projections, board
         <div className="flex items-center justify-between gap-2 flex-wrap mb-2">
           <div>
             <div className="text-xs font-bold text-slate-300">Model Projections</div>
-            <div className="text-[11px] text-slate-500" style={mono}>{hasSlate ? (slateReady ? "using selected-slate matchup context" : "loading selected-slate context") : "available when the player is on the selected slate"}</div>
+            <div className="text-[11px] text-slate-500" style={mono}>{hasSlate ? (slateReady ? "using selected-slate matchup context" : "loading selected-slate context") : "available when player is in the selected slate"}</div>
           </div>
           {canFetchOdds && (
             oddsReady ? (
@@ -276,9 +277,8 @@ export function PlayerAnalysis({ view, profile, spot, detail, projections, board
             )
           )}
         </div>
-        {!hasSlate ? <div className="text-sm text-slate-500 py-5 text-center">No matchup on the selected slate. Change the slate if you want same-day projections.</div>
+        {!hasSlate ? <div className="text-sm text-slate-500 py-5 text-center">No matchup on the selected date. Change the date if you want same-day projections.</div>
           : !slateReady ? <div className="text-sm text-slate-500 py-5 text-center" style={mono}>loading matchup detail…</div>
-          : projections.length === 0 ? <div className="text-sm text-slate-500 py-5 text-center">No model context for this player in this game.</div>
           : <div className="grid sm:grid-cols-2 gap-2">{projections.map((r) => <AnalysisProjectionRow key={r.type} r={r} />)}</div>}
       </div>
 
@@ -286,7 +286,7 @@ export function PlayerAnalysis({ view, profile, spot, detail, projections, board
         <div className="flex items-center justify-between gap-2 flex-wrap mb-2">
           <div>
             <div className="text-xs font-bold text-slate-300">Current Board Markets</div>
-            <div className="text-[11px] text-slate-500" style={mono}>{boardEntries.length ? `${boardEntries.length} priced player market(s) loaded` : boardGameCount ? "game odds loaded, no matched player markets" : "pull odds for this game to see priced markets"}</div>
+            <div className="text-[11px] text-slate-500" style={mono}>{boardEntries.length ? `${boardEntries.length} priced player market(s) loaded` : boardGameCount ? "game odds loaded, no matched player markets" : "pull odds from Slate or this profile to populate market rows"}</div>
           </div>
           {boardEntries.length > 1 && (
             <div className="flex gap-1">

@@ -18,8 +18,10 @@ function classify(comp, hasGoalies) {
   const st = comp && comp.status && comp.status.type;
   if (st && st.completed) return "FINAL";
   if (st && st.state === "in") return "LIVE";
-  if (st && /POSTPON|CANCEL/i.test(String(st.name || ""))) return "POSTPONED";
-  return hasGoalies ? "GOALIES" : "SCHEDULED";
+  // MLB-shell status vocabulary: probable goalies posted = PENDING (probables), like MLB's probable pitchers;
+  // a postponed game stays SCHEDULED and settles as void through fetchGameResult, as on MLB
+  if (st && /POSTPON|CANCEL/i.test(String(st.name || ""))) return "SCHEDULED";
+  return hasGoalies ? "PENDING" : "SCHEDULED";
 }
 function probableGoalie(c) {
   const p = (c.probables || []).find((x) => /Goalie/i.test(String(x.name || "")));
@@ -43,8 +45,8 @@ export async function fetchSchedule(date) {
       homeRec: rec(home), awayRec: rec(away),
       time: ev.date ? new Date(ev.date).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "TBD",
       gameTimeIso: ev.date || null, venue: (comp.venue && comp.venue.fullName) || "",
-      status, homeScore: home.score != null && status !== "SCHEDULED" && status !== "GOALIES" ? +home.score : null,
-      awayScore: away.score != null && status !== "SCHEDULED" && status !== "GOALIES" ? +away.score : null,
+      status, homeScore: home.score != null && status !== "SCHEDULED" && status !== "PENDING" ? +home.score : null,
+      awayScore: away.score != null && status !== "SCHEDULED" && status !== "PENDING" ? +away.score : null,
       period: comp.status ? comp.status.period : null, clock: comp.status ? comp.status.displayClock : null,
       homeGoalie, awayGoalie, manual: false,
     };

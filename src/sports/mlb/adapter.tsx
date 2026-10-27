@@ -193,34 +193,36 @@ function hitterRow(g, d, p, i) {
   const stat = rec && rec.season, l15 = rec && rec.l15, bvp = rec && rec.bvp;
   const sProxy = stat && stat.ab ? (stat.h / stat.ab) + (stat.tb / stat.ab) : null;
   const oppLast = rec && rec.oppName ? rec.oppName.split(" ").slice(-1)[0] : null;
-  const badges = [];
+  let chip = null;
   if (rec && rec.bats && rec.oppThrows) {
     const f = calculatePlatoonAdjustment({ kind: "hitter", bats: rec.bats, oppThrows: rec.oppThrows, splits: rec.splits, season: rec.season });
-    badges.push({ text: `${rec.bats}v${rec.oppThrows} ×${f.toFixed(2)}`, tone: f < 0.99 ? "bad" : f > 1.01 ? "good" : "muted", title: `bats ${rec.bats} vs ${rec.oppThrows}HP` });
+    chip = { text: `${rec.bats}v${rec.oppThrows} ×${f.toFixed(2)}`, tone: f < 0.99 ? "bad" : f > 1.01 ? "good" : "muted", title: `bats ${rec.bats} vs ${rec.oppThrows}HP` };
   }
   return {
-    id: p.id, idx: i + 1, name: rec ? rec.name : "—", badges,
+    id: p.id, idx: i + 1, name: rec ? rec.name : "—", chip,
     stat: stat ? `${stat.avg != null ? stat.avg : "—"}/${stat.ops != null ? stat.ops : "—"}` : "—",
     hot: l15 && sProxy != null ? l15.ops - sProxy : null,
     detail: [
-      `season: ${stat ? `${stat.h}-${stat.ab}, ${stat.hr}HR, ${stat.slg != null ? stat.slg : "—"}SLG` : "n/a"}`,
-      ...(l15 ? [`L15: ${l15.h}-${l15.ab}, ${l15.hr}HR, ${l15.avg.toFixed(3)}`] : []),
-      ...(oppLast ? [`vs ${oppLast}: ${bvp ? `${bvp.h}-${bvp.ab}${bvp.hr ? `, ${bvp.hr}HR` : ""}` : (bvp === null ? "no history" : "…")}`] : []),
+      { text: `season: ${stat ? `${stat.h}-${stat.ab}, ${stat.hr}HR, ${stat.slg != null ? stat.slg : "—"}SLG` : "n/a"}` },
+      ...(l15 ? [{ text: `L15: ${l15.h}-${l15.ab}, ${l15.hr}HR, ${l15.avg.toFixed(3)}`, strong: true }] : []),
+      ...(oppLast ? [{ text: `vs ${oppLast}: ${bvp ? `${bvp.h}-${bvp.ab}${bvp.hr ? `, ${bvp.hr}HR` : ""}` : (bvp === null ? "no history" : "…")}` }] : []),
     ],
     player: p, draft: { kind: "hitter", id: p.id, name: rec && rec.name },
   };
 }
-function starterRow(sp, st) {
+function starterCard(label, sp, st) {
   return {
-    id: sp.id, name: sp.name, nameBadge: st && st.role === "swing" ? { text: "SWING", tone: "warn" } : null,
-    sub: st ? `${st.era} ERA · ${st.k9.toFixed(1)} K/9 · ~${st.expIp.toFixed(1)} IP${st.recentLog && st.recentLog.games >= 3 ? ` (L${st.recentLog.games} avg ${st.recentLog.avgIp.toFixed(1)})` : ""}` : "—",
-    player: sp, draft: { kind: "pitcher", id: sp.id, name: sp.name },
+    starter: true, title: `${label} SP`, empty: "TBD",
+    row: sp ? {
+      name: sp.name, nameBadge: st && st.role === "swing" ? "SWING" : null,
+      sub: st ? `${st.era} ERA · ${st.k9.toFixed(1)} K/9 · ~${st.expIp.toFixed(1)} IP${st.recentLog && st.recentLog.games >= 3 ? ` (L${st.recentLog.games} avg ${st.recentLog.avgIp.toFixed(1)})` : ""}` : "—",
+      player: sp, draft: { kind: "pitcher", id: sp.id, name: sp.name },
+    } : null,
   };
 }
 function slateView(g, d) {
   const gp = gameProbs(d.lambdaH, d.lambdaA);
   const wx = d.weather && !d.park.dome;
-  const sp = (s, label) => ({ title: `${label} SP`, empty: "TBD", rows: s ? [starterRow(s, d.spStats[s.id])] : [] });
   return {
     env: [
       { label: "PARK RF", v: d.park.rf.toFixed(2), hot: d.park.rf >= 1.05, cold: d.park.rf <= 0.96 },
@@ -228,11 +230,11 @@ function slateView(g, d) {
       ...(d.park.dome ? [{ label: "DOME", v: "yes" }] : []),
       ...(wx ? [{ label: "TEMP", v: `${d.weather.temp}°`, hot: d.weather.temp >= 85, cold: d.weather.temp <= 60 }, { label: "WIND", v: `${d.weather.wind}mph`, hot: d.weather.wind >= 12 }, { label: "RAIN", v: `${d.weather.pop}%`, hot: d.weather.pop >= 50 }] : []),
     ],
-    gameLine: { lambdaA: d.lambdaA, lambdaH: d.lambdaH, home: gp.home, away: gp.away, total: gp.totalLambda, note: "team run environment × park. Compare to the market for game-line edges." },
+    gameLine: { lambdaA: d.lambdaA, lambdaH: d.lambdaH, home: gp.home, away: gp.away, total: gp.totalLambda, note: "model line from team run env × park (read-only) — compare to market for game edges once moneyline odds are wired in." },
     sections: [
-      [{ title: `${g.away} (away)`, legend: "AVG/OPS", empty: "— not posted —", rows: (g.awayLineup || []).map((p, i) => hitterRow(g, d, p, i)) },
-       { title: `${g.home} (home)`, legend: "AVG/OPS", empty: "— not posted —", rows: (g.homeLineup || []).map((p, i) => hitterRow(g, d, p, i)) }],
-      [sp(g.awaySP, g.away), sp(g.homeSP, g.home)],
+      [{ title: `${g.away} (away)`, empty: "— not posted —", rows: (g.awayLineup || []).map((p, i) => hitterRow(g, d, p, i)) },
+       { title: `${g.home} (home)`, empty: "— not posted —", rows: (g.homeLineup || []).map((p, i) => hitterRow(g, d, p, i)) }],
+      [starterCard(g.away, g.awaySP, g.awaySP && d.spStats[g.awaySP.id]), starterCard(g.home, g.homeSP, g.homeSP && d.spStats[g.homeSP.id])],
     ],
   };
 }
@@ -240,13 +242,19 @@ function slateView(g, d) {
 const MLB = {
   id: "mlb",
   meta: {
-    title: "MLB", emoji: "⚾", league: "MLB",
+    title: "MLB", tagline: "live odds · de-vigged edge · Monte-Carlo props", emoji: "⚾", league: "MLB",
+    analysisHint: "MLB-wide profile lookup. If the player is on the selected slate, this tab adds matchup context, model projections, and any pulled",
     statsSource: "MLB Stats API", searchPlaceholder: "Mike Trout",
     csvPrefix: "mlb-edge-finder", boardLogCsvPrefix: "mlb-board-log", backupApp: "mlb-edge-finder",
     overrideTitle: "Per-market book overrides — e.g. pull Home Run odds from a different book than the rest of the board",
     diagnosticsType: "Home Run", diagnosticsMarketKey: "batter_home_runs",
     draftKindLabel: (kind) => (kind === "pitcher" ? "PITCHER" : "HITTER"),
     searchResultLine: (p) => `${p.teamAbbr || p.team || "FA"} · ${p.position || "—"} · bats ${p.bats || "—"} / throws ${p.throws || "—"}`,
+    intro: {
+      file: "Search any MLB player by name.", fileSub: "season · recent windows · splits · Statcast",
+      slate: (games) => `${games.filter((g) => g.status === "POSTED" || g.status === "PARTIAL").length} posted/partial lineup game(s), ${games.filter((g) => g.status === "LIVE").length} live.`,
+      slateSub: "matchup · park · weather · BvP",
+    },
   },
   config: { ALL_PROPS, BOOKS, BOOK_LABELS, CATEGORY_ORDER, DEFAULT_LINE, ODDS_TESTING_LIMIT, isLineType, matchesQuery, STAT_ORDER: CATEGORY_ORDER, TREND_PROPS, SIGNAL_RULES },
   storage,

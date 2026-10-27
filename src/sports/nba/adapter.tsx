@@ -9,7 +9,7 @@ import { jget, espnWeb } from "../../core/espn";
 import { normName } from "../../core/odds";
 import { createStorage } from "../../core/storage";
 import { logSections } from "../../core/playerLog";
-import { injuryBadge } from "../../core/slate";
+import { injuryChip } from "../../core/slate";
 
 // same keys as the old NBA page (nbaef_*), so existing bets and board log carry over
 const storage = createStorage("nbaef", MODEL_VERSION, {});
@@ -165,7 +165,7 @@ function analysisCtx(d, spot, profile) {
 
 /* ---- Slate: what the shared game panel shows for a basketball game ---- */
 const game = {
-  subtitle: (g) => g.venue || "TBD",
+  subtitle: (g) => (g.venue || "TBD") + (g.awayRec || g.homeRec ? ` · ${g.awayRec || "—"} / ${g.homeRec || "—"}` : ""),
   finalSuffix: (g) => (g.period && g.period > 4 ? `/${g.period === 5 ? "OT" : `${g.period - 4}OT`}` : ""),
   liveLabel: (g) => `${g.period > 4 ? "OT" : `Q${g.period}`} ${g.clock || ""}`,
 };
@@ -173,19 +173,22 @@ const perG = (log, k) => (log && log.season && log.season.g ? log.season[k] / lo
 const f1 = (x) => (x == null || isNaN(x) ? "—" : Number(x).toFixed(1));
 function nbaRow(d, p, i) {
   const lg = d.logs[p.id];
+  const r = lg && lg.recent && lg.recent.games ? lg.recent : null;
+  const rg = (k) => (r ? f1(r[k] / r.games) : "—");
   return {
-    id: p.id, idx: i + 1, tag: `${p.pos}${p.isStarter ? "*" : ""}`,
-    tagWarn: p.depthConfirmed === false ? "No confirmed depth chart for this team, so the order is the roster listing, not verified starters" : null,
-    name: p.name, badges: [injuryBadge(p.injuryStatus)].filter(Boolean),
+    id: p.id, idx: i + 1, name: p.name,
+    chip: { text: `${p.pos}${p.isStarter ? "*" : ""}`, tone: "muted", title: p.isStarter ? "depth-chart starter" : "rotation" },
+    chips: [p.depthConfirmed === false ? { text: "?", tone: "warn", title: "No confirmed depth chart for this team, so the order is the roster listing, not verified starters" } : null, injuryChip(p.injuryStatus)].filter(Boolean),
     stat: `${f1(perG(lg, "min"))} · ${f1(perG(lg, "pts"))} · ${f1(perG(lg, "reb"))} · ${f1(perG(lg, "ast"))} · ${f1(perG(lg, "fg3m"))}`,
+    detail: [
+      { text: `model base: ${lg && lg.season ? Math.round(lg.season.g) : 0} gm · MIN/PTS/REB/AST/3PM per game` },
+      ...(r ? [{ text: `L${r.games}: ${rg("min")} min, ${rg("pts")} pts, ${rg("reb")} reb, ${rg("ast")} ast`, strong: true }] : []),
+    ],
     player: { id: p.id, name: p.name }, draft: { kind: "player", id: p.id, name: p.name },
   };
 }
 function teamColumn(title, team, d) {
-  const featuredIds = new Set((team.featured || []).map((p) => p.id));
-  const rest = (team.roster || []).filter((p) => !featuredIds.has(p.id)).sort((a, b) => (perG(d.logs[b.id], "min") || 0) - (perG(d.logs[a.id], "min") || 0));
-  const n = (team.featured || []).length;
-  return { title, legend: "MIN · PTS · REB · AST · 3PM", empty: "— roster unavailable —", rows: (team.featured || []).map((p, i) => nbaRow(d, p, i)), moreRows: rest.map((p, i) => nbaRow(d, p, n + i)) };
+  return { title, empty: "— roster unavailable —", rows: (team.featured || []).map((p, i) => nbaRow(d, p, i)) };
 }
 function slateView(g, d) {
   const gp = gameProbs(d.lambdaH, d.lambdaA);
@@ -263,13 +266,19 @@ function draftCtx(d, g, kind, pid) {
 const NBA = {
   id: "nba",
   meta: {
-    title: "NBA", emoji: "🏀", league: "NBA",
+    title: "NBA", tagline: "live odds · de-vigged edge · Monte-Carlo props", emoji: "🏀", league: "NBA",
+    analysisHint: "NBA-wide profile lookup. If the player is on the selected slate, this tab adds matchup context, model projections, and any pulled",
     statsSource: "ESPN", searchPlaceholder: "Jayson Tatum",
     csvPrefix: "nba-edge-finder", boardLogCsvPrefix: "nba-board-log", backupApp: "nba-edge-finder",
     overrideTitle: "Per-market book overrides: pull one market from a different book when your main book doesn't carry it",
     diagnosticsType: "Double-Double", diagnosticsMarketKey: "player_double_double",
     draftKindLabel: () => "PLAYER",
     searchResultLine: (p) => `${p.teamName || "FA"}`,
+    intro: {
+      file: "Search any NBA player by name.", fileSub: "season · last 10 · game log",
+      slate: (games) => `${games.length} game(s) on this date, ${games.filter((g) => g.status === "LIVE").length} live.`,
+      slateSub: "rest · blowout risk · injuries · usage",
+    },
   },
   config: { ALL_PROPS: ALL_PLAYER_PROPS, BOOKS, BOOK_LABELS, CATEGORY_ORDER, DEFAULT_LINE, ODDS_TESTING_LIMIT, isLineType, isYesNoType, matchesQuery, STAT_ORDER, TREND_PROPS, SIGNAL_RULES },
   storage,

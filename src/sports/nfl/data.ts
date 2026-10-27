@@ -65,6 +65,11 @@ export function mapGame(ev) {
     manual: false,
   };
 }
+// the shell navigates every sport by date: the NFL games on one calendar date (same scoreboard feed)
+export async function fetchScheduleByDate(date) {
+  const d = await jget(`${ESPN_SITE}/scoreboard?dates=${String(date).replace(/-/g, "")}&limit=100`);
+  return (d.events || []).map(mapGame);
+}
 export async function fetchSchedule(seasonType, week, year) {
   const d = await jget(`${ESPN_SITE}/scoreboard?seasontype=${seasonType}&week=${week}&year=${year}`);
   return (d.events || []).map(mapGame);

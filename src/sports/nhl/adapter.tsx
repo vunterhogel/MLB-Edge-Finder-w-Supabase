@@ -99,7 +99,7 @@ function trendSubjects(g, d) {
 /* ---- Slate: what the shared game panel shows for a hockey game ---- */
 const periodLabel = (p) => (p == null ? "" : p <= 3 ? `P${p}` : p === 4 ? "OT" : "SO");
 const game = {
-  subtitle: (g) => `G: ${g.awayGoalie ? g.awayGoalie.name : "TBD"} vs ${g.homeGoalie ? g.homeGoalie.name : "TBD"}`,
+  subtitle: (g) => `G: ${g.awayGoalie ? g.awayGoalie.name : "TBD"} vs ${g.homeGoalie ? g.homeGoalie.name : "TBD"}` + (g.awayRec || g.homeRec ? ` · ${g.awayRec || "—"} / ${g.homeRec || "—"}` : ""),
   finalSuffix: (g) => (g.period && g.period > 3 ? `/${periodLabel(g.period)}` : ""),
   liveLabel: (g) => `${periodLabel(g.period)} ${g.clock || ""}`,
 };
@@ -108,30 +108,32 @@ const f2 = (x) => (x == null || isNaN(x) ? "—" : Number(x).toFixed(2));
 const svFmt = (x) => (x == null ? "—" : x.toFixed(3).replace(/^0/, ""));
 function skaterRow(p, i) {
   return {
-    id: p.id, idx: i + 1, tag: p.pos, name: p.name,
-    badges: p.injury ? [{ text: p.injury, tone: "bad" }] : [],
+    id: p.id, idx: i + 1, name: p.name,
+    chip: { text: p.pos, tone: "muted" },
+    chips: p.injury ? [{ text: p.injury, tone: "bad" }] : [],
     stat: `${p.gp} · ${p.season.g}-${p.season.a}-${p.season.g + p.season.a} · ${f1(p.rates.sog)} · ${f1(p.rates.recentToi || p.rates.toi)}`,
+    detail: [
+      { text: `GP ${p.gp} · G-A-P ${p.season.g}-${p.season.a}-${p.season.g + p.season.a}` },
+      { text: `model SOG/g ${f2(p.rates.sog)} · TOI ${f1(p.rates.recentToi || p.rates.toi)}`, strong: true },
+    ],
     player: { id: p.id, name: p.name }, draft: { kind: "skater", id: p.id, name: p.name },
   };
 }
+// regulars (anyone with games this season or last), forwards then defense, by ice time
 function skaterColumn(title, list) {
-  // regulars (anyone with games this season or last) first, by ice time; the rest behind "show all"
   const active = list.filter((p) => p.gp > 0 || p.rates.priorGames > 0).slice(0, 20);
-  const activeIds = new Set(active.map((p) => p.id));
-  const rest = list.filter((p) => !activeIds.has(p.id));
-  return { title, legend: "GP · G-A-P · SOG/g · TOI", empty: "— roster unavailable —", rows: active.map((p, i) => skaterRow(p, i)), moreRows: rest.map((p, i) => skaterRow(p, active.length + i)) };
+  return { title, empty: "— roster unavailable —", rows: active.map((p, i) => skaterRow(p, i)) };
 }
-function goalieColumn(title, goalies, expShots) {
+function goalieCard(title, goalies, expShots) {
   const starter = goalies.find((x) => x.starter) || null;
   const others = goalies.filter((x) => x !== starter);
-  if (!starter) return { title, empty: `starter not posted${others.length ? ` · ${others.map((o) => o.name).join(", ")}` : ""}`, rows: [] };
   return {
-    title,
-    rows: [{
-      id: starter.id, name: starter.name, nameBadge: { text: starter.starterStatus || "PROBABLE", tone: "good" },
+    starter: true, title, empty: `starter not posted${others.length ? ` · ${others.map((o) => o.name).join(", ")}` : ""}`,
+    row: starter ? {
+      name: starter.name, nameBadge: starter.starterStatus || "PROBABLE",
       sub: `${svFmt(starter.rates.rawSvPct)} SV% (${starter.rates.starts} GS) · model ${svFmt(starter.rates.svPct)} · ${f2(starter.rates.gaa)} GAA · ~${f1(expShots * starter.rates.svPct * 0.97)} saves${others.length ? ` · backup: ${others.map((o) => o.name).join(", ")}` : ""}`,
       player: { id: starter.id, name: starter.name }, draft: { kind: "goalie", id: starter.id, name: starter.name },
-    }],
+    } : null,
   };
 }
 function slateView(g, d) {
@@ -148,10 +150,10 @@ function slateView(g, d) {
       { label: `${g.home} GA/G`, v: f2(T.home.ga), hot: T.home.ga >= 3.4, cold: T.home.ga <= 2.7 },
       { label: "EXP SOG", v: `${f1(d.shotsA)}–${f1(d.shotsH)}`, hot: d.shotsA + d.shotsH >= 62, cold: d.shotsA + d.shotsH <= 52 },
     ],
-    gameLine: { lambdaA: d.lambdaA, lambdaH: d.lambdaH, home: gp.home, away: gp.away, total: gp.totalLambda, extra: [["OT", pct(gp.regTie)]], note: "team goal rates (shrunk to league) × opponent defense and starting goalie × home ice. Win % includes OT/shootout." },
+    gameLine: { lambdaA: d.lambdaA, lambdaH: d.lambdaH, home: gp.home, away: gp.away, total: gp.totalLambda, note: "team goal rates (shrunk to league) × opponent defense and starting goalie × home ice. Win % includes OT/shootout." },
     sections: [
       [skaterColumn(`${g.away} (away)`, side("away")), skaterColumn(`${g.home} (home)`, side("home"))],
-      [goalieColumn(`${g.away} G`, gl("away"), d.shotsH), goalieColumn(`${g.home} G`, gl("home"), d.shotsA)],
+      [goalieCard(`${g.away} G`, gl("away"), d.shotsH), goalieCard(`${g.home} G`, gl("home"), d.shotsA)],
     ],
   };
 }
@@ -231,13 +233,19 @@ function draftCtx(d, g, kind, pid) {
 const NHL = {
   id: "nhl",
   meta: {
-    title: "NHL", emoji: "🏒", league: "NHL",
+    title: "NHL", tagline: "live odds · de-vigged edge · Monte-Carlo props", emoji: "🏒", league: "NHL",
+    analysisHint: "NHL-wide profile lookup. If the player is on the selected slate, this tab adds matchup context, model projections, and any pulled",
     statsSource: "ESPN", searchPlaceholder: "Connor McDavid",
     csvPrefix: "nhl-edge-finder", boardLogCsvPrefix: "nhl-board-log", backupApp: "nhl-edge-finder",
     overrideTitle: "Per-market book overrides: pull one market (e.g. Saves) from a different book than the rest of the board",
     diagnosticsType: "Saves", diagnosticsMarketKey: "player_total_saves",
     draftKindLabel: (kind) => (kind === "goalie" ? "GOALIE" : "SKATER"),
     searchResultLine: (p) => `${p.teamName || "FA"}`,
+    intro: {
+      file: "Search any NHL player by name.", fileSub: "season · recent windows · game log",
+      slate: (games) => `${games.filter((g) => g.homeGoalie || g.awayGoalie).length} game(s) with probable goalies, ${games.filter((g) => g.status === "LIVE").length} live.`,
+      slateSub: "opponent · goalie · goal environment",
+    },
   },
   config: { ALL_PROPS, BOOKS, BOOK_LABELS, CATEGORY_ORDER, DEFAULT_LINE, ODDS_TESTING_LIMIT, isLineType, matchesQuery, STAT_ORDER, TREND_PROPS, SIGNAL_RULES },
   storage,

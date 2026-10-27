@@ -54,11 +54,9 @@ export function TrendPill({ label, s }) {
 export function StatCard({ label, v, good }) {
   return <div className="bg-slate-900/70 border border-slate-800 rounded-xl px-3 py-3"><div className="text-[10px] text-slate-500 font-bold tracking-wide">{label}</div><div className={`text-xl font-black mt-0.5 ${good === true ? "text-emerald-400" : good === false ? "text-rose-400" : "text-slate-100"}`}>{v}</div></div>;
 }
-// compact selects get a FIXED width (w) so filter bars lay out identically for every sport, whatever the
-// length of its market names; long option labels truncate inside the box instead of widening it
-export function Sel({ label, v, opts, labels, onChange, compact, w = "w-32" }) {
+export function Sel({ label, v, opts, labels, onChange, compact }) {
   const sel = (
-    <select value={v} onChange={(e) => onChange(e.target.value)} className={`bg-slate-950 border border-slate-700 rounded px-2 ${compact ? `py-1 ${w} truncate` : "py-1.5"} text-sm text-slate-100`}>
+    <select value={v} onChange={(e) => onChange(e.target.value)} className={`bg-slate-950 border border-slate-700 rounded px-2 ${compact ? "py-1" : "py-1.5"} text-sm text-slate-100`}>
       {opts.map((o) => <option key={o} value={o}>{labels && labels[o] != null ? labels[o] : o}</option>)}
     </select>
   );
@@ -72,7 +70,7 @@ export function MultiSel({ label, selected, opts, labels, onChange, compact }) {
   const summary = selected.length === 0 ? "All" : selected.length === 1 ? lab(selected[0]) : `${selected.length} selected`;
   return (
     <div className="relative inline-block">
-      <button onClick={() => setOpen((o) => !o)} className={`bg-slate-950 border rounded px-2 ${compact ? "py-1 w-40 truncate text-left" : "py-1.5"} text-sm whitespace-nowrap ${selected.length ? "border-emerald-700 text-emerald-300" : "border-slate-700 text-slate-100"}`}>
+      <button onClick={() => setOpen((o) => !o)} className={`bg-slate-950 border rounded px-2 ${compact ? "py-1" : "py-1.5"} text-sm whitespace-nowrap ${selected.length ? "border-emerald-700 text-emerald-300" : "border-slate-700 text-slate-100"}`}>
         <span className="text-slate-400">{label}</span> {summary} ▾
       </button>
       {open && (

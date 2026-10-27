@@ -1,8 +1,10 @@
-/* Per-sport persistence (bets, credits, book overrides, board log in IndexedDB). EVERY sport uses this one
-   module, so tracked bets, the board log and their exports behave identically sport to sport; only the
-   key prefix differs, so sports never share data.
-   createStorage("mlbef", ...) -> mlbef_mybets_v1, mlbef_boardlog_db, etc. (MLB's original keys). */
-export function createStorage(prefix, MODEL_VERSION, DEFAULT_BOOK_OVERRIDES = {}) {
+/* Per-sport persistence (bets, credits, book overrides, board log in IndexedDB). This is the MLB storage
+   module, used unchanged by every sport and keyed by a sport prefix so sports never share data.
+   createStorage("mlbef", ...) -> mlbef_mybets_v1, mlbef_boardlog_db, etc.
+   migrateRecord (optional): applied to each stored bet and board-log row when it is loaded, for a sport
+   whose older records predate this shared format (old NFL records stored their slate as a week key). */
+export function createStorage(prefix, MODEL_VERSION, DEFAULT_BOOK_OVERRIDES = {}, migrateRecord = null) {
+  const migrate = (rows) => (migrateRecord && Array.isArray(rows) ? rows.map((r) => (r ? migrateRecord(r) : r)) : rows);
   const LS_BETS = `${prefix}_mybets_v1`;
   const LS_CREDITS = `${prefix}_credits_v1`;
   const LS_SHOW_COVERAGE = `${prefix}_showcoverage_v1`;
@@ -13,8 +15,7 @@ export function createStorage(prefix, MODEL_VERSION, DEFAULT_BOOK_OVERRIDES = {}
   const BOARD_DB_NAME = `${prefix}_boardlog_db`;
   const BOARD_DB_STORE = "kv";
   const BOARD_DB_KEY = "boardLog";
-  // every tracked bet carries its slate key in `date` (old NFL bets stored it as `week`)
-  function loadBets() { try { return (JSON.parse(localStorage.getItem(LS_BETS)) || []).map((b) => (b && b.date == null && b.week != null ? { ...b, date: b.week } : b)); } catch { return []; } }
+  function loadBets() { try { return migrate(JSON.parse(localStorage.getItem(LS_BETS)) || []); } catch { return []; } }
   function saveBets(b) { try { localStorage.setItem(LS_BETS, JSON.stringify(b)); } catch { /* storage unavailable */ } }
   function loadCredits() { try { const v = localStorage.getItem(LS_CREDITS); return v == null || v === "" ? null : +v; } catch { return null; } }
   function loadShowCoverage() { try { const v = localStorage.getItem(LS_SHOW_COVERAGE); return v == null ? false : v === "1"; } catch { return false; } }
@@ -35,9 +36,9 @@ export function createStorage(prefix, MODEL_VERSION, DEFAULT_BOOK_OVERRIDES = {}
    * and training residual models. Without full-board logging we only have selection-
    * biased data from manually tracked bets, which is useless for model evaluation.
    *
-   * Schema: one row per (player × prop type × line × side × slate × model version).
+   * Schema: one row per (player × prop type × line × side × date).
    * Settlement update: when settleBets() runs, actual results are written back.
-   * Retention: last 730 days / 300k rows, enforced on every append.
+   * Retention: last 60 days / 100k rows, enforced on every append.
    */
 
   /* Board log storage: IndexedDB (localStorage's ~5MB quota silently dropped rows past ~10.5k).
@@ -102,7 +103,7 @@ export function createStorage(prefix, MODEL_VERSION, DEFAULT_BOOK_OVERRIDES = {}
           }
         } catch { /* corrupted legacy data — start fresh */ }
       }
-      boardLogCache = Array.isArray(rows) ? rows : [];
+      boardLogCache = Array.isArray(rows) ? migrate(rows) : [];
     } catch (err) {
       boardLogSaveError = `Board log storage unavailable: ${String((err && err.message) || err)}`;
     }
@@ -122,71 +123,66 @@ export function createStorage(prefix, MODEL_VERSION, DEFAULT_BOOK_OVERRIDES = {}
   function getBoardLogSaveError() {
     return boardLogSaveError;
   }
-  /* ---- one board-log row schema for every sport ----
-     logId = `${slate}|${modelVersion}|${betId}`: the slate key (a date for MLB/NBA/NHL, a week key like
-     "2026-2-8" for NFL) plus the model version, so a new model version logs its own snapshot of the same
-     bet next to the old one (champion/challenger on identical games) instead of being deduped away.
-     Older rows keep the ids they were written with; dedupe reads both forms so the switch never logs a
-     duplicate. `date` always holds the slate key (old NFL rows stored it as `week`). */
-  const slateOf = (row) => (row.date ?? row.week ?? "");
-  function dedupeKey(row) {
-    const parts = String(row.logId || "").split("|");
-    if (parts.length >= 3) return row.logId;                       // already slate|version|bet
-    return `${slateOf(row)}|${row.modelVersion || ""}|${parts[parts.length - 1]}`; // legacy slate|bet
-  }
-  async function appendBoardLog(entries, modelVersion, slate) {
+  async function appendBoardLog(entries, modelVersion, date) {
     if (!entries || !entries.length) return;
     await boardLogReady; // never append before the persisted log has loaded
     const existing = loadBoardLog();
-    const existingByKey = new Map(existing.map((e) => [dedupeKey(e), e]));
+    const existingIds = new Set(existing.map((e) => e.logId));
     const now = new Date().toISOString();
     const cutoffMs = Date.now() - BOARD_LOG_RETENTION_DAYS * 86400000;
+    const existingById = new Map(existing.map((e) => [e.logId, e]));
 
-    // Rows freeze at first-seen (that's what makes them useful for calibration/CLV research), so a
-    // field added after a bet was first logged (gameTimeIso) can only reach the row by this backfill.
-    // Never the frozen calibration numbers.
+    // logId is deterministic (date + game + player + market + line + side, no timestamp) BY
+    // DESIGN — once a bet is logged today, its model%/novig/edge/EV snapshot is meant to freeze
+    // at first-seen, not get overwritten on every board refresh (that's what makes it useful for
+    // calibration/CLV research later). But that means a field added AFTER a bet was already
+    // logged today (gameTimeIso, added for the Parlay Builder's kickoff filter) can never reach
+    // an already-logged row through the normal "new row" path below — it'd just get silently
+    // deduped away forever. Backfill ONLY that kind of previously-missing metadata in place,
+    // never the frozen calibration numbers.
     let backfilled = 0;
     for (const e of entries) {
-      const already = existingByKey.get(`${slate}|${modelVersion}|${e.id}`);
+      const already = existingById.get(`${date}|${e.id}`);
       if (already && !already.gameTimeIso && e.gameTimeIso) { already.gameTimeIso = e.gameTimeIso; backfilled++; }
     }
 
     const newRows = entries
       .filter((e) => e.modelP != null && e.novig != null)
-      .map((e) => ({
-        logId: `${slate}|${modelVersion}|${e.id}`,
-        loggedAt: now,
-        modelVersion,
-        date: slate,
-        // market
-        game: e.game,
-        gameTimeIso: e.gameTimeIso || null,
-        gamePk: String(e.gamePk),
-        playerId: String(e.playerId ?? ""),
-        name: e.name,
-        type: e.type,
-        line: e.line,
-        side: e.side,
-        odds: e.odds,
-        novig: e.novig != null ? +e.novig.toFixed(4) : null,
-        // model
-        rawModelP: e.rawModelP != null ? +e.rawModelP.toFixed(4) : null,
-        calibratedP: e.modelP != null ? +e.modelP.toFixed(4) : null,
-        edge: e.edge != null ? +e.edge.toFixed(4) : null,
-        ev: e.ev != null ? +e.ev.toFixed(4) : null,
-        proj: e.proj != null ? +e.proj.toFixed(3) : null,
-        // snapshot context
-        live: !!(e.calc && (e.calc.live || /live/i.test(String(e.calc.dist || "")))),
-        preStart: e.gameTimeIso ? Date.parse(now) < Date.parse(e.gameTimeIso) : null,
-        suppressed: e.suppressNote || (e.outsSanityFailed ? "stale IP data" : null), // edge forced to market by a sanity gate
-        // settlement (filled later)
-        settled: false,
-        actualStat: null,
-        result: null,        // "won" | "lost" | "push" | "void"
-        closingNovig: null,  // from refreshLines() when bet started
-        clv: null,           // closingNovig - novig (positive = we beat the close)
-      }))
-      .filter((e) => !existingByKey.has(e.logId));
+      .map((e) => {
+        const logId = `${date}|${e.id}`;
+        return {
+          logId,
+          loggedAt: now,
+          modelVersion,
+          date,
+          // market
+          game: e.game,
+          gameTimeIso: e.gameTimeIso || null,
+          gamePk: String(e.gamePk),
+          playerId: String(e.playerId ?? ""),
+          name: e.name,
+          type: e.type,
+          line: e.line,
+          side: e.side,
+          odds: e.odds,
+          novig: e.novig != null ? +e.novig.toFixed(4) : null,
+          // model
+          rawModelP: e.rawModelP != null ? +e.rawModelP.toFixed(4) : null,
+          calibratedP: e.modelP != null ? +e.modelP.toFixed(4) : null,
+          edge: e.edge != null ? +e.edge.toFixed(4) : null,
+          ev: e.ev != null ? +e.ev.toFixed(4) : null,
+          proj: e.proj != null ? +e.proj.toFixed(3) : null,
+          // in-game snapshot? (live and pregame rows were previously indistinguishable in the log)
+          live: !!(e.calc && (e.calc.live || /live/i.test(String(e.calc.dist || "")))),
+          // settlement (filled later)
+          settled: false,
+          actualStat: null,
+          result: null,        // "won" | "lost" | "push" | "void"
+          closingNovig: null,  // from refreshLines() when bet started
+          clv: null,           // closingNovig - novig (positive = we beat the close)
+        };
+      })
+      .filter((e) => !existingIds.has(e.logId));
 
     if (!newRows.length) { if (backfilled) saveBoardLog(existing); return; }
 
@@ -203,17 +199,17 @@ export function createStorage(prefix, MODEL_VERSION, DEFAULT_BOOK_OVERRIDES = {}
     await boardLogReady;
     const log = loadBoardLog();
     if (!log.length) return;
-    // Build lookup: slate|gamePk|playerId|type|line|side -> { actual, status }
+    // Build lookup: date|gamePk|playerId|type|line|side -> { actual, status }
     const lookup = {};
     for (const b of settledBets) {
       if (b.status === "open") continue;
-      const key = `${slateOf(b)}|${b.gamePk}|${b.playerId}|${b.type}|${b.line}|${b.side}`;
+      const key = `${b.date}|${b.gamePk}|${b.playerId}|${b.type}|${b.line}|${b.side}`;
       lookup[key] = { actual: b.actual, result: b.status };
     }
     let changed = false;
     const updated = log.map((e) => {
       if (e.settled) return e;
-      const key = `${slateOf(e)}|${e.gamePk}|${e.playerId}|${e.type}|${e.line}|${e.side}`;
+      const key = `${e.date}|${e.gamePk}|${e.playerId}|${e.type}|${e.line}|${e.side}`;
       const hit = lookup[key];
       if (!hit) return e;
       changed = true;

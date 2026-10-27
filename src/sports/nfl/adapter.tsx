@@ -1,45 +1,46 @@
-/* NFL sport adapter for the shared SportApp shell (same shape as the MLB / NBA / NHL adapters).
+/* NFL sport adapter for the shared MLB shell (same shape as the MLB / NBA / NHL adapters).
    The projection model is the old NFL page's engine, moved without changing a number (nfl-v2).
-   NFL runs by week, not date, so this adapter also supplies the shell's optional week navigator:
-   the slate key is "<year>-<seasonType>-<week>" (e.g. "2026-2-8"), the same key the old page used for
-   tracked bets and board-log ids, so existing data lines up. */
+   Everything else (navigation by date, tracking, settlement, stats, persistence) is the MLB shell's. */
 import { ALL_PLAYER_PROPS, BOOKS, BOOK_LABELS, CATEGORY_ORDER, DEFAULT_LINE, HOME_FIELD_MULT, LG_PPG, ODDS_SPORT, ODDS_SPORT_PRESEASON, ODDS_TESTING_LIMIT, STADIUMS, SIGNAL_RULES, isLineType, matchesQuery } from "./config";
-import { GAMELOG_ROWS, ESPN_WEB, TREND_PROPS, actualFor, buildGameLineEntries, buildTrendCard, currentWeekGuess, fetchAthleteGamelog, fetchCurrentWeek, fetchDepthChart, fetchEventOdds, fetchGameSummary, fetchLongCmpForEventTrySeasons, fetchOddsEvents, fetchRoster, fetchSchedule, fetchStandings, fetchTeamStats, fetchWeather, gradeLine, jget, matchCurrentOdds, matchEvent, normName, parseEventOdds, parseGameOdds, searchPlayers, trendValueForGame, weekYear } from "./data";
-import { EXPERIMENTAL_TYPES, MODEL_VERSION, calculateInjuryAvailability, evalBet, gameProbs, projectProp } from "./engine";
+import { GAMELOG_ROWS, ESPN_WEB, TREND_PROPS, actualFor, buildGameLineEntries, buildTrendCard, fetchAthleteGamelog, fetchDepthChart, fetchEventOdds, fetchGameSummary, fetchLongCmpForEventTrySeasons, fetchOddsEvents, fetchRoster, fetchScheduleByDate, fetchStandings, fetchTeamStats, fetchWeather, gradeLine, jget, matchCurrentOdds, matchEvent, normName, parseEventOdds, parseGameOdds, searchPlayers, trendValueForGame } from "./data";
+import { MODEL_VERSION, calculateInjuryAvailability, evalBet, gameProbs, projectProp } from "./engine";
 import { analysisCtx, featuredFromRosterAndDepth, playerCtx, posKey, propsForKind, propsForPos, rosterSpot } from "./context";
 import { createStorage } from "../../core/storage";
-import { clamp, gradeBet, pct } from "../../core/math";
-import { WeekPicker, weekShift } from "./ui";
+import { clamp, gradeBet } from "../../core/math";
 import { logSections } from "../../core/playerLog";
-import { injuryBadge } from "../../core/slate";
+import { injuryChip } from "../../core/slate";
 
-const storage = createStorage("nfief", MODEL_VERSION, {});   // nfief_* keys (unchanged)
+// NFL seasons cross the new year (playoffs in Jan/Feb belong to the previous season)
+export function nflSeasonFor(dateStr) { const [y, m] = String(dateStr).split("-").map(Number); return m >= 3 ? y : y - 1; }
 
-/* ---------------- week slate ---------------- */
-const SEASON_TYPE_SHORT = { 1: "Pre", 2: "", 3: "Post" };
-export function parseWeekKey(k) {
-  const [y, st, w] = String(k || "").split("-").map(Number);
-  return { year: y || new Date().getFullYear(), seasonType: st || 2, week: w || 1 };
+// Older NFL records (before the shared shell) stored their slate as a week key "year-seasonType-week".
+// The shell keys every sport by date, so those are mapped to the Sunday of that week when loaded
+// (bets and board-log rows map identically, so settlement still pairs them up).
+function weekKeySunday(k) {
+  const m = /^(\d{4})-([123])-(\d+)$/.exec(String(k || ""));
+  if (!m) return null;
+  const y = +m[1], st = +m[2], w = +m[3];
+  const labor = new Date(y, 8, 1); while (labor.getDay() !== 1) labor.setDate(labor.getDate() + 1);
+  const wk1 = new Date(labor); wk1.setDate(wk1.getDate() + 6);           // first regular-season Sunday
+  const d = new Date(wk1);
+  if (st === 2) d.setDate(d.getDate() + 7 * (w - 1));
+  else if (st === 1) d.setDate(d.getDate() - 7 * (4 - w));
+  else d.setDate(d.getDate() + 7 * (17 + w));
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
-export const weekKeyOf = ({ year, seasonType, week }) => `${year}-${seasonType}-${week}`;
-const slate = {
-  unit: "week",
-  initial: () => weekKeyOf(currentWeekGuess()),
-  resolveCurrent: async () => weekKeyOf(await fetchCurrentWeek()),
-  season: (k) => String(parseWeekKey(k).year),
-  order: (k) => { const { year, seasonType, week } = parseWeekKey(k); return year * 1000 + seasonType * 100 + week; },
-  label: (k) => { const { year, seasonType, week } = parseWeekKey(k); return `${year} ${SEASON_TYPE_SHORT[seasonType] ? `${SEASON_TYPE_SHORT[seasonType]} ` : ""}Wk ${week}`; },
-  shift: weekShift,
-  today: async () => weekKeyOf(await fetchCurrentWeek()),
-  Picker: WeekPicker,
-};
+function migrateRecord(r) {
+  const k = r.date ?? r.week;
+  const date = weekKeySunday(k);
+  return date ? { ...r, date } : (r.date == null && r.week != null ? { ...r, date: r.week } : r);
+}
+const storage = createStorage("nfief", MODEL_VERSION, {}, migrateRecord);   // nfief_* keys (unchanged)
 
-/* the odds feed splits preseason into its own sport key; follow whichever week is loaded */
+/* the odds feed splits preseason into its own sport key; follow the loaded date's games */
 let currentSportKey = ODDS_SPORT;
-async function fetchScheduleForKey(k) {
-  const { year, seasonType, week } = parseWeekKey(k);
-  currentSportKey = seasonType === 1 ? ODDS_SPORT_PRESEASON : ODDS_SPORT;
-  return fetchSchedule(seasonType, week, year);
+async function fetchScheduleForDate(date) {
+  const games = await fetchScheduleByDate(date);
+  currentSportKey = games.some((g) => g.seasonType === 1) ? ODDS_SPORT_PRESEASON : ODDS_SPORT;
+  return games;
 }
 
 /* ---------------- per-game detail (moved from the old page's loadDetail) ---------------- */
@@ -49,7 +50,7 @@ const standingsCache = {};
 function standingsFor(yr) { if (!standingsCache[yr]) standingsCache[yr] = fetchStandings(yr).catch(() => ({})); return standingsCache[yr]; }
 
 async function loadGameDetail(g, { date }) {
-  const year = parseWeekKey(date).year;
+  const year = nflSeasonFor(date);
   const standings = await standingsFor(year);
   const stadium = STADIUMS[g.homeId] || { lat: null, lon: null, dome: true };
   const [rosterH, rosterA, depthH, depthA, teamStatsH, teamStatsA] = await Promise.all([
@@ -112,15 +113,11 @@ function buildPropEntries(g, d, rows, book, gl) {
       if (odds == null) continue;
       const bet = { gamePk: g.pk, game: `${g.away}@${g.home}`, gameTimeIso: g.gameTimeIso || null, playerId: found.id, name: found.name, type: row.type, line: String(row.point), side, odds, overOdds: row.over, underOdds: row.under, ctx: found.ctx, book: row.srcBook || book };
       const ev = evalBet(bet, pre);
-      entries.push({ id: `${g.pk}-${found.id}-${row.type}-${row.point}-${side}`, ...bet, ...ev, experimental: EXPERIMENTAL_TYPES.has(row.type), suppressNote: ev.roleCheck ? "role check" : null });
+      entries.push({ id: `${g.pk}-${found.id}-${row.type}-${row.point}-${side}`, ...bet, ...ev, suppressNote: ev.roleCheck ? "role check" : null });
     }
   }
   return entries;
 }
-function buildLineEntries(g, d, gl, book) {
-  return buildGameLineEntries(g, d, gl, book).map((e) => ({ ...e, experimental: EXPERIMENTAL_TYPES.has(e.type) }));
-}
-
 /* ---------------- Player Analysis ---------------- */
 const dstName = (teamId, d) => {
   const g = d && (d.home.teamId === teamId ? "home" : d.away.teamId === teamId ? "away" : null);
@@ -132,7 +129,7 @@ async function fetchPlayerAnalysisProfile(player, _season, key) {
     const teamId = Number(id.slice(4));
     return { kind: "DST", player: { id, name: player.name || "D/ST", pos: "DST", teamId, teamName: player.teamName || "" }, log: null, priorLog: null };
   }
-  const year = parseWeekKey(key).year;
+  const year = nflSeasonFor(key);
   const [bio, gl] = await Promise.all([
     jget(`${ESPN_WEB}/athletes/${id}`).catch(() => null),
     fetchAthleteGamelog(id, 4).catch(() => null),
@@ -169,7 +166,7 @@ function trendSubjects(g, d) {
 
 /* ---------------- Slate: what the shared game panel shows for a football game ---------------- */
 const game = {
-  subtitle: (g) => g.venue || "TBD",
+  subtitle: (g) => (g.venue || "TBD") + (g.awayRec || g.homeRec ? ` · ${g.awayRec || "—"} / ${g.homeRec || "—"}` : ""),
   finalSuffix: (g) => (g.period && g.period > 4 ? "/OT" : ""),
   liveLabel: (g) => `${g.period > 4 ? "OT" : `Q${g.period}`} ${g.clock || ""}`,
 };
@@ -184,14 +181,18 @@ function footballColumn(title, team, d) {
   const dst = { id: `dst-${team.teamId}`, pos: "DST", name: `${title.split(" ")[0]} D/ST` };
   const rows = [...team.featured, dst].map((p, i) => {
     const pos = posKey(p.pos);
+    const gl = d.logs[p.id];
+    const s = gl && gl.season;
     return {
-      id: p.id, idx: i + 1, tag: `${p.pos}${p.depthRank && p.depthRank < 90 ? p.depthRank : ""}`,
-      tagWarn: p.depthConfirmed === false ? "No confirmed depth chart for this team, so the order is the roster listing, not a verified starter" : null,
-      name: p.name, badges: [injuryBadge(p.injuryStatus)].filter(Boolean), stat: l4(d.logs[p.id], pos),
+      id: p.id, idx: i + 1, name: p.name,
+      chip: { text: `${p.pos}${p.depthRank && p.depthRank < 90 ? p.depthRank : ""}`, tone: "muted", title: "position / depth-chart rank" },
+      chips: [p.depthConfirmed === false ? { text: "?", tone: "warn", title: "No confirmed depth chart for this team, so the order is the roster listing, not a verified starter" } : null, injuryChip(p.injuryStatus)].filter(Boolean),
+      stat: l4(gl, pos),
+      detail: [{ text: s && s.g ? `season: ${s.g} gm` : "season: n/a" }, ...(gl && gl.recent && gl.recent.games ? [{ text: `last ${gl.recent.games}: ${l4(gl, pos) || "—"}`, strong: true }] : [])],
       player: { id: p.id, name: p.name, pos: p.pos, teamId: team.teamId }, draft: { kind: pos, id: p.id, name: p.name },
     };
   });
-  return { title, legend: "last-4 form", empty: "— roster unavailable —", rows: team.featured.length ? rows : [] };
+  return { title, empty: "— roster unavailable —", rows: team.featured.length ? rows : [] };
 }
 function slateView(g, d) {
   const gp = gameProbs(d.lambdaH, d.lambdaA);
@@ -202,7 +203,7 @@ function slateView(g, d) {
       ...(d.stadium && d.stadium.dome ? [{ label: "ROOF", v: "dome/closed" }] : []),
       ...(w ? [{ label: "TEMP", v: `${w.temp}°`, hot: w.temp >= 90, cold: w.temp <= 32 }, { label: "WIND", v: `${w.wind}mph`, hot: w.wind >= 15 }, { label: "RAIN", v: `${w.pop}%`, hot: w.pop >= 50 }] : []),
     ],
-    gameLine: { lambdaA: d.lambdaA, lambdaH: d.lambdaH, home: gp.home, away: gp.away, total: gp.totalLambda, extra: [["tie", pct(gp.tie)]], note: "team scoring environment (standings points for / against × home field). Game lines are experimental: once odds are pulled they anchor to the market total and spread." },
+    gameLine: { lambdaA: d.lambdaA, lambdaH: d.lambdaH, home: gp.home, away: gp.away, total: gp.totalLambda, note: "team scoring environment (standings points for / against × home field). Game lines are experimental: once odds are pulled they anchor to the market total and spread." },
     sections: [[footballColumn(`${g.away} (away)`, d.away, d), footballColumn(`${g.home} (home)`, d.home, d)]],
   };
 }
@@ -240,7 +241,7 @@ function playerView({ profile, spot, detail }) {
     subtitle: [p.teamAbbr || (spot ? (spot.side === "home" ? spot.game.home : spot.game.away) : "FA"), pos || "—", p.jersey ? `#${p.jersey}` : "", ctx && ctx.depthRank && ctx.depthRank < 90 ? `depth #${ctx.depthRank}` : "", roster && roster.injuryStatus ? roster.injuryStatus.replace(/_/g, " ") : ""].filter(Boolean).join(" · "),
     metrics: sm.tiles,
     cards: [
-      !spot ? { title: "SLATE MATCHUP", empty: "No game in the selected week (bye, or a different week is loaded)." } : {
+      !spot ? { title: "SLATE MATCHUP", empty: "Not found on the selected date." } : {
         title: "SLATE MATCHUP", headline: { text: `${spot.game.away} @ ${spot.game.home}` },
         note: `${spot.side === "home" ? spot.game.home : spot.game.away} ${pos || "player"} · vs ${spot.side === "home" ? spot.game.away : spot.game.home}`,
         lines: ready ? [
@@ -273,7 +274,7 @@ async function augmentResults(items, results) {
     const k = `${b.playerId}:${b.gamePk}`;
     if (k in found) continue;
     attempted++;
-    found[k] = await fetchLongCmpForEventTrySeasons(b.playerId, b.gamePk, weekYear(b.date ?? b.week));
+    found[k] = await fetchLongCmpForEventTrySeasons(b.playerId, b.gamePk, nflSeasonFor(b.date));
     if (found[k] != null) hits++;
     res.longCmp = res.longCmp || {};
     res.longCmp[String(b.playerId)] = found[k];
@@ -303,20 +304,25 @@ const DRAFT_DEFAULT = { QB: "Pass Yards", RB: "Rush Yards", WR: "Receiving Yards
 
 const NFL = {
   id: "nfl",
-  slate,
   meta: {
-    title: "NFL", emoji: "🏈", league: "NFL",
+    title: "NFL", tagline: "live odds · de-vigged edge · Monte-Carlo props", emoji: "🏈", league: "NFL",
+    analysisHint: "NFL-wide profile lookup. If the player is on the selected slate, this tab adds matchup context, model projections, and any pulled",
     statsSource: "ESPN", searchPlaceholder: "Patrick Mahomes",
     csvPrefix: "nfl-edge-finder", boardLogCsvPrefix: "nfl-board-log", backupApp: "nfl-edge-finder",
     overrideTitle: "Per-market book overrides: pull one market from a different book when your main book doesn't carry it",
     diagnosticsType: "Anytime TD", diagnosticsMarketKey: "player_anytime_td",
     draftKindLabel: (kind) => kind || "PLAYER",
     searchResultLine: (p) => p.teamName || "Free agent / unresolved team",
+    intro: {
+      file: "Search any NFL player by name.", fileSub: "season · last 4 · game log",
+      slate: (games) => `${games.length} game(s) on this date, ${games.filter((g) => g.status === "LIVE").length} live.`,
+      slateSub: "game script · weather · injuries · depth",
+    },
   },
   config: { ALL_PROPS: ALL_PLAYER_PROPS, BOOKS, BOOK_LABELS, CATEGORY_ORDER, DEFAULT_LINE, ODDS_TESTING_LIMIT, isLineType, matchesQuery, STAT_ORDER: CATEGORY_ORDER, TREND_PROPS, SIGNAL_RULES },
   storage,
   api: {
-    fetchSchedule: fetchScheduleForKey,
+    fetchSchedule: fetchScheduleForDate,
     fetchOddsEvents: () => fetchOddsEvents(currentSportKey),
     fetchEventOdds: (id, books) => fetchEventOdds(currentSportKey, id, books),
     matchEvent,
@@ -325,7 +331,7 @@ const NFL = {
       const mk = bm && (bm.markets || []).find((m) => m.key === "player_anytime_td");
       return { books: bms.map((b) => b.key), usedBook: bm ? bm.key : null, rawKeys: bm ? (bm.markets || []).map((m) => m.key) : [], hasHR: !!mk, hrSample: mk && mk.outcomes ? mk.outcomes[0] : null };
     },
-    parseEventOdds, parseGameOdds, matchCurrentOdds, buildGameLineEntries: buildLineEntries,
+    parseEventOdds, parseGameOdds, matchCurrentOdds, buildGameLineEntries,
     fetchGameResult: fetchGameSummary,
     searchPlayers: (q) => searchPlayers(q),
     fetchPlayerAnalysisProfile, findPlayerInSlate,
@@ -336,7 +342,7 @@ const NFL = {
   propsForKind,
   gradeLineResult,
   gradeTrackedProp: (b, res) => gradeProp(b, res, "DNP"),
-  gradeLogProp: (e, res) => gradeProp(e, res, "DNP"),
+  gradeLogProp: (e, res) => gradeProp(e, res, null),
   draftCtx,
   draftDefaults: (kind) => { const type = DRAFT_DEFAULT[posKey(kind)] || "Receptions"; return { type, line: DEFAULT_LINE[type] || "0.5" }; },
   game, slateView, playerView,
