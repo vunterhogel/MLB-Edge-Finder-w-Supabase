@@ -1,7 +1,9 @@
 /* NHL sport adapter for the shared SportApp shell (same shape as sports/mlb/adapter.tsx). */
 import { ALL_PROPS, BOOKS, BOOK_LABELS, CATEGORY_ORDER, DEFAULT_LINE, GOALIE_PROPS, ODDS_TESTING_LIMIT, SKATER_PROPS, STAT_ORDER, TREND_PROPS, SIGNAL_RULES, isLineType, matchesQuery } from "./config";
 import { buildGameLineEntries, buildTrendCard, espnSeasonFor, fetchEventOdds, fetchGameResult, fetchOddsEvents, fetchPlayerAnalysisProfile, fetchPlayerLogs, fetchRoster, fetchSchedule, fetchTeamStats, findPlayerInSlate, matchCurrentOdds, matchEvent, oddsDebug, parseEventOdds, parseGameOdds, playerTeam, searchPlayers, statFor, trendValueForGame } from "./data";
-import { MODEL_VERSION, evalBet, fractionRemaining, gameProbs, gameLambdas, goalieRates, projectProp, skaterRates, teamRates } from "./engine";
+import { HOME_ICE, MODEL_VERSION, evalBet, fractionRemaining, gameProbs, gameLambdas, goalieFactor, goalieRates, projectProp, skaterRates, teamRates } from "./engine";
+import { LG } from "./config";
+import { loadNhlMatchupData, nhlMatchupInputs } from "./matchups";
 import { gradeBet, pct } from "../../core/math";
 import { normName } from "../../core/odds";
 import { createStorage } from "../../core/storage";
@@ -18,9 +20,21 @@ async function pool(items, n, fn) {
 
 /* ---- context builders ---- */
 function liveSnap(d, pid) { return d.live ? { fractionRemaining: d.live.fractionRemaining, totals: (d.live.players && d.live.players[pid]) || {} } : null; }
+// v2: the opponent-side factors the skater model uses (engine.ts MODEL_VERSION note)
+function skaterMx(d, home) {
+  if (!d.teams) return null;
+  const opp = home ? d.teams.away : d.teams.home;
+  const oppGoalie = d.starterRates ? (home ? d.starterRates.away : d.starterRates.home) : null;
+  const goalie = goalieFactor(oppGoalie);
+  return {
+    defOpp: 0.5 * (opp.ga / LG.goals) + 0.5 * goalie, goalie, ice: home ? HOME_ICE : 1 / HOME_ICE,
+    oppShots: opp.sa / LG.shots,
+    pos: d.matchups ? d.matchups[home ? "home" : "away"] : null, // what the opponent allows to forwards / defensemen
+  };
+}
 function skaterCtx(d, s) {
   const home = s.side === "home";
-  return { kind: "skater", pos: s.group, rates: s.rates, injury: s.injury, teamLambda: home ? d.lambdaH : d.lambdaA, teamShots: home ? d.shotsH : d.shotsA, live: liveSnap(d, s.id) };
+  return { kind: "skater", pos: s.group, rates: s.rates, injury: s.injury, teamLambda: home ? d.lambdaH : d.lambdaA, teamShots: home ? d.shotsH : d.shotsA, mx: skaterMx(d, home), live: liveSnap(d, s.id) };
 }
 function goalieCtx(d, gk) {
   const home = gk.side === "home";
@@ -30,10 +44,11 @@ function goalieCtx(d, gk) {
 /* ---- everything the model needs for one game ---- */
 async function loadGameDetail(g, { date }) {
   const season = espnSeasonFor(date);
-  const [homeRoster, awayRoster, homeT, awayT, liveRes] = await Promise.all([
+  const [homeRoster, awayRoster, homeT, awayT, liveRes, matchupRows] = await Promise.all([
     fetchRoster(g.homeId).catch(() => []), fetchRoster(g.awayId).catch(() => []),
     fetchTeamStats(g.homeId).catch(() => null), fetchTeamStats(g.awayId).catch(() => null),
     g.status === "LIVE" ? fetchGameResult(g.pk) : Promise.resolve(null),
+    loadNhlMatchupData(season),
   ]);
   const roster = [...homeRoster.map((p) => ({ ...p, side: "home", teamId: g.homeId })), ...awayRoster.map((p) => ({ ...p, side: "away", teamId: g.awayId }))];
   const skaters = {}, goalies = {}, gamelogs = {}, priorGamelogs = {};
@@ -57,6 +72,9 @@ async function loadGameDetail(g, { date }) {
     ready: true, loading: false, skaters, goalies, gamelogs, priorGamelogs,
     teams: { home: teamRates(homeT), away: teamRates(awayT), homeRaw: homeT, awayRaw: awayT },
     lambdaH: lam.lambdaH, lambdaA: lam.lambdaA, shotsH: lam.shotsH, shotsA: lam.shotsA, live,
+    // v2: starting goalies' rates and opponent-by-position factors for the skater model (null -> team level)
+    starterRates: { home: starterOf("home") ? starterOf("home").rates : null, away: starterOf("away") ? starterOf("away").rates : null },
+    matchups: nhlMatchupInputs(matchupRows, g, date),
   };
 }
 

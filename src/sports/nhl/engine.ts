@@ -8,7 +8,17 @@
 import { clamp, evPerUnit, impliedProb, negativeBinomialProbabilityOver, noVigProb, poiCdf, poiPmf, probToAmerican } from "../../core/math";
 import { LG, PRIOR, PRIOR_SEASON_MAX, PRIOR_SEASON_WEIGHT, SHRINK_G } from "./config";
 
-export const MODEL_VERSION = "nhl-v1-2026-10-19";
+export const MODEL_VERSION = "nhl-v2-2026-10-27";
+/* v2 (2026-10-27): the skater game-environment factor no longer counts the player's own team offense
+   twice. v1 multiplied his per-game rates (which already reflect his team's offense) by a team goal /
+   shot expectation that included that same offense; v2 uses only the opponent side: the opponent's
+   defense + starting goalie for points / goals / assists, and what the opponent allows by position
+   (forwards vs defensemen) for shots on goal and goals. Replaying the 2025-26 regular season game by
+   game (inputs built only from games before each one; settings chosen on the first half, judged on
+   the held-out second half), v2 scored better than v1 on every skater market it changes: shots on goal
+   (z 2.4), points (z 3.6), goals (z 1.8), assists (z 3.2), by average log-likelihood of the actual
+   result. Power Play Points keeps v1's factor (the box scores can't validate a change there); saves
+   are unchanged (no double count). Game lines are unchanged. */
 // dispersion = variance / mean (core/math NB convention), matching the collector's fitted values
 export const NB_PHI = { sog: 1.25, pts: 1.15, saves: 1.6 };
 export const HOME_ICE = 1.025;          // goal-rate multiplier for the home team (inverse-ish for away)
@@ -138,14 +148,31 @@ export function projectProp(ctx, type, line) {
   const toiMult = clamp(1 + 0.6 * (toiRatio - 1), 0.88, 1.12);
   const env = clamp(ctx.teamLambda / LG.goals, 0.75, 1.3);
   const shotEnv = clamp(1 + 0.7 * (ctx.teamShots / LG.shots - 1), 0.85, 1.15);
-  const ctxMult = spec.key === "sog" ? shotEnv : spec.key === "ppp" ? Math.sqrt(env) : env;
+  const mx = ctx.mx;
+  let ctxMult, envLabel;
+  if (mx && spec.key !== "ppp") {
+    // v2: opponent side only (see MODEL_VERSION note). Position = forwards (F) or defensemen (D).
+    const grp = ctx.pos === "D" ? "D" : "F";
+    const pos = mx.pos || null;
+    if (spec.key === "sog") {
+      const m = pos ? pos.sog[grp] : mx.oppShots;
+      ctxMult = clamp(1 + 0.7 * (m - 1), 0.85, 1.15); envLabel = pos ? `opp SOG allowed vs ${grp}` : "opp shots allowed";
+    } else if (spec.key === "g" && pos) {
+      ctxMult = clamp((0.5 * pos.g[grp] + 0.5 * mx.goalie) * mx.ice, 0.75, 1.3); envLabel = `opp goals allowed vs ${grp} + goalie`;
+    } else {
+      ctxMult = clamp(mx.defOpp * mx.ice, 0.75, 1.3); envLabel = "opp defense + goalie";
+    }
+  } else {
+    ctxMult = spec.key === "sog" ? shotEnv : spec.key === "ppp" ? Math.sqrt(env) : env;
+    envLabel = spec.key === "sog" ? "opp shot env" : "goal env";
+  }
   const mean = base * toiMult * ctxMult;
   const cur = live ? spec.cur(totals) : 0;
   const rem = mean * fr;
   const pOver = overProb(spec.fam, rem, line - cur, spec.phi);
   const proj = cur + rem;
   const baseStr = `${base.toFixed(3)} ${type}/gm (${r.games} gm this season + ${r.priorGames} last season, shrunk) · ${r.toi.toFixed(1)} TOI`;
-  return { pOver, proj, calc: { dist: spec.fam === "poisson" ? "Poisson" : "Neg.Binom", params: `μ=${rem.toFixed(2)}${live ? " rem" : ""}${spec.phi ? `, φ=${spec.phi}` : ""}`, proj, baseStr, mults: live ? [] : [["ice time trend", toiMult], [spec.key === "sog" ? "opp shot env" : "goal env", ctxMult]], live: live ? { current: cur, fr } : null } };
+  return { pOver, proj, calc: { dist: spec.fam === "poisson" ? "Poisson" : "Neg.Binom", params: `μ=${rem.toFixed(2)}${live ? " rem" : ""}${spec.phi ? `, φ=${spec.phi}` : ""}`, proj, baseStr, mults: live ? [] : [["ice time trend", toiMult], [envLabel, ctxMult]], live: live ? { current: cur, fr } : null } };
 }
 
 /* full evaluation of a priced prop (model + market), same shape as MLB's evalBet */
