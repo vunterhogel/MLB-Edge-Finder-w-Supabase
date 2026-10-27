@@ -7,6 +7,7 @@ import ParlayBuilder from "./parlay/ParlayBuilder";
 import MyBets from "./hub/MyBets";
 import MyStats from "./hub/MyStats";
 import { useHubBets } from "./hub/useHubBets";
+import { useParlays } from "./parlay/store";
 import { useRoute } from "./core/route";
 
 /* Root: the app frame. A sidebar (a slide-out menu on phones) switches pages, and the page address
@@ -32,7 +33,8 @@ const TAB_LABEL = { slate: "Slate", board: "Board", trends: "Trends", analysis: 
 function Sidebar({ route, navigate, onPick }) {
   // open tracked bets across every sport, shown next to My Bets
   const all = useHubBets();
-  const open = Object.values(all).reduce((n, bets) => n + bets.filter((b) => b.status === "open").length, 0);
+  const parlays = useParlays();
+  const open = Object.values(all).reduce((n, bets) => n + bets.filter((b) => b.status === "open").length, 0) + parlays.filter((p) => p.status === "open").length;
   return (
     <nav className="flex flex-col h-full">
       <div className="px-4 pt-5 pb-4 border-b border-slate-800">
@@ -51,7 +53,7 @@ function Sidebar({ route, navigate, onPick }) {
                   className={`w-full flex items-center gap-2.5 px-4 py-2 text-sm font-semibold text-left border-l-2 ${active ? "border-emerald-400 bg-slate-900 text-emerald-400" : "border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-900/60"}`}
                 >
                   <span className="w-5 text-center">{i.icon}</span>{i.label}
-                  {i.page === "bets" && open > 0 && <span className="ml-auto text-[10px] font-bold text-emerald-300 bg-emerald-900/40 border border-emerald-800 rounded-full px-1.5 py-0.5" title={`${open} open tracked bet(s)`}>{open}</span>}
+                  {i.page === "bets" && open > 0 && <span className="ml-auto text-[10px] font-bold text-emerald-300 bg-emerald-900/40 border border-emerald-800 rounded-full px-1.5 py-0.5" title={`${open} open tracked bet(s) and parlay(s)`}>{open}</span>}
                 </button>
               );
             })}
@@ -98,9 +100,9 @@ export default function Root() {
         {page("nfl", <NFLApp {...tabProps("nfl")} />)}
         {page("nba", <NBAApp {...tabProps("nba")} />)}
         {page("nhl", <NHLApp {...tabProps("nhl")} />)}
-        {page("bets", <MyBets />)}
-        {page("stats", <MyStats />)}
-        {page("parlay", <ParlayBuilder />)}
+        {page("bets", <MyBets active={route.page === "bets"} />)}
+        {page("stats", <MyStats active={route.page === "stats"} />)}
+        {page("parlay", <ParlayBuilder active={route.page === "parlay"} navigate={navigate} />)}
       </main>
     </div>
   );

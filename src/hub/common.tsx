@@ -26,3 +26,10 @@ export function combinedStats(all, range) {
   }
   return { ...base, byType, typeOrder, bySport };
 }
+
+// add parlay results into an overall stats line (same fields as betStats' overall)
+export function mergeOverall(a, b) {
+  const s = { n: a.n + b.n, w: a.w + b.w, l: a.l + b.l, ps: a.ps + b.ps, v: a.v + b.v, net: a.net + b.net, staked: a.staked + b.staked, flatNet: a.flatNet + b.flatNet };
+  const flatRisked = s.w + s.l;
+  return { ...s, winPct: flatRisked ? s.w / flatRisked : null, roi: s.staked ? s.net / s.staked : null, flatRoi: flatRisked ? s.flatNet / flatRisked : null };
+}

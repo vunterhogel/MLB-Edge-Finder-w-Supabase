@@ -16,3 +16,6 @@ export const HUB_SPORTS = [MLB, NFL, NBA, NHL].map((sport) => ({
 export const HUB_SPORT = Object.fromEntries(HUB_SPORTS.map((s) => [s.id, s]));
 export const SPORT_FILTER_OPTS = ["all", ...HUB_SPORTS.map((s) => s.id)];
 export const SPORT_FILTER_LABELS = { all: "All sports", ...Object.fromEntries(HUB_SPORTS.map((s) => [s.id, `${s.icon} ${s.label}`])) };
+// My Bets / My Stats selector: the sports plus tracked parlays
+export const BET_FILTER_OPTS = [...SPORT_FILTER_OPTS, "parlays"];
+export const BET_FILTER_LABELS = { ...SPORT_FILTER_LABELS, parlays: "🧩 Parlays" };
