@@ -12,7 +12,9 @@ import { PlayerAnalysis, PlayerAnalysisIntro } from "./analysis";
    `sport` adapter (see sports/mlb/adapter.tsx); this file holds no sport logic of its own. */
 
 /* ============================================================ */
-export default function SportApp({ sport }) {
+// tab / onTabChange (optional): lets the app frame drive the active tab from the page address
+// (#/mlb/board). Without them the shell keeps its own tab state exactly as before.
+export default function SportApp({ sport, tab: routeTab = null, onTabChange = null }) {
   const { ALL_PROPS, BOOKS, BOOK_LABELS, CATEGORY_ORDER, DEFAULT_LINE, ODDS_TESTING_LIMIT, isLineType, matchesQuery, STAT_ORDER, TREND_PROPS } = sport.config;
   const { BOARD_DB_KEY, LS_BOARD_LOG, LS_CREDITS, MODEL_VERSION, appendBoardLog, boardLogReady, getBoardLogSaveError, idbDel, loadBets, loadBoardLog, loadBookOverrides, loadCredits, loadShowCoverage, resetBoardLogCache, saveBets, saveBoardLog, saveBookOverrides, saveShowCoverage, settleBoardLog } = sport.storage;
   const { fetchSchedule, fetchOddsEvents, fetchEventOdds, matchEvent, oddsDebug, parseEventOdds, parseGameOdds, matchCurrentOdds, buildGameLineEntries, fetchGameResult, searchPlayers, fetchPlayerAnalysisProfile, findPlayerInSlate, buildTrendCard } = sport.api;
@@ -40,7 +42,9 @@ export default function SportApp({ sport }) {
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
   const [stamp, setStamp] = useState(null);
-  const [tab, setTab] = useState("slate");
+  const [ownTab, setOwnTab] = useState(routeTab || "slate");
+  const tab = routeTab || ownTab;
+  const setTab = (k) => { setOwnTab(k); if (onTabChange) onTabChange(k); };
   const [open, setOpen] = useState(null);
   const [detail, setDetail] = useState({});
   const [book, setBook] = useState("draftkings");
