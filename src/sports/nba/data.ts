@@ -369,7 +369,11 @@ export function buildGameLineEntries(g, d, gl, book) {
    actualFor() looks the field up directly by key/label. */
 export const BOX_STAT_FOR = {
   "Points": ["points", "PTS"], "Rebounds": ["rebounds", "REB"], "Assists": ["assists", "AST"],
-  "Three-Pointers Made": ["threePointFieldGoalsMade-threePointFieldGoalsAttempted", "threePointFieldGoalsMade", "3PM"]   // ESPN box key is "made-attempted"; the old name never matched, so every 3PM bet settled as 0, "Steals": ["steals", "STL"], "Blocks": ["blocks", "BLK"], "Turnovers": ["turnovers", "TO"],
+  // ESPN's 3PM box key is "made-attempted"; the old name never matched, so every 3PM bet settled as 0
+  "Three-Pointers Made": ["threePointFieldGoalsMade-threePointFieldGoalsAttempted", "threePointFieldGoalsMade", "3PM"],
+  // (these three used to sit after that comment on the same line, so they were commented out and
+  // Steals / Blocks / Turnovers bets could never settle)
+  "Steals": ["steals", "STL"], "Blocks": ["blocks", "BLK"], "Turnovers": ["turnovers", "TO"],
 };
 export function actualFor(type, ps) {
   if (!ps) return null; // player never appeared in the box score -> void/DNP, handled upstream
