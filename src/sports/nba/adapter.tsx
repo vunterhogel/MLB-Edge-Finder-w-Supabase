@@ -1,10 +1,10 @@
 /* NBA sport adapter for the shared SportApp shell (same shape as the MLB and NHL adapters).
    The projection model is the existing NBA engine, moved unchanged except for the fixes noted in
    engine.ts / data.ts (3PM parsing, preseason rows, season-boundary logs, OT ties, DNP settling). */
-import { loadNbaMatchupData, nbaMatchupInputs } from "./matchups";
+import { loadNbaMatchupData, nbaMatchupInputs, nbaRoleInputs } from "./matchups";
 import { ALL_PLAYER_PROPS, BOOKS, BOOK_LABELS, CATEGORY_ORDER, DEFAULT_LINE, HOME_COURT_MULT, LG_PACE, LG_PPG, ODDS_SPORT, ODDS_TESTING_LIMIT, SIGNAL_RULES, isLineType, isYesNoType, matchesQuery } from "./config";
-import { actualFor, buildGameLineEntries, buildPlayerLog, buildTrendCard, computeRest, espnIdForTeamName, fetchDepthChart, fetchEventOdds, fetchGameSummary, fetchOddsEvents, fetchRoster, fetchSchedule, fetchSeasonRows, fetchStandings, fetchTeamSchedule, fetchTeamStats, matchCurrentOdds, matchEvent, nbaSeasonFor, parseEventOdds, parseGameOdds, playerTeam, searchPlayers as espnSearch, gradeLine, trendValueForGame } from "./data";
-import { MODEL_VERSION, calculateInjuryAvailability, evalBet, gameProbs, posGroup, projectPlayer } from "./engine";
+import { actualFor, buildGameLineEntries, buildPlayerLog, buildTrendCard, needsPrior2, computeRest, espnIdForTeamName, fetchDepthChart, fetchEventOdds, fetchGameSummary, fetchOddsEvents, fetchRoster, fetchSchedule, fetchSeasonRows, fetchStandings, fetchTeamSchedule, fetchTeamStats, matchCurrentOdds, matchEvent, nbaSeasonFor, parseEventOdds, parseGameOdds, playerTeam, searchPlayers as espnSearch, gradeLine, trendValueForGame } from "./data";
+import { MODEL_VERSION, calculateInjuryAvailability, evalBet, gameProbs, playerRoleRates, posGroup, projectPlayer } from "./engine";
 import { clamp, gradeBet } from "../../core/math";
 import { jget, espnWeb } from "../../core/espn";
 import { normName } from "../../core/odds";
@@ -68,41 +68,67 @@ async function loadGameDetail(g, { date }) {
   await pool(everyone, 8, async ({ p, teamId }) => {
     playerTeam[p.id] = teamId;
     const [cur, prior] = await Promise.all([fetchSeasonRows(p.id, year), fetchSeasonRows(p.id, year - 1)]);
-    logs[p.id] = buildPlayerLog(cur, prior);
+    const prior2 = needsPrior2(prior) ? await fetchSeasonRows(p.id, year - 2) : null; // v4: thin last season -> the one before
+    logs[p.id] = buildPlayerLog(cur, prior, prior2);
     gamelogs[p.id] = cur; priorGamelogs[p.id] = prior;
   });
   const sH = teamPpg(stCur[g.homeId], stPrior[g.homeId]), sA = teamPpg(stCur[g.awayId], stPrior[g.awayId]);
   const lambdaH = +clamp(LG_PPG * clamp(sH.ppgFor / LG_PPG, 0.75, 1.35) * clamp(sA.ppgAgainst / LG_PPG, 0.75, 1.35) * HOME_COURT_MULT.home, 85, 145).toFixed(2);
   const lambdaA = +clamp(LG_PPG * clamp(sA.ppgFor / LG_PPG, 0.75, 1.35) * clamp(sH.ppgAgainst / LG_PPG, 0.75, 1.35) * HOME_COURT_MULT.away, 85, 145).toFixed(2);
   const gameDate = g.gameTimeIso ? new Date(g.gameTimeIso) : new Date(`${date}T19:00:00`);
+  // the team's last 5 completed games (to tell a regular starter who's OUT tonight from a long-term absence)
+  const last5 = (sched) => sched.filter((e) => e.completed && e.date < gameDate).slice(-5).map((e) => e.date.getTime());
   return {
-    ready: true, loading: false,
-    home: { roster: rH, depth: depthH, featured: featH, teamStats: teamStatsH, standings: sH, rest: computeRest(schedH, gameDate) },
-    away: { roster: rA, depth: depthA, featured: featA, teamStats: teamStatsA, standings: sA, rest: computeRest(schedA, gameDate) },
+    ready: true, loading: false, pk: g.pk, roleData: matchupData,
+    home: { teamId: g.homeId, roster: rH, depth: depthH, featured: featH, teamStats: teamStatsH, standings: sH, rest: computeRest(schedH, gameDate), last5: last5(schedH) },
+    away: { teamId: g.awayId, roster: rA, depth: depthA, featured: featA, teamStats: teamStatsA, standings: sA, rest: computeRest(schedA, gameDate), last5: last5(schedA) },
     logs, gamelogs, priorGamelogs, lambdaH, lambdaA,
     // v3: opponent defense by position + matchup pace, from hoopR box scores (null -> v2 inputs)
     matchups: nbaMatchupInputs(matchupData, g, date),
   };
 }
 
-/* one player -> the ctx object projectPlayer consumes (moved from the old page's playerCtx) */
+/* one player -> the ctx object projectPlayer consumes */
+const SIX_HOURS = 6 * 3600 * 1000;
+// this game's rows never feed its own projection (a live game can already be in the game log)
+const histFor = (d, gl) => {
+  const h = gl && gl.hist ? gl.hist : { cur: [], prior: [], prior2: [] };
+  return { ...h, cur: h.cur.filter((r) => String(r.eventId) !== String(d.pk)) };
+};
+// a teammate OUT tonight counts as a missing regular starter if he played and started at least 3 of the
+// team's last 5 games (starts from the hoopR box scores; the depth chart when those aren't loaded)
+function startersOut(d, teamData, pid) {
+  let n = 0;
+  for (const tp of teamData.roster || []) {
+    if (tp.id === pid || calculateInjuryAvailability(tp.injuryStatus) !== 0) continue;
+    const gl = d.logs[tp.id]; if (!gl || !gl.hist) continue;
+    const played = gl.hist.cur.filter((r) => r.date && (teamData.last5 || []).some((t) => Math.abs(Date.parse(r.date) - t) < SIX_HOURS));
+    if (played.length < 3) continue;
+    const starts = nbaRoleInputs(d.roleData, tp.id).recentStarts(played.map((r) => String(r.eventId)));
+    if (starts != null ? starts >= 3 : tp.isStarter) n++;
+  }
+  return n;
+}
 function playerCtx(d, side, p, logOverride) {
   const isHome = side === "home";
   const teamData = isHome ? d.home : d.away;
   const gl = logOverride || d.logs[p.id];
-  const missingUsageShare = (teamData.roster || []).filter((tp) => tp.id !== p.id && (teamData.featured || []).some((f) => f.id === tp.id && f.isStarter) && calculateInjuryAvailability(tp.injuryStatus) === 0).length * 0.08;
+  const role = nbaRoleInputs(d.roleData, p.id);
+  const h = histFor(d, gl);
+  // depth chart says who starts tonight; with no depth chart for this team, unknown (no role shift)
+  const depthKnown = Object.keys(teamData.depth || {}).length > 0;
   return {
-    kind: "player", pos: p.pos, isStarter: !!p.isStarter,
+    kind: "player", pos: p.pos, isStarter: depthKnown && p.depthRank < 99 ? !!p.isStarter : null,
     season: gl ? gl.season : null, recent: gl ? gl.recent : null, games: gl ? gl.games : null,
     injuryStatus: p.injuryStatus, depthRank: p.depthRank,
     impliedTeamPts: isHome ? d.lambdaH : d.lambdaA, projSpreadAbs: Math.abs(d.lambdaH - d.lambdaA),
-    teamPace: null, oppPace: null, lgPace: LG_PACE,
-    oppDRTG: null, lgDRTG: null, oppRebRateAllowed: null, lgRebRateAllowed: null, oppAstAllowed: null, lgAstAllowed: null,
-    opp3ptPctAllowed: null, lg3ptPctAllowed: null, oppTovForced: null, lgTovForced: null, oppFgaRimAllowed: null, lgFgaRimAllowed: null,
-    missingUsageShare,
+    // v4 role model inputs (engine playerRoleRates)
+    hist: { cur: h.cur.map(role.tag), prior: h.prior, prior2: h.prior2 },
+    teamId: teamData.teamId, priorTeam: role.priorTeam, priorStartShare: role.priorStartShare,
+    startersOut: startersOut(d, teamData, p.id),
     // v3: this team's matchup (matchups.ts): opponent defense by position and the pace multiplier
     mx: d.matchups ? d.matchups[side] : null,
-    daysRest: teamData.rest.daysRest, backToBack: teamData.rest.backToBack, crossCountryTravel: false,
+    daysRest: teamData.rest.daysRest, backToBack: teamData.rest.backToBack,
   };
 }
 const sideOfPlayer = (d, pid) => (d.home.roster.some((p) => p.id === pid) ? "home" : d.away.roster.some((p) => p.id === pid) ? "away" : null);
@@ -146,10 +172,11 @@ async function fetchPlayerAnalysisProfile(player, _season, date) {
   const teamId = a.team ? Number(a.team.id) : player.teamId || null;
   if (teamId) playerTeam[String(player.id)] = teamId;
   const [cur, prior] = await Promise.all([fetchSeasonRows(player.id, year), fetchSeasonRows(player.id, year - 1)]);
+  const prior2 = needsPrior2(prior) ? await fetchSeasonRows(player.id, year - 2) : null;
   return {
     kind: "player",
     player: { id: String(player.id), name: a.displayName || player.name, pos: (a.position && a.position.abbreviation) || "", jersey: a.jersey || "", teamId, teamAbbr: (a.team && a.team.abbreviation) || "", teamName: (a.team && a.team.displayName) || player.teamName || "" },
-    logs: { cur, prior }, log: buildPlayerLog(cur, prior),
+    logs: { cur, prior }, log: buildPlayerLog(cur, prior, prior2),
   };
 }
 function findPlayerInSlate(playerId, games) {
@@ -243,10 +270,13 @@ function playerView({ profile, spot, detail }) {
       { title: "SEASON BASELINE", empty: s && s.g ? null : "No games in the model base yet.", grid: [["G", s.g ? Math.round(s.g) : 0], ["MIN", pg("min")], ["PTS", pg("pts"), "sky"], ["REB", pg("reb"), "sky"], ["AST", pg("ast"), "sky"], ["3PM", pg("fg3m"), "sky"], ["STL", pg("stl")], ["BLK", pg("blk")], ["TOV", pg("tov")], ["FGM", pg("fgm")]] },
       !ctx ? { title: "MODEL CONTEXT", empty: spot ? "loading matchup context…" : "Available when the player is on the selected slate." } : {
         title: "MODEL CONTEXT", note: "inputs the projection uses for this game",
-        grid: [["implied pts", ctx.impliedTeamPts != null ? ctx.impliedTeamPts.toFixed(1) : "—", "sky"], ["proj spread", ctx.projSpreadAbs != null ? ctx.projSpreadAbs.toFixed(1) : "—"],
-          ["starter", ctx.isStarter ? "yes" : "no"], ["depth", ctx.depthRank && ctx.depthRank < 90 ? `#${ctx.depthRank}` : "—"],
-          ["days rest", ctx.daysRest ?? "—"], ["B2B", ctx.backToBack ? "yes" : "no", ctx.backToBack ? "warn" : null],
-          ["usage freed", ctx.missingUsageShare ? `${Math.round(ctx.missingUsageShare * 100)}%` : "0%"], ["L10 games", ctx.recent && ctx.recent.games != null ? ctx.recent.games : "—"]],
+        grid: (() => {
+          const rr = playerRoleRates(ctx);
+          return [["proj minutes", rr.minutes0.toFixed(1), "sky"], ["recent min", rr.minutesBase.toFixed(1)],
+            ["starter", ctx.isStarter == null ? "unknown" : ctx.isStarter ? "yes" : "no"], ["start share", rr.startShare != null ? `${Math.round(rr.startShare * 100)}%` : "—"],
+            ["role shift", rr.shift ? `${rr.shift > 0 ? "+" : ""}${rr.shift.toFixed(1)} min` : "—"], ["starters out", ctx.startersOut || 0, ctx.startersOut ? "warn" : null],
+            ["prior base", rr.priorLabel === "none" ? "none" : `${rr.priorGames} gm ${rr.priorLabel}`], ["team change", rr.teamChange ? "yes" : "no", rr.teamChange ? "warn" : null]];
+        })(),
       },
     ],
     ...logSections({ rows, curCount, types: NBA_FORM_TYPES, valueFor: trendValueForGame, abbr: (t) => NBA_ABBR[t] || t, defaultLines: DEFAULT_LINE, title: "Scoring Form" }),

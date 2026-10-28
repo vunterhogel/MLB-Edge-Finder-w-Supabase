@@ -81,6 +81,13 @@ export function samplePoisson(lam) {
   return Math.max(0, Math.round(lam + Math.sqrt(lam) * gaussian()));
 }
 export function sampleNegBin(mean, phi) { const { r, p } = nbParams(mean, phi); const lam = sampleGamma(r, (1 - p) / p); return samplePoisson(lam); }
+// A count with mean ~mean and variance phi x mean but less right-skew than the negative binomial: a gamma
+// shifted by `shift` (mean + shift, same variance), less the shift, rounded, floored at 0. shift 0 is
+// NB-like; bigger shifts are more symmetric. (NBA points: lumpy 2s and 3s give a wide but not very skewed spread.)
+export function sampleShiftedGammaCount(mean, phi, shift) {
+  const mu = Math.max(mean, 0.01), m = mu + shift, v = phi * mu;
+  return Math.max(0, Math.round(sampleGamma((m * m) / v, v / m) - shift));
+}
 export function runMonteCarlo(drawFn, line, side, seed, N = 50000) {
   const prev = RNG; RNG = mulberry32(seed >>> 0 || 12345); _spareGaussian = null;
   let over = 0; for (let i = 0; i < N; i++) { if (drawFn() > line) over++; }

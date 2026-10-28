@@ -29,7 +29,7 @@ async function loadSeason(season) {
     fetchViaProxy(`${BASE}/espn_nba_team_boxscores/team_box_${season}.parquet`, "buffer"),
   ]);
   const teams = await readParquet(tb, ["game_id", "season_type", "game_date", "team_id", "opponent_team_id", "field_goals_attempted", "offensive_rebounds", "total_turnovers", "turnovers", "free_throws_attempted"]);
-  const players = await readParquet(pb, ["game_id", "season_type", "team_id", "opponent_team_id", "minutes", "points", "rebounds", "assists", "three_point_field_goals_made", "steals", "blocks", "turnovers", "athlete_position_abbreviation", "did_not_play"]);
+  const players = await readParquet(pb, ["game_id", "season_type", "game_date", "athlete_id", "team_id", "opponent_team_id", "minutes", "points", "rebounds", "assists", "three_point_field_goals_made", "steals", "blocks", "turnovers", "starter", "athlete_position_abbreviation", "did_not_play"]);
   const poss = new Map(); // game_id:team -> possessions
   for (const t of teams) {
     if (t.season_type !== 2) continue;
@@ -54,13 +54,59 @@ async function loadSeason(season) {
     s.pts += x.points || 0; s.reb += x.rebounds || 0; s.ast += x.assists || 0; s.fg3m += x.three_point_field_goals_made || 0;
     s.stl += x.steals || 0; s.blk += x.blocks || 0; s.tov += x.turnovers || 0;
   }
-  return [...rows.values()].map((r) => { for (const P of POS) for (const k in r.s[P]) r.s[P][k] = +r.s[P][k].toFixed(1); return r; });
+  return { rows: [...rows.values()].map((r) => { for (const P of POS) for (const k in r.s[P]) r.s[P][k] = +r.s[P][k].toFixed(1); return r; }), roles: buildRoles(players), miss: buildMissing(players) };
 }
 
-const loaded = new Map(); // season -> Promise<rows | null>
+/* v4: for every team-game, how many of the team's regular starters (started 3+ of its previous 5 games)
+   didn't play that night. The engine compares tonight's count with the games a player's minutes came from. */
+function buildMissing(players) {
+  const tg = new Map(); // `${game}:${team}` -> { d, g, t, st: Set, pl: Set }
+  for (const x of players) {
+    if (x.season_type !== 2 || x.team_id == null) continue;
+    const k = `${x.game_id}:${x.team_id}`;
+    const o = tg.get(k) || tg.set(k, { d: day(x.game_date), g: x.game_id, t: x.team_id, st: new Set(), pl: new Set() }).get(k);
+    if (!x.did_not_play && x.minutes > 0) { o.pl.add(x.athlete_id); if (x.starter) o.st.add(x.athlete_id); }
+  }
+  const byTeam = new Map();
+  for (const o of tg.values()) (byTeam.get(o.t) || byTeam.set(o.t, []).get(o.t)).push(o);
+  const out = {};
+  for (const list of byTeam.values()) {
+    list.sort((a, b) => (a.d < b.d ? -1 : a.d > b.d ? 1 : 0));
+    list.forEach((o, i) => {
+      const cnt = new Map();
+      for (const p of list.slice(Math.max(0, i - 5), i)) for (const a of p.st) cnt.set(a, (cnt.get(a) || 0) + 1);
+      let n = 0; for (const [a, c] of cnt) if (c >= 3 && !o.pl.has(a)) n++;
+      out[`${o.g}:${o.t}`] = n;
+    });
+  }
+  return out;
+}
+
+/* v4 role info per player (engine playerRoleRates): which team he played for when (stints, so a trade is
+   seen), how often he started, and his starter flag in his last 25 games (ESPN's game log has no starts) */
+const ROLE_RECENT = 25;
+function buildRoles(players) {
+  const by = new Map();
+  for (const x of players) {
+    if (x.season_type !== 2 || x.did_not_play || !(x.minutes > 0) || x.athlete_id == null) continue;
+    (by.get(x.athlete_id) || by.set(x.athlete_id, []).get(x.athlete_id)).push({ d: day(x.game_date), g: x.game_id, t: x.team_id, s: x.starter ? 1 : 0 });
+  }
+  const out = {};
+  for (const [id, games] of by) {
+    games.sort((a, b) => (a.d < b.d ? 1 : a.d > b.d ? -1 : 0)); // newest first
+    const st = [];
+    for (const x of games) { const last = st[st.length - 1]; if (last && last[0] === x.t) last[1] = x.d; else st.push([x.t, x.d, x.d]); } // [team, from, to], newest stint first
+    const r = {}; for (const x of games.slice(0, ROLE_RECENT)) r[x.g] = [x.t, x.s]; // game -> [team, started]
+    out[id] = { st, n: games.length, gs: games.reduce((a, x) => a + x.s, 0), r };
+  }
+  return out;
+}
+
+const loaded = new Map(); // season -> Promise<{ rows, roles } | null>
 function seasonRows(season, maxAgeMs) {
   if (!loaded.has(season)) {
-    const key = `nbaef_matchups_${season}_v1`;
+    const key = `nbaef_matchups_${season}_v2`;
+    try { localStorage.removeItem(`nbaef_matchups_${season}_v1`); } catch { /* storage unavailable */ } // v1 cache had no role info
     const p = (async () => {
       const cached = cacheGet(key, maxAgeMs);
       if (cached) return cached;
@@ -73,11 +119,37 @@ function seasonRows(season, maxAgeMs) {
   }
   return loaded.get(season);
 }
-// { cur, prior } rows for the season the slate belongs to (season = its ending year, as ESPN numbers it)
+// { cur, prior } rows (+ role info) for the season the slate belongs to (season = its ending year, as ESPN numbers it)
 export async function loadNbaMatchupData(season) {
   if (!season) return null;
   const [cur, prior] = await Promise.all([seasonRows(season, 6 * 3600 * 1000), seasonRows(season - 1, 7 * 86400 * 1000)]);
-  return cur || prior ? { cur: cur || [], prior: prior || [] } : null;
+  return cur || prior ? { cur: cur ? cur.rows : [], prior: prior ? prior.rows : [], curRoles: cur ? cur.roles : {}, priorRoles: prior ? prior.roles : {}, curMiss: cur ? cur.miss : {} } : null;
+}
+
+/* For one player: last season's team and start share, and helpers to tag this season's game-log rows with
+   the team he played for and whether he started. Everything is null when the files aren't loaded. */
+export function nbaRoleInputs(data, athleteId) {
+  const c = data && data.curRoles ? data.curRoles[athleteId] : null, p = data && data.priorRoles ? data.priorRoles[athleteId] : null;
+  // team for a game-log row: exact by game id for his last 25 games, else the stint covering its date (a
+  // late tip is the next day in UTC, so a day either side of a stint still counts)
+  const shift = (d, n) => new Date(Date.parse(`${d}T12:00:00Z`) + n * 86400000).toISOString().slice(0, 10);
+  const teamOn = (row) => {
+    if (!c) return null;
+    if (row.eventId != null && c.r[row.eventId]) return c.r[row.eventId][0];
+    if (!row.date) return null; const d = day(row.date);
+    for (const [t, from, to] of c.st) if (d >= shift(from, -1) && d <= shift(to, 1)) return t;
+    return null;
+  };
+  return {
+    priorTeam: p && p.st.length ? p.st[0][0] : null,
+    priorStartShare: p && p.n ? p.gs / p.n : null,
+    tag: (row) => {
+      const team = teamOn(row);
+      const m = data && data.curMiss && team != null ? data.curMiss[`${row.eventId}:${team}`] : null;
+      return { ...row, team, starter: c && row.eventId != null && c.r[row.eventId] ? c.r[row.eventId][1] === 1 : null, miss: m != null ? m : null };
+    },
+    recentStarts: (eventIds) => (c ? eventIds.filter((g) => c.r[g] && c.r[g][1] === 1).length : null),
+  };
 }
 
 // prior weight in GAMES of this-season-equivalent sample: k games of league average per stat

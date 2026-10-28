@@ -441,19 +441,21 @@ export function aggregate(rows, w = 1) {
   for (const r of rows) { a.g += w; for (const k of KEYS) a[k] += w * (r[k] || 0); }
   return a;
 }
-// season base = this season's regular-season games + last season's. Last season counts in full on
-// opening night and fades to half weight by game 15, so week 1 leans on last year instead of
-// collapsing to the position prior, and by mid-November this season dominates.
+// season base (shown on the page) = this season's regular-season games + last season's. Last season counts in
+// full on opening night and fades to half weight by game 15. The projection itself (engine v4) works from
+// `hist`: the raw rows, newest first, including the season before last for players with < 10 games last season.
 export const priorSeasonWeight = (curGames) => Math.max(0.5, 1 - curGames / 30);
-export function buildPlayerLog(cur, prior) {
-  const curReg = (cur || []).filter((r) => !r.postseason && r.min > 0);
-  const priorReg = (prior || []).filter((r) => !r.postseason && r.min > 0).slice(0, 60);
+export function buildPlayerLog(cur, prior, prior2 = null) {
+  const reg = (rows) => (rows || []).filter((r) => !r.postseason && r.min > 0);
+  const curReg = reg(cur), priorAll = reg(prior), priorReg = priorAll.slice(0, 60);
   const sc = aggregate(curReg), sp = aggregate(priorReg, priorSeasonWeight(curReg.length));
   const season = { g: sc.g + sp.g }; for (const k of KEYS) season[k] = sc[k] + sp[k];
   const recentRows = curReg.slice(0, 10);
   const recent = aggregate(recentRows); recent.games = recentRows.length; delete recent.g;
-  return { season, recent, games: [...(cur || []), ...(prior || [])], curGames: curReg.length, priorGames: priorReg.length };
+  return { season, recent, games: [...(cur || []), ...(prior || [])], curGames: curReg.length, priorGames: priorReg.length, hist: { cur: curReg, prior: priorAll, prior2: reg(prior2) } };
 }
+// the season before last is only needed when last season is too thin to anchor on
+export const needsPrior2 = (prior) => (prior || []).filter((r) => !r.postseason && r.min > 0).length < 10;
 
 /* ---- box score for settling ---- */
 export async function fetchGameSummary(eventId) {

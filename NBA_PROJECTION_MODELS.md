@@ -232,6 +232,49 @@ Before v3, every opponent input reached the engine empty, so every opponent mult
 - **Fallback.** If the files can't load, every multiplier is null and that game uses its v2 inputs (neutral).
 - **Calibration.** It starts fresh under the v3 model version; CALIB_KEEP stays at its day-1 values until graded volume says otherwise.
 
+### v4 (nba-v4-2026-10-28): role / minutes model, fitted spreads, points shape
+
+v4 replaces Steps 1-2 above and the dispersion table. It keeps the v3 matchup multipliers, the injury availability factor and the double / triple-double simulation. Backend only; the page shows the same things (Player Analysis "Model context" now lists the v4 inputs). Code: `playerRoleRates` / `playerMeans` / `projectPlayer` in `engine.ts`, role data in `matchups.ts` (`nbaRoleInputs`), wiring in `adapter.tsx` (`playerCtx`), `buildPlayerLog(cur, prior, prior2)` in `data.ts`.
+
+**Why.** On the 10-27 slate the model sat far below the market on high-line players (projection about 0.88-0.90 of the line) and flagged mostly unders. Replaying full seasons showed two causes. (1) Minutes were anchored to last season, so a real role change was held back all year. Under v3, players whose minutes rose 5+ MPG were under-projected 12-18%, and players whose minutes fell 5+ were over-projected about 20%. This hits young players growing into roles and veterans losing minutes, plus anyone traded. (2) The negative binomial spread for points was about half what games show (variance ≈ 3.5-4× the mean, not 1.8×), and its shape was too right-skewed: at lines near the projection it priced overs about 4 points too low.
+
+**Minutes.** This season's games weigh by recency: a game's weight halves every 3 games. Last season's average is an anchor worth 1 recent game, so it matters on opening night and fades as this season's sample builds. A small role prior is mixed in (30 min if starting tonight, 18 off the bench, weight 0.25 games). After a team change, last season's weight is ×0.35, and so are this-season games played for a former team. If last season has under 10 games (injury, rookie), the season before last is the anchor instead. Role shift: +4 min × (starting tonight − his recent start share). Tonight's starter comes from the depth chart, and start history comes from the hoopR box scores. With no depth chart the shift is 0. Recorded minutes always lead; career stage isn't an input.
+
+**Rates.** Per-minute rates use the same structure with a long memory: weight halves every 100 games, and last season's rates are worth 10 games of his minutes. They shrink toward the position prior by 100 minutes, counted against the minutes he actually played. v3 counted the down-weighted prior instead, which pulled stars toward average early in the season.
+
+**Starters out.** Count a regular starter as out when he's OUT tonight and played and started 3+ of the team's last 5 games. Teammates' minutes go ×(1 + 0.06 × (out tonight − the usual count in the games behind his minutes)). Points, assists, threes and turnovers per minute go ×(1 + 0.04 × the same difference, against the games behind his rates). Comparing with the usual count matters: a raw per-starter boost double counts an absence his recent minutes already reflect. It over-projected everyone by about 3%. Per-game missing counts come from the hoopR box scores.
+
+**Removed.** The back-to-back / rest multiplier and the blowout-risk minutes cut both made the replay worse, so they're out. The old usage boost (points +4.8% per OUT featured starter) is replaced by the one above.
+
+**Spreads and shape (fitted on 2024-25).**
+- Negative binomial φ (var / mean): reb 1.45, ast 1.25, 3PM 1.2, stl 1.1, blk 1.1, tov 1.05, Reb+Ast 1.7, Blk+Stl 1.15.
+- Points and the points combos use a shifted-gamma count instead (`sampleShiftedGammaCount`). It's a gamma with the same mean and variance shifted right by `shift`, then the shift is taken back off, which keeps the spread while cutting the skew. Points φ 3.5 / shift 12, PRA 3.55 / 12, P+R 3.5 / 10, P+A 3.4 / 10.
+- Probabilities are still Monte Carlo with 50,000 draws.
+- Combos are the sum of the means with their own fitted spread.
+- Double / triple-doubles keep the v3 joint simulation, which the replay showed is calibrated once its means are right.
+
+**Validation.**
+- **Setup.** Two seasons were replayed game by game from hoopR box scores, each player's inputs built only from games before that night, the same way the page builds them. Tuned on 2024-25 (2022-23 and 2023-24 as history); judged on 2025-26, held out. Sample: rotation players, about 22k player-games a season. The shipped engine reproduces the harness, and a full adapter run with mocked ESPN responses reproduces the engine.
+- **Held-out log-likelihood gain vs shipped v3, per game:**
+  - Points +0.316 (z 42)
+  - PRA +0.202 (z 34)
+  - P+R +0.176 (z 33)
+  - P+A +0.170 (z 33)
+  - Rebounds +0.045 (z 21)
+  - Assists +0.045 (z 24)
+  - Threes +0.033 (z 20)
+  - Steals +0.032 (z 19)
+  - Blocks +0.022 (z 15)
+  - Turnovers +0.037 (z 23)
+  - Reb+Ast +0.087 (z 35)
+  - Blk+Stl +0.111 (z 38)
+
+  Every market is larger in the first 25 days (Points +0.40). Without any starter information, about 90% of the gain remains.
+- **Calibration (held out).** The slope of actual on projected is 1.01 for points (v3 1.06; early season 1.07 vs v3 1.15). For points, players whose minutes rose 5+ went from 18% under-projected to 9%, and those whose minutes fell 5+ from 20% over to 10%. New-team players went from 4% over to 2%, and players with no last season from 6% over to 1% under. What remains is change that hadn't happened yet on game night. P(over) at the half-point line nearest the projection, and one either side, lands within about 1 point of actual for every market. Points: 0.535 / 0.465 / 0.400 modeled vs 0.535 / 0.462 / 0.395 actual.
+- **10-27 slate check.** Replaying the real board-log players, the app's v3 numbers match the harness (ratio 1.007), so the gap was the model, not bad data. v4 points projections: Wembanyama 21.7 → 25.5 (line 27.5), Lillard 14.9 → 20.7 (20.5), Acuff Jr. 14.2 → 18.3 (20.5), Harper 13.9 → 17.6 (17.5), Paul Reed 9.6 → 13.6 (12.5), Tatum 18.1 → 21.8 (26.5).
+
+**Calibration weights.** CALIB_KEEP is unchanged. The board log restarts under the v4 version, and the weights get fitted from several weeks of v4 board logs, not hand-set.
+
 ## 5. Calibration & pricing (reused verbatim from MLB/NFL — sport-agnostic)
 
 `impliedProb`, `probToAmerican`, `evPerUnit`, `noVigProb`, `calibrateToMarket`,
