@@ -68,6 +68,14 @@ export default function ParlayBuilder({ active = true, navigate = null }) {
   const [trackUnits, setTrackUnits] = useState("1");
   const setFilter = (patch) => setF((p) => ({ ...p, ...patch }));
   const setOpt = (patch) => setOpts((p) => ({ ...p, ...patch }));
+  // Start fresh: the whole workspace back to defaults (filters, slip, pins, exclusions, auto-build
+  // settings and results) and the board logs re-read. Tracked parlays are not touched.
+  function startFresh() {
+    setSource("board"); setF(EMPTY_POOL_FILTERS); setShowMore(false);
+    setPinned(new Map()); setExcluded(new Set()); setSlip(new Map()); setSlipUnits("1");
+    setOpts(DEFAULT_BUILD); setBuilt({ results: [], msg: "" }); setTrackUnits("1");
+    void loadBoardLogs();
+  }
 
   // read every sport's board log whenever the page is opened (sport pages keep adding to it)
   async function loadBoardLogs() {
@@ -117,7 +125,10 @@ export default function ParlayBuilder({ active = true, navigate = null }) {
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100" style={{ fontFamily: "ui-sans-serif, system-ui, sans-serif" }}>
       <div className="max-w-6xl mx-auto px-4 pb-28">
-        <HubHeader title="PARLAY" accent="BUILDER" sub="every sport's board log or your open bets · combined EV / edge · auto-build under your constraints" />
+        <div className="relative">
+          <HubHeader title="PARLAY" accent="BUILDER" sub="every sport's board log or your open bets · combined EV / edge · auto-build under your constraints" />
+          <button onClick={startFresh} className="absolute right-0 top-6 text-xs border border-slate-700 rounded-lg px-3 py-1.5 text-slate-300 hover:border-slate-500 hover:text-white" title="Reset filters, slip, pins, exclusions, auto-build settings and results. Tracked parlays are kept.">↺ Start fresh</button>
+        </div>
         <div className="text-[11px] text-slate-500 mt-3 mb-3 leading-relaxed">
           Legs carry their own sport model's win %, de-vigged fair %, edge and EV. Combined win % assumes legs are independent; same-game legs (<span className="text-amber-400 font-bold">SGP</span>) are correlated, so treat their combined EV as optimistic. Board-log legs are priced at the odds first logged that day.
           {openParlays > 0 && <> · <button onClick={() => navigate && navigate("bets")} className="text-emerald-400 hover:underline">{openParlays} open parlay{openParlays === 1 ? "" : "s"} in My Bets</button></>}
@@ -280,7 +291,7 @@ export default function ParlayBuilder({ active = true, navigate = null }) {
                 </div>
               </div>
             </div>
-            {built.msg && <div className="text-[11px] text-slate-400 mb-2">{built.msg}</div>}
+            {built.msg && <div className="text-[11px] text-slate-400 mb-2">{built.msg} <button onClick={() => setBuilt({ results: [], msg: "" })} className="text-slate-500 hover:text-rose-300 ml-1">clear results</button></div>}
             {built.results.length > 0 && (
               <div className="flex items-center gap-2 mb-2 text-[11px] text-slate-500">
                 track at <input value={trackUnits} onChange={(e) => setTrackUnits(e.target.value)} inputMode="decimal" className="w-12 bg-slate-950 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-slate-100" style={mono} /> units

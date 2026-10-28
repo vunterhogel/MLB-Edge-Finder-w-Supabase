@@ -35,6 +35,12 @@ function initialRoute() {
   return parseHash(window.location.hash) || valid(readJson(LS_LAST, null)) || DEFAULT_ROUTE;
 }
 
+// forget every sport's remembered tab (the sidebar's "Fresh start" sends each sport back to its Slate)
+export function resetSportTabs() {
+  for (const k of Object.keys(sportTabs)) delete sportTabs[k];
+  writeJson(LS_TABS, sportTabs);
+}
+
 export function useRoute() {
   const [route, setRoute] = useState(initialRoute);
   const cur = useRef(route);
