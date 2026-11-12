@@ -8,7 +8,15 @@
 import { clamp, evPerUnit, impliedProb, negativeBinomialProbabilityOver, noVigProb, poiCdf, poiPmf, probToAmerican } from "../../core/math";
 import { LG, PRIOR, PRIOR_SEASON_MAX, PRIOR_SEASON_WEIGHT, SHRINK_G } from "./config";
 
-export const MODEL_VERSION = "nhl-v2-2026-10-27";
+export const MODEL_VERSION = "nhl-v3-2026-11-12";
+/* v3 (2026-11-12): skater base rates rebuilt. v2 shrank every skater's per-game rates 25-30 games toward a league-average forward /
+   defenseman, so the players books post props on (top six, power play) were projected 15-30% low on points
+   and assists and nearly every flag was an under. v3 projects ice time from recent games, works in per-60
+   rates (this season by recency + last season as an anchor) and shrinks toward a prior that scales with
+   ice time, so a 20-minute first-liner is pulled toward a first-liner, not the average forward. Points now
+   use a Poisson (fitted: NB overstated their spread), SOG phi 1.125, Saves phi 2.05. Replayed 2024-25
+   (tuning) and 2025-26 (held out): better on every skater market (points z 14, assists z 10, SOG z 5,
+   goals z 5, saves z 3), top-quintile points act/proj 1.14 -> 1.03. Opponent factors are v2's. */
 /* v2 (2026-10-27): the skater game-environment factor no longer counts the player's own team offense
    twice. v1 multiplied his per-game rates (which already reflect his team's offense) by a team goal /
    shot expectation that included that same offense; v2 uses only the opponent side: the opponent's
@@ -20,7 +28,7 @@ export const MODEL_VERSION = "nhl-v2-2026-10-27";
    result. Power Play Points keeps v1's factor (the box scores can't validate a change there); saves
    are unchanged (no double count). Game lines are unchanged. */
 // dispersion = variance / mean (core/math NB convention), matching the collector's fitted values
-export const NB_PHI = { sog: 1.25, pts: 1.15, saves: 1.6 };
+export const NB_PHI = { sog: 1.125, saves: 2.05 }; // v3 fit on 2024-25 (points and assists are Poisson)
 export const HOME_ICE = 1.025;          // goal-rate multiplier for the home team (inverse-ish for away)
 export const OT_HOME_WIN = 0.52;        // P(home wins | tied after regulation)
 export const REG_SHARE = 0.97;          // share of a team's goals scored in regulation
@@ -29,24 +37,57 @@ export const keepFor = (t) => (CALIB_KEEP[t] != null ? CALIB_KEEP[t] : 0.4);
 export const calibrateToMarket = (p, market, type) => (p == null || market == null ? p : clamp(market + keepFor(type) * (p - market), 0.001, 0.999));
 
 /* ---------- skater rates ---------- */
-// rows: newest-first game rows from core/espn fetchGamelog. Returns weighted per-game rates.
-export function skaterRates(cur, prior, pos) {
+// v3 (see MODEL_VERSION): ice time from recent games + per-60 rates with a role prior that scales with ice time
+export const V3 = {
+  toiHalfLife: 2,       // games: a game's weight in the ice-time projection halves every 2 games
+  priorToiGames: 1,     // last season's average ice time counts as this many recent games
+  roleToiGames: 0.25,   // position-average ice time mixed in (games)
+  rateHalfLife: 120,    // games: per-60 rates have a long memory
+  priorRateGames: 25,   // last season's per-60 rates count as this many games of his ice time
+  priorMinutes: 300,    // per-60 rates shrink toward the role prior by this many minutes
+  roleGamma: 0.8,       // role prior per 60 = position average x (proj TOI / position TOI)^0.8
+};
+// league per-60 by position, 2025-26 regular season (NHL box scores)
+export const LG60 = { F: { sog: 6.68, g: 0.867, a: 1.186, toi: 15.14 }, D: { sog: 3.96, g: 0.240, a: 0.837, toi: 19.30 } };
+function v2Rates(cur, prior, pos) { // v1/v2 per-game shrink: still used for Power Play Points (no box data to refit it)
   const P = PRIOR[pos === "D" ? "D" : "F"];
-  const use = (rows, w) => rows.filter((r) => !r.postseason).map((r) => ({ r, w }));
-  const rows = [...use(cur || [], 1), ...use((prior || []).slice(0, PRIOR_SEASON_MAX), PRIOR_SEASON_WEIGHT)];
-  let wsum = 0;
-  const tot = { sog: 0, g: 0, a: 0, ppp: 0, toi: 0 };
-  for (const { r, w } of rows) {
-    const s = r.s || {};
-    wsum += w;
-    tot.sog += w * (s.shotsTotal || 0); tot.g += w * (s.goals || 0); tot.a += w * (s.assists || 0);
-    tot.ppp += w * ((s.powerPlayGoals || 0) + (s.powerPlayAssists || 0)); tot.toi += w * (s.timeOnIcePerGame || 0);
-  }
+  const rows = [...cur.map((r) => ({ r, w: 1 })), ...prior.slice(0, PRIOR_SEASON_MAX).map((r) => ({ r, w: PRIOR_SEASON_WEIGHT }))];
+  let wsum = 0; const tot = { ppp: 0, toi: 0 };
+  for (const { r, w } of rows) { const s = r.s || {}; wsum += w; tot.ppp += w * ((s.powerPlayGoals || 0) + (s.powerPlayAssists || 0)); tot.toi += w * (s.timeOnIcePerGame || 0); }
   const shr = (k) => (tot[k] + SHRINK_G[k] * P[k]) / (wsum + SHRINK_G[k]);
-  const curRows = (cur || []).filter((r) => !r.postseason);
-  const last5 = curRows.slice(0, 5);
-  const recentToi = last5.length >= 3 ? last5.reduce((a, r) => a + (r.s.timeOnIcePerGame || 0), 0) / last5.length : null;
-  return { sog: shr("sog"), g: shr("g"), a: shr("a"), ppp: shr("ppp"), toi: shr("toi"), recentToi, games: curRows.length, priorGames: Math.min((prior || []).filter((r) => !r.postseason).length, PRIOR_SEASON_MAX), effGames: wsum };
+  return { ppp: shr("ppp"), toi: shr("toi"), effGames: wsum };
+}
+// rows: newest-first game rows from core/espn fetchGamelog. Returns per-game means (before opponent factors).
+export function skaterRates(cur0, prior0, pos) {
+  const cur = (cur0 || []).filter((r) => !r.postseason), prior = (prior0 || []).filter((r) => !r.postseason);
+  const L = LG60[pos === "D" ? "D" : "F"];
+  const toiOf = (r) => (r.s && r.s.timeOnIcePerGame) || 0;
+  const pToi = prior.length ? prior.reduce((a, r) => a + toiOf(r), 0) / prior.length : 0;
+  const pw = prior.length ? 1 : 0;
+  let w = 0, tS = 0, rw = 0, rMin = 0; const st = { sog: 0, g: 0, a: 0 };
+  for (let i = 0; i < cur.length; i++) {
+    const s = cur[i].s || {}, m = toiOf(cur[i]), a = Math.pow(0.5, i / V3.toiHalfLife), b = Math.pow(0.5, i / V3.rateHalfLife);
+    w += a; tS += a * m; rw += b; rMin += b * m; st.sog += b * (s.shotsTotal || 0); st.g += b * (s.goals || 0); st.a += b * (s.assists || 0);
+  }
+  const kt = V3.priorToiGames * pw;
+  const toi = (tS + kt * pToi + V3.roleToiGames * L.toi) / (w + kt + V3.roleToiGames);
+  const pMin = prior.reduce((a, r) => a + toiOf(r), 0);
+  const pSum = { sog: 0, g: 0, a: 0 }; for (const r of prior) { const s = r.s || {}; pSum.sog += s.shotsTotal || 0; pSum.g += s.goals || 0; pSum.a += s.assists || 0; }
+  const anchorMin = V3.priorRateGames * pw * pToi;
+  const role = Math.pow(Math.max(toi, 5) / L.toi, V3.roleGamma);
+  const per = {};
+  for (const k of ["sog", "g", "a"]) {
+    const pRate = pMin ? pSum[k] / pMin : 0;
+    const den = rMin + anchorMin, seen = den ? (st[k] + pRate * anchorMin) / den : 0;
+    per[k] = (seen * den + (L[k] / 60) * role * V3.priorMinutes) / (den + V3.priorMinutes);
+  }
+  const old = v2Rates(cur, prior, pos);
+  const last5 = cur.slice(0, 5);
+  const recentToi = last5.length >= 3 ? last5.reduce((a, r) => a + toiOf(r), 0) / last5.length : null;
+  // Power Play Points keep v2's per-game rate and its ice-time trend multiplier
+  const pppToiMult = recentToi && old.toi ? clamp(1 + 0.6 * (recentToi / old.toi - 1), 0.88, 1.12) : 1;
+  return { sog: toi * per.sog, g: toi * per.g, a: toi * per.a, ppp: old.ppp, pppToiMult, toi, recentToi: null, per60: { sog: per.sog * 60, g: per.g * 60, a: per.a * 60 },
+    games: cur.length, priorGames: Math.min(prior.length, PRIOR_SEASON_MAX), effGames: old.effGames };
 }
 export function goalieRates(cur, prior) {
   const rows = [...(cur || []).filter((r) => !r.postseason).map((r) => ({ r, w: 1 })), ...(prior || []).filter((r) => !r.postseason).slice(0, PRIOR_SEASON_MAX).map((r) => ({ r, w: PRIOR_SEASON_WEIGHT }))];
@@ -120,7 +161,7 @@ function overProb(family, mean, line, phi) {
 }
 const PROP_SPEC = {
   "Shots on Goal": { key: "sog", fam: "nb", phi: NB_PHI.sog, cur: (t) => t.shotsTotal || 0 },
-  "Points": { key: "pts", fam: "nb", phi: NB_PHI.pts, cur: (t) => (t.goals || 0) + (t.assists || 0) },
+  "Points": { key: "pts", fam: "poisson", cur: (t) => (t.goals || 0) + (t.assists || 0) },
   "Goals": { key: "g", fam: "poisson", cur: (t) => t.goals || 0 },
   "Assists": { key: "a", fam: "poisson", cur: (t) => t.assists || 0 },
   "Power Play Points": { key: "ppp", fam: "poisson", cur: (t) => (t.powerPlayGoals || 0) + (t.powerPlayAssists || 0) },
@@ -144,8 +185,8 @@ export function projectProp(ctx, type, line) {
   if (!spec || ctx.kind !== "skater" || !ctx.rates) return { pOver: null, proj: null, calc: null };
   const r = ctx.rates;
   const base = spec.key === "pts" ? r.g + r.a : r[spec.key];
-  const toiRatio = r.recentToi && r.toi ? r.recentToi / r.toi : 1;
-  const toiMult = clamp(1 + 0.6 * (toiRatio - 1), 0.88, 1.12);
+  // v3: sog / goals / assists already come from projected ice time; only PPP keeps v2's trend multiplier
+  const toiMult = spec.key === "ppp" ? r.pppToiMult || 1 : 1;
   const env = clamp(ctx.teamLambda / LG.goals, 0.75, 1.3);
   const shotEnv = clamp(1 + 0.7 * (ctx.teamShots / LG.shots - 1), 0.85, 1.15);
   const mx = ctx.mx;
@@ -171,8 +212,8 @@ export function projectProp(ctx, type, line) {
   const rem = mean * fr;
   const pOver = overProb(spec.fam, rem, line - cur, spec.phi);
   const proj = cur + rem;
-  const baseStr = `${base.toFixed(3)} ${type}/gm (${r.games} gm this season + ${r.priorGames} last season, shrunk) · ${r.toi.toFixed(1)} TOI`;
-  return { pOver, proj, calc: { dist: spec.fam === "poisson" ? "Poisson" : "Neg.Binom", params: `μ=${rem.toFixed(2)}${live ? " rem" : ""}${spec.phi ? `, φ=${spec.phi}` : ""}`, proj, baseStr, mults: live ? [] : [["ice time trend", toiMult], [envLabel, ctxMult]], live: live ? { current: cur, fr } : null } };
+  const baseStr = `${base.toFixed(3)} ${type}/gm (${r.games} gm this season + ${r.priorGames} last season) · ${r.toi.toFixed(1)} proj TOI`;
+  return { pOver, proj, calc: { dist: spec.fam === "poisson" ? "Poisson" : "Neg.Binom", params: `μ=${rem.toFixed(2)}${live ? " rem" : ""}${spec.phi ? `, φ=${spec.phi}` : ""}`, proj, baseStr, mults: live ? [] : [...(spec.key === "ppp" ? [["ice time trend", toiMult]] : []), [envLabel, ctxMult]], live: live ? { current: cur, fr } : null } };
 }
 
 /* full evaluation of a priced prop (model + market), same shape as MLB's evalBet */
