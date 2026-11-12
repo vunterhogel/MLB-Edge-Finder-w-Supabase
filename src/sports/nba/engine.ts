@@ -13,12 +13,18 @@ export function probabilityOver(family, line, side, seed, params) {
 // per-market calibration: DAY-1 PRIOR. No settled-bet history for basketball yet, so every
 // category starts at a conservative, uniform "trust the market a lot" weight — same posture
 // NFL launched with. Retune per-category from the Stats tab; don't hand-tune from vibes.
-export const MODEL_VERSION = "nba-v4-2026-10-28";   // bump on every model change (part of every board-log id). v3: opponent defense by position + real pace (matchups.ts). v4: role/minutes model, fitted spreads, points shape
+export const MODEL_VERSION = "nba-v5-2026-11-12";   // bump on every model change (part of every board-log id). v3: opponent defense by position + real pace (matchups.ts). v4: role/minutes model, fitted spreads, points shape. v5: role settings refit on two seasons (bench minutes), DD/TD sim refit, fitted CALIB_KEEP
 
+/* v5: fitted on the 10/28-11/11 board logs (21.4k prop rows, 110 games), using v5's own probabilities for those
+   games: the weight on the model that best predicts results by log-loss, rounded to 0.05. 0 = the model's lean
+   adds nothing beyond the DraftKings no-vig price in that market yet (Points, Pts+Reb, Pts+Ast, game total,
+   moneyline), so it produces no edge there. Only Double-Double and Triple-Double held up when fit on week 1 and
+   tested on week 2; the rest are small-sample fits. Turnovers had no board rows and keep their old value.
+   Refit as v5 board logs build up. */
 export const CALIB_KEEP = {
-  "Points": 0.45, "Rebounds": 0.45, "Assists": 0.45, "Three-Pointers Made": 0.40, "Steals": 0.35, "Blocks": 0.35, "Turnovers": 0.35,
-  "Pts+Reb+Ast": 0.45, "Pts+Reb": 0.45, "Pts+Ast": 0.45, "Reb+Ast": 0.40, "Blocks+Steals": 0.35,
-  "Double-Double": 0.35, "Triple-Double": 0.30, "Spread": 0.50, "Total": 0.50,
+  "Points": 0.00, "Rebounds": 0.30, "Assists": 0.25, "Three-Pointers Made": 0.20, "Steals": 0.75, "Blocks": 0.30, "Turnovers": 0.35,
+  "Pts+Reb+Ast": 0.05, "Pts+Reb": 0.00, "Pts+Ast": 0.00, "Reb+Ast": 0.20, "Blocks+Steals": 0.15,
+  "Double-Double": 0.70, "Triple-Double": 0.95, "Spread": 0.20, "Total": 0.00, "Moneyline": 0.00,
 };
 export const CALIB_KEEP_DEFAULT = 0.5;
 export function keepFor(type) { return (type != null && CALIB_KEEP[type] != null) ? CALIB_KEEP[type] : CALIB_KEEP_DEFAULT; }
@@ -70,24 +76,29 @@ export function marginProb(lhEff, laEff, hc, ac, cmp) {
 // minutes growing, a veteran's shrinking) shows up within a few games instead of being held back by last
 // season. A team change discounts last season (and in-season games for a former team). Players with under
 // 10 games last season fall back to the season before. Fitted on 2024-25; see NBA_PROJECTION_MODELS.md.
+// v5 values: refit on 2024-25 + 2025-26 together and checked on 2026-27 to date (out of time). v4 (fit on
+// 2024-25 alone) projected bench players' minutes ~3-7% high; v5's bench/starter role prior fixes that.
 export const V4 = {
   minHalfLife: 3,       // games
-  priorMinGames: 1,     // last season's minutes average counts as this many recent games
-  rateHalfLife: 100,    // games (rates are far more stable than minutes)
+  priorMinGames: 0.5,   // last season's minutes average counts as this many recent games (v4: 1)
+  rateHalfLife: 50,     // games (rates are far more stable than minutes) (v4: 100)
   priorRateGames: 10,   // last season's per-minute rates count as this many games of his minutes
-  teamChange: 0.35,     // last-season (and former-team) weight after a team change
-  roleMpg: { starter: 30, bench: 18 }, roleGames: 0.25, // fallback minutes by role, and its weight in games
-  starterShift: 4,      // minutes: + this x (starting tonight - his recent share of starts)
+  teamChange: 0.25,     // last-season (and former-team) weight after a team change (v4: 0.35)
+  roleMpg: { starter: 34, bench: 12 }, roleGames: 0.25, // fallback minutes by role, and its weight in games (v4: 30 / 18)
+  starterShift: 6,      // minutes: + this x (starting tonight - his recent share of starts) (v4: 4)
   posShrinkMin: 100,    // per-minute rates shrink toward the position prior by this many minutes
   // per regular starter OUT tonight beyond how many were missing in the games his numbers came from:
   // teammates' minutes, and pts/ast/3PM/TO per minute (missBase: assumed count when a game's isn't known)
-  perStarterOut: { minutes: 0.06, usage: 0.04 }, missBase: 0.5,
+  perStarterOut: { minutes: 0.06, usage: 0.02 }, missBase: 0.5, // usage v4: 0.04
 };
 // dispersion, fitted on 2024-25 (var = phi x mean). Points and point combos use a shifted-gamma count
 // (SG_SHIFT): the negative binomial at their spread is too right-skewed and priced overs ~4 points low.
 export const NB_PHI = { reb: 1.45, ast: 1.25, fg3m: 1.2, stl: 1.1, blk: 1.1, tov: 1.05, "Reb+Ast": 1.7, "Blocks+Steals": 1.15 };
 export const SG = { pts: { phi: 3.5, shift: 12 }, "Pts+Reb+Ast": { phi: 3.55, shift: 12 }, "Pts+Reb": { phi: 3.5, shift: 10 }, "Pts+Ast": { phi: 3.4, shift: 10 } };
-const DD_PHI = { pts: 1.8, reb: 1.5, ast: 1.6, stl: 1.6, blk: 1.6 }; // double/triple-double sim (replay: already calibrated, unchanged)
+// double/triple-double sim (v5): the same shapes as the single-stat props (points shifted gamma, the rest NB at
+// their fitted spreads) and a smaller shared hot/cold-night factor (sd 0.10, v4 0.18). v4's sim ran ~10-17% high
+// (2025-26: 0.095 vs 0.088 actual; 2026-27: 0.088 vs 0.075); v5: 0.080 / 0.075, better log-loss in all 3 seasons.
+const DD_SHARED_SD = 0.10;
 // position-group league priors (per-36) — only stabilize thin samples (a rookie's first games)
 export const POS_PRIOR = {
   G: { pts36: 16.5, reb36: 3.8, ast36: 5.2, stl36: 1.3, blk36: 0.3, tov36: 2.3, fg3m36: 2.4 },
@@ -240,14 +251,14 @@ export function simulateDoubleTriple(means, need, seed, N = 20000) {
   const s0 = (seed >>> 0) || hashSeed(`dd|${means.pts.toFixed(2)}|${means.reb.toFixed(2)}|${means.ast.toFixed(2)}`);
   return withSeededRng(s0, () => {
     let hits = 0;
-    const cats = [["pts", DD_PHI.pts], ["reb", DD_PHI.reb], ["ast", DD_PHI.ast], ["stl", DD_PHI.stl], ["blk", DD_PHI.blk]];
+    const cats = [["pts", null], ["reb", NB_PHI.reb], ["ast", NB_PHI.ast], ["stl", NB_PHI.stl], ["blk", NB_PHI.blk]];
     for (let i = 0; i < N; i++) {
       // shared per-game noise (bounded so it can't flip means negative): a hot/cold/foul-trouble night
-      const shared = clamp(1 + gaussian() * 0.18, 0.5, 1.7);
+      const shared = clamp(1 + gaussian() * DD_SHARED_SD, 0.5, 1.7);
       let count = 0;
       for (const [k, phi] of cats) {
         const mean = Math.max((means[k] || 0) * shared, 0.01);
-        if (sampleNegBin(mean, phi) >= 10) count++;
+        if ((phi == null ? sampleShiftedGammaCount(mean, SG.pts.phi, SG.pts.shift) : sampleNegBin(mean, phi)) >= 10) count++;
       }
       if (count >= need) hits++;
     }

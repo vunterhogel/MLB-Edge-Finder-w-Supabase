@@ -275,6 +275,68 @@ v4 replaces Steps 1-2 above and the dispersion table. It keeps the v3 matchup mu
 
 **Calibration weights.** CALIB_KEEP is unchanged. The board log restarts under the v4 version, and the weights get fitted from several weeks of v4 board logs, not hand-set.
 
+### v5 (nba-v5-2026-11-12): role settings refit, DD/TD sim refit, fitted calibration weights
+
+**Evidence.** Two weeks of v4 board logs (10/28-11/11, 110 games, 21.4k settled prop rows), plus replays of 2024-25, 2025-26 and 2026-27 to date.
+- Minutes were right on average for the players on the board (projected 28.2, actual 28.1). But bench players were projected too high: board bench points 6.8% above the line against actual results at the line. The replay agreed: 2025-26 bench minutes ×0.977, and 2026-27 bench minutes ×0.927.
+- The model's double-double probability ran high: board 0.150 vs 0.124 actual, and the replay 10-17% high.
+- The model's lean beyond the line carried almost no information on Points and the points combos. The correlation of (proj − line) with (actual − line) is about 0 there, 0.07 for rebounds and assists, and 0.16-0.30 for threes, blocks and steals.
+
+**Role settings.** Refit on 2024-25 and 2025-26 together, then checked on 2026-27 to date, which is out of time.
+
+| Setting | v4 | v5 |
+|---|---|---|
+| Role prior minutes (starter / bench) | 30 / 18 | 34 / 12 |
+| Starter shift | +4 min | +6 min |
+| Last-season minutes anchor | 1 game | 0.5 game |
+| Rate half-life | 100 games | 50 games |
+| Team-change weight | ×0.35 | ×0.25 |
+| Starters-out usage boost | +4% | +2% |
+
+Results:
+- Bench minutes went from ×0.977 to ×1.016 (2025-26).
+- On 2026-27 (not used for fitting), log-likelihood gains are Points +0.012 (z 5), PRA +0.016 (z 5), Assists (z 3.3) and Threes (z 2.1). Blocks is −0.002 (z −1.9), and the other markets are flat.
+
+**Double / triple-double sim.** It now uses the same shapes as the single-stat props: points are a shifted gamma (φ 3.5, shift 12), and the others are NB at their fitted spreads. The shared hot/cold-night factor drops from sd 0.18 to 0.10.
+
+| Season | v4 mean | v5 mean | Actual |
+|---|---|---|---|
+| 2025-26 | 0.095 | 0.080 | 0.088 |
+| 2026-27 | 0.088 | 0.075 | 0.075 |
+
+Log-loss improves in all three seasons. On the board, v5 DD averages 0.136 vs 0.124 actual (market 0.165).
+
+**Calibration weights (CALIB_KEEP).** These are fitted to the 10/28-11/11 board logs using v5's own probabilities for those games: the weight that minimizes log-loss, rounded to 0.05.
+
+| Market | Weight |
+|---|---|
+| Points | 0 |
+| Pts+Reb | 0 |
+| Pts+Ast | 0 |
+| PRA | 0.05 |
+| Reb+Ast | 0.20 |
+| Threes | 0.20 |
+| Assists | 0.25 |
+| Rebounds | 0.30 |
+| Blocks | 0.30 |
+| Blk+Stl | 0.15 |
+| Steals | 0.75 |
+| Double-Double | 0.70 |
+| Triple-Double | 0.95 |
+| Spread | 0.20 |
+| Total | 0 |
+| Moneyline | 0 |
+| Turnovers | 0.35 (no board rows; unchanged) |
+
+- A weight of 0 means the model's lean adds nothing beyond the DraftKings no-vig price in that market yet, so the market produces no edges.
+- Only Double-Double and Triple-Double held up when fit on week 1 and tested on week 2. The other weights are small-sample fits and get refit as v5 logs build up.
+- On these same games (in sample), flags drop from 38 to 8 per game and the over / under split goes to 49 / 51. Expect fewer, sharper flags. The forward test is the v5 board log.
+
+**Not changed.** These live-board gaps didn't show up in the replays (all players, 2026-27 to date: threes ×0.98, steals ×0.97), so they look like selection and small sample, and the fitted weights handle them:
+- threes about 4% low
+- steals about 8% high
+- the game total about 3% high
+
 ## 5. Calibration & pricing (reused verbatim from MLB/NFL — sport-agnostic)
 
 `impliedProb`, `probToAmerican`, `evPerUnit`, `noVigProb`, `calibrateToMarket`,
