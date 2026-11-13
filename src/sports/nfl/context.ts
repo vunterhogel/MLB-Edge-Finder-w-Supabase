@@ -39,6 +39,8 @@ export function playerCtx(d, g, side, p, logOverride = null) {
   const marketSpread = g.marketSpreadHome != null ? (isHome ? g.marketSpreadHome : -g.marketSpreadHome) : null;
   const modelSpread = isHome ? (d.lambdaA - d.lambdaH) : (d.lambdaH - d.lambdaA); // signed FOR this team (positive = underdog)
   const teamSpread = marketSpread != null ? marketSpread : modelSpread;
+  // v4: market implied team total (game total / 2 - this team's spread / 2); null without a market total
+  const teamTotal = g.marketTotal != null && marketSpread != null ? g.marketTotal / 2 - marketSpread / 2 : null;
   return {
     kind: p.pos === "PK" ? "K" : p.pos, // shell uses ctx.kind to pick the prop list; same value as pos
     pos: p.pos === "PK" ? "K" : p.pos,
@@ -46,7 +48,7 @@ export function playerCtx(d, g, side, p, logOverride = null) {
     // last season's real, complete log — the shrinkage prior once this-season sample is thin/empty
     // (fetched only when it's needed, see loadDetail). null for rookies / no data available.
     priorSeason: priorGl ? priorGl.season : null,
-    teamSpread, weather: d.weather, stadium: d.stadium,
+    teamSpread, teamTotal, weather: d.weather, stadium: d.stadium,
     injuryStatus: p.injuryStatus, depthRank: p.depthRank,
     impliedTeamPts, teamDrivesPerGame: 10.8, redZoneTdRate: 0.58,
     oppPassAtt: LG.teamPassAtt, teamSackRate: LG.sackRatePerPassAtt, teamDefIntRate: LG.defIntRatePerPassAtt,

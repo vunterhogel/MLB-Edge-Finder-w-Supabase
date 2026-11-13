@@ -4,7 +4,7 @@ import { DST_PROPS, K_PROPS, LG_PPG, NFL_PTS_PHI, QB_PROPS, RB_PROPS, WR_PROPS }
 
 export function probabilityOver(family, line, side, seed, params) {
   let over;
-  if (family === "poisson") over = 1 - poiCdf(Math.floor(line), params.mean);
+  if (family === "poisson" || (params && params.phi != null && params.phi <= 1)) over = 1 - poiCdf(Math.floor(line), params.mean); // v4: phi 1 = Poisson
   else over = runMonteCarlo(() => sampleNegBin(params.mean, params.phi), line, "over", seed);
   return side === "over" ? over : 1 - over;
 }
@@ -20,7 +20,15 @@ export function liveProbabilityOver(family, seed, params, currentTotal, line) {
 // for football yet, so every category starts at a conservative, uniform "trust the market a lot"
 // weight. Retune per-category from the Stats tab exactly the way MLB did — do NOT hand-tune
 // these from vibes; wait for graded volume.
-export const MODEL_VERSION = "nfl-v3-2026-10-27";   // bump on every model change (part of every board-log id). v3: opponent positional matchups (nflverse weekly stats)
+export const MODEL_VERSION = "nfl-v4-2026-11-12";   // bump on every model change (part of every board-log id). v3: opponent positional matchups (nflverse weekly stats). v4: replay-fit priors / shrinkage / spreads, QB volume from starts
+/* v4 (2026-11-12): every prior, shrink weight and spread refit by replaying the 2025 season week by week from
+   nflverse box scores (inputs built only from earlier weeks, the way the page builds them; the app's own
+   projections match the replay at a median ratio of 1.000) and checked on 2026 weeks 1-9 (held out).
+   Biggest fix: QB volume. v3 averaged a QB's attempts over every game he appeared in and shrank toward his
+   own per-game average from last season, so a backup thrust into a start (Minshew 6 att vs a 34.5 line,
+   Milton 6 vs 31.5) or any QB with a few partial games projected far too low; starters overall ran ~6% low.
+   v4 counts only starts (15+ attempts) and shrinks toward his last-season per-start average (3+ starts) or a
+   30-attempt starter prior. See V4 below for every setting. */
 
 export const CALIB_KEEP = {
   "Pass Yards": 0.45, "Pass TDs": 0.40, "Interceptions": 0.35, "Pass Completions": 0.45, "Pass Attempts": 0.45, "Longest Completion": 0.35,
@@ -93,10 +101,12 @@ export function shrinkValue(obs, count, prior, k) {
 // in place of a league-wide constant, so early-season sample thinness shrinks toward "this player's
 // own career rate" instead of "average NFL player at this position" — the fix for every player at
 // the same depth-chart slot projecting identically in week 1.
-export function priorRate(ctx, numKey, denKey, lgDefault) {
+export function priorRate(ctx, numKey, denKey, lgDefault, k = 0) {
   const ps = ctx.priorSeason;
   if (!ps || !ps[denKey]) return lgDefault;
-  return ps[numKey] / ps[denKey];
+  // v4: last season's rate is itself shrunk toward the league default by k (same units as the denominator),
+  // so 3 backup games last season can't set a starter's prior (v3: k = 0, his raw rate)
+  return (ps[numKey] + k * lgDefault) / (ps[denKey] + k);
 }
 // Blend + shrink a player's own "longest play" history (season + recent, both averages — see
 // fetchAthleteGamelog's avgLong) toward a prior, instead of the old ratio-of-other-stats approach
@@ -105,18 +115,20 @@ export function priorRate(ctx, numKey, denKey, lgDefault) {
 // slot vs TE, etc. — see callers), never a single league-wide constant.
 export function projectLongestStat(ctx, key, fallbackPrior) {
   const s = ctx.season || {}; const l = ctx.recent || null; const ps = ctx.priorSeason;
-  const prior = (ps && ps[`${key}Avg`] != null) ? ps[`${key}Avg`] : fallbackPrior;
+  // v4: his own last-season average when there is one, else the role prior x 0.9; shrink 8 games (v3: 60)
+  const fb = fallbackPrior * V4.long.priorScale;
+  const prior = (ps && ps[`${key}Avg`] != null) ? (ps[`${key}Avg`] * (ps[`${key}N`] || 0) + fb * V4.long.k) / ((ps[`${key}N`] || 0) + V4.long.k) : fb; // last season's average, itself shrunk 8 games
   const seasonAvg = s[`${key}Avg`] != null ? s[`${key}Avg`] : null;
   const seasonN = s[`${key}N`] || 0;
   const recentAvg = (l && l[`${key}Avg`] != null) ? l[`${key}Avg`] : null;
-  const blended = blendRate(seasonAvg, recentAvg, RECENT_WEIGHT);
-  return shrinkValue(blended, seasonN, prior, SHRINK_N.rate);
+  const blended = blendRate(seasonAvg, recentAvg, V4.long.rw);
+  return shrinkValue(blended, seasonN, prior, V4.long.k);
 }
 
 /* ============================================================
    PROJECTION ENGINE — per position (doc §3)
    ============================================================ */
-export const RECENT_WEIGHT = 0.30;       // L4-game blend weight — heavier than MLB's 0.20 L15 weight because
+export const RECENT_WEIGHT = 0.30;       // v3 value; v4 projectors use the per-group settings in V4       // L4-game blend weight — heavier than MLB's 0.20 L15 weight because
                                    // an NFL season (17 games) has far less season-to-date signal to lean on
 export const MIN_L4_SNAPS = 2;           // require >=2 recent games with snaps before blending recent form in
 // v2 (2026-10-18): refit from the settled board log (weeks 3-6, 827 unique player/game/prop rows).
@@ -124,12 +136,30 @@ export const MIN_L4_SNAPS = 2;           // require >=2 recent games with snaps 
 // spread is ~65-70 yds (var/mean ~20). That made raw yardage Brier 0.31-0.38 (worse than a coin flip)
 // and inflated claimed edge ~3.5x (claimed +10.5pp, realized +2.9pp). Values below are set slightly
 // conservative of the in-sample Brier optimum; retune once more weeks settle.
+// v4: refit on the 2025 replay (variance / mean; 1 = Poisson). v3 values in comments.
 export const NB_PHI = {
-  passYds: 20, passAtt: 3.0, passCmp: 2.0, passTd: 1.4, ints: 1.3, longestCmp: 7,
-  rushYds: 20, rushAtt: 1.8, rushTd: 1.5, longestRush: 6,
-  rec: 1.4, recYds: 22, recTd: 1.5, longestRec: 8,
-  anytimeTd: 1.4, kickPts: 3.5, fgMade: 1.3, sacks: 1.4, defInt: 1.4,
+  passYds: 27, passAtt: 2.0, passCmp: 1.6, passTd: 1, ints: 1, longestCmp: 5,   // v3: 20, 3.0, 2.0, 1.4, 1.3, 7
+  rushYds: 27, rushAtt: 1.8, rushTd: 1, longestRush: 7,                          // v3: 20, -, 1.5, 6
+  rec: 1.3, recYds: 30, recTd: 1, longestRec: 8,                                 // v3: 1.4, 22, 1.5, 8
+  anytimeTd: 1, kickPts: 2, fgMade: 1, sacks: 1.4, defInt: 1.4,                  // v3: 1.4, 3.5, 1.3
 };
+/* v4 settings by projector, fit on the 2025 replay (see MODEL_VERSION note). rw = weight on the last 4 games
+   (minL4 = games needed to use them); k = games (volume) or opportunities (rates) of prior mixed in. */
+export const V4 = {
+  qb: { rw: 0.15, minL4: 2, kAtt: 4, kRate: 60, kTd: 150, startAtt: 15, attPrior: 30, priorStartsMin: 3 },
+  rush: { rw: 0.30, minL4: 1, kRush: 3, kRate: 60, share1: 0.65, share2: 0.20 },
+  recv: { rw: 0.45, minL4: 1, kTgt: 3, kRate: 30, shareWR1: 0.16, shareWR2: 0.13, shareWR3: 0.06, shareTE: 0.14, shareRB: 0.07 },
+  long: { rw: 0.15, k: 8, priorScale: 0.9 },       // "longest" stats: v3 shrank 60 games toward a role prior (always ~the prior)
+  td: { k: 60, gl1: 1.0, gl2: 0.85, qbRushPrior: 0.20, kQb: 6 }, // TD rates per opportunity; Poisson counts
+  k: { fgPerDrive: 0.17, fgPct: 0.88, xpScale: 0.9 },
+  // team implied total from the market (total / 2 - spread / 2) vs league 22.25: mean x (teamTotal / 22.25)^e.
+  // Fit on 2025, held up on 2026. Rushing volume and kicking showed no effect.
+  env: { ref: 22.25, passAtt: 0.3, passYpc: 0.2, passTdRate: 0.3, intRate: -0.2, targets: 0.3, recTdRate: 0.5, rushTd: 0.8, qbRushTd: 0.8 },
+};
+export function teamEnv(ctx, e) {
+  const t = ctx && ctx.teamTotal;
+  return t == null || !Number.isFinite(t) || !e ? 1 : clamp(Math.pow(t / V4.env.ref, e), 0.8, 1.25);
+}
 
 /* -------- league-average priors (empirical-Bayes shrinkage targets) --------
    Reasonable, well-known NFL per-game/per-attempt benchmarks. Exactly like
@@ -224,24 +254,33 @@ export function calculateRestAdjustment(ctx) {
 }
 
 /* ---- QB projections ---- */
+// v4: QB volume comes from his STARTS this season (games with 15+ attempts; season.qbAtt lists every game's
+// attempts in order), shrunk toward his last-season per-start average (3+ starts) or a 30-attempt starter
+// prior. A depth-chart starter with no starts yet projects as a starter, not as the backup he was.
+export function qbStarts(agg) {
+  if (!agg) return [];
+  if (Array.isArray(agg.qbAtt)) return agg.qbAtt.filter((a) => a >= V4.qb.startAtt);
+  // a log built without the per-game list: treat every game as a start if his average says he's a starter
+  const avg = agg.g ? (agg.passAtt || 0) / agg.g : 0;
+  return avg >= V4.qb.startAtt ? Array(agg.g).fill(avg) : [];
+}
 export function qbBaseRates(ctx) {
-  const s = ctx.season || {}; const l = ctx.recent || null;
-  const lOK = l && l.games >= MIN_L4_SNAPS;
-  // Each `prior*` below is THIS player's own prior-season rate when ESPN has a log for him,
-  // falling back to the flat league constant only for a rookie/no-history player — see priorRate().
-  // This is what stops two different QBs from projecting identically in week 1.
-  const priorPassAtt = priorRate(ctx, "passAtt", "g", LG.teamPassAtt * 0.98);
-  const priorCompPct = priorRate(ctx, "passCmp", "passAtt", LG.compPct);
-  const priorYpc = priorRate(ctx, "passYds", "passCmp", LG.ypa / LG.compPct);
-  const priorPassTdRate = priorRate(ctx, "passTd", "passAtt", LG.passTdRate);
-  const priorIntRate = priorRate(ctx, "ints", "passAtt", LG.intRate);
-  const passAttRaw = blendRate(s.passAtt && s.g ? s.passAtt / s.g : priorPassAtt, lOK ? l.passAtt / l.games : null, RECENT_WEIGHT);
-  const passAtt = shrinkValue(passAttRaw, s.g || 0, priorPassAtt, SHRINK_N.passAtt);
-  const compPct = shrinkRate(s.passAtt ? s.passCmp / s.passAtt : 0, s.passAtt || 0, priorCompPct, SHRINK_N.rate);
-  const ypc = shrinkRate(s.passCmp ? s.passYds / s.passCmp : 0, s.passCmp || 0, priorYpc, SHRINK_N.rate);
-  const passTdRate = shrinkRate(s.passAtt ? s.passTd / s.passAtt : 0, s.passAtt || 0, priorPassTdRate, SHRINK_N.rate);
-  const intRate = shrinkRate(s.passAtt ? s.ints / s.passAtt : 0, s.passAtt || 0, priorIntRate, SHRINK_N.rate);
-  return { passAtt, compPct, ypc, passTdRate, intRate };
+  const s = ctx.season || {}; const Q = V4.qb;
+  const cur = qbStarts(s), priorStarts = qbStarts(ctx.priorSeason);
+  const avgOf = (a) => a.reduce((x, y) => x + y, 0) / a.length;
+  const priorPassAtt = priorStarts.length >= Q.priorStartsMin ? avgOf(priorStarts) : Q.attPrior;
+  const recent = cur.slice(-4);
+  const passAttRaw = blendRate(cur.length ? avgOf(cur) : priorPassAtt, recent.length >= Q.minL4 ? avgOf(recent) : null, Q.rw);
+  const passAtt = shrinkValue(passAttRaw, cur.length, priorPassAtt, Q.kAtt);
+  const priorCompPct = priorRate(ctx, "passCmp", "passAtt", LG.compPct, Q.kRate);
+  const priorYpc = priorRate(ctx, "passYds", "passCmp", LG.ypa / LG.compPct, Q.kRate);
+  const priorPassTdRate = priorRate(ctx, "passTd", "passAtt", LG.passTdRate, Q.kTd);
+  const priorIntRate = priorRate(ctx, "ints", "passAtt", LG.intRate, Q.kTd);
+  const compPct = shrinkRate(s.passAtt ? s.passCmp / s.passAtt : 0, s.passAtt || 0, priorCompPct, Q.kRate);
+  const ypc = shrinkRate(s.passCmp ? s.passYds / s.passCmp : 0, s.passCmp || 0, priorYpc, Q.kRate);
+  const passTdRate = shrinkRate(s.passAtt ? s.passTd / s.passAtt : 0, s.passAtt || 0, priorPassTdRate, Q.kTd);
+  const intRate = shrinkRate(s.passAtt ? s.ints / s.passAtt : 0, s.passAtt || 0, priorIntRate, Q.kTd);
+  return { passAtt, compPct, ypc, passTdRate, intRate, starts: cur.length };
 }
 export function projectQB(ctx, type, line) {
   const base = qbBaseRates(ctx);
@@ -262,11 +301,12 @@ export function projectQB(ctx, type, line) {
   const oppInt = mInt != null ? mInt : calculateOppDefenseAdjustment(ctx.oppDefTakeaways, ctx.lgDefTakeaways, 0.8, 1.25);
   const avail = calculateInjuryAvailability(ctx.injuryStatus);
   const rest = calculateRestAdjustment(ctx);
-  const passAtt = base.passAtt * gs * rest * avail;
+  const env = teamEnv(ctx, V4.env.passAtt);
+  const passAtt = base.passAtt * gs * rest * avail * env;
   const passCmp = passAtt * base.compPct * oppCmp;
-  const passYds = passCmp * base.ypc * wx * oppYpc;
-  const passTd = passAtt * base.passTdRate * oppTd;
-  const ints = passAtt * base.intRate * oppInt * clamp(2 - wx, 0.95, 1.15); // bad weather -> more picks
+  const passYds = passCmp * base.ypc * wx * oppYpc * teamEnv(ctx, V4.env.passYpc);
+  const passTd = passAtt * base.passTdRate * oppTd * teamEnv(ctx, V4.env.passTdRate);
+  const ints = passAtt * base.intRate * oppInt * clamp(2 - wx, 0.95, 1.15) * teamEnv(ctx, V4.env.intRate); // bad weather -> more picks
   const table = {
     "Pass Attempts": { mean: passAtt, phi: NB_PHI.passAtt },
     "Pass Completions": { mean: passCmp, phi: NB_PHI.passCmp },
@@ -278,28 +318,29 @@ export function projectQB(ctx, type, line) {
   const t = table[type]; if (!t) return { pOver: null, proj: null, calc: null };
   const seed = hashSeed(`qb|${type}|${line}|${passAtt.toFixed(2)}`);
   const pOver = probabilityOver("nb", line, "over", seed, t);
-  return { pOver, proj: t.mean, calc: fullCalc("Neg.Binom", `μ=${t.mean.toFixed(2)}, φ=${t.phi}`, t.mean, `${base.passAtt.toFixed(1)} att/g season base`, [["game script", gs], ["weather", wx], ...(v3 ? [["opp comp% allowed", oppCmp], ["opp yds/cmp allowed", oppYpc]] : [["opp pass D", oppPass]]), ["opp pass TD", oppTd], ["opp INT rate", oppInt], ["availability", avail], ["rest", rest]]) };
+  return { pOver, proj: t.mean, calc: fullCalc("Neg.Binom", `μ=${t.mean.toFixed(2)}, φ=${t.phi}`, t.mean, `${base.passAtt.toFixed(1)} att/start base (${base.starts} start${base.starts === 1 ? "" : "s"} this season)`, [["game script", gs], ["team total", env], ["weather", wx], ...(v3 ? [["opp comp% allowed", oppCmp], ["opp yds/cmp allowed", oppYpc]] : [["opp pass D", oppPass]]), ["opp pass TD", oppTd], ["opp INT rate", oppInt], ["availability", avail], ["rest", rest]]) };
 }
 
 /* ---- RB projections ---- */
 export function rbBaseRates(ctx) {
   const s = ctx.season || {}; const l = ctx.recent || null;
-  const lOK = l && l.games >= MIN_L4_SNAPS;
-  const lgRushAtt = LG.teamRushAtt * (ctx.touchShare || 0.4), lgTargets = LG.targetShareRB * LG.teamPassAtt;
-  const priorRushAtt = priorRate(ctx, "rushAtt", "g", lgRushAtt);
-  const priorYpc = priorRate(ctx, "rushYds", "rushAtt", LG.rushYpc);
-  const priorRushTdRate = priorRate(ctx, "rushTd", "rushAtt", LG.rushTdRate);
-  const priorTargets = priorRate(ctx, "targets", "g", lgTargets);
-  const priorCatchRate = priorRate(ctx, "rec", "targets", LG.catchRate + 0.05);
-  const priorYpt = priorRate(ctx, "recYds", "targets", LG.ypt * 0.7);
-  const rushAttRaw = blendRate(s.rushAtt && s.g ? s.rushAtt / s.g : priorRushAtt, lOK ? l.rushAtt / l.games : null, RECENT_WEIGHT);
-  const rushAtt = shrinkValue(rushAttRaw, s.g || 0, priorRushAtt, SHRINK_N.rushAtt);
-  const ypc = shrinkRate(s.rushAtt ? s.rushYds / s.rushAtt : 0, s.rushAtt || 0, priorYpc, SHRINK_N.rate);
-  const rushTdRate = shrinkRate(s.rushAtt ? s.rushTd / s.rushAtt : 0, s.rushAtt || 0, priorRushTdRate, SHRINK_N.rate);
-  const targetsRaw = blendRate(s.targets && s.g ? s.targets / s.g : priorTargets, lOK ? l.targets / l.games : null, RECENT_WEIGHT);
-  const targets = shrinkValue(targetsRaw, s.g || 0, priorTargets, SHRINK_N.targets);
-  const catchRate = shrinkRate(s.targets ? s.rec / s.targets : 0, s.targets || 0, priorCatchRate, SHRINK_N.rate); // RBs catch a slightly higher % of (shorter) targets
-  const ypt = shrinkRate(s.targets ? s.recYds / s.targets : 0, s.targets || 0, priorYpt, SHRINK_N.rate); // RB targets are shorter-developing than WR targets
+  const R = V4.rush, C = V4.recv;
+  const share = ctx.depthRank === 1 ? R.share1 : R.share2;
+  const lgRushAtt = LG.teamRushAtt * share, lgTargets = C.shareRB * LG.teamPassAtt;
+  const priorRushAtt = priorRate(ctx, "rushAtt", "g", lgRushAtt, R.kRush);
+  const priorYpc = priorRate(ctx, "rushYds", "rushAtt", LG.rushYpc, R.kRate);
+  const priorRushTdRate = priorRate(ctx, "rushTd", "rushAtt", LG.rushTdRate, V4.td.k);
+  const priorTargets = priorRate(ctx, "targets", "g", lgTargets, C.kTgt);
+  const priorCatchRate = priorRate(ctx, "rec", "targets", LG.catchRate + 0.05, C.kRate);
+  const priorYpt = priorRate(ctx, "recYds", "targets", LG.ypt * 0.7, C.kRate);
+  const rushAttRaw = blendRate(s.rushAtt && s.g ? s.rushAtt / s.g : priorRushAtt, l && l.games >= R.minL4 ? l.rushAtt / l.games : null, R.rw);
+  const rushAtt = shrinkValue(rushAttRaw, s.g || 0, priorRushAtt, R.kRush);
+  const ypc = shrinkRate(s.rushAtt ? s.rushYds / s.rushAtt : 0, s.rushAtt || 0, priorYpc, R.kRate);
+  const rushTdRate = shrinkRate(s.rushAtt ? s.rushTd / s.rushAtt : 0, s.rushAtt || 0, priorRushTdRate, V4.td.k);
+  const targetsRaw = blendRate(s.targets && s.g ? s.targets / s.g : priorTargets, l && l.games >= C.minL4 ? l.targets / l.games : null, C.rw);
+  const targets = shrinkValue(targetsRaw, s.g || 0, priorTargets, C.kTgt);
+  const catchRate = shrinkRate(s.targets ? s.rec / s.targets : 0, s.targets || 0, priorCatchRate, C.kRate); // RBs catch a slightly higher % of (shorter) targets
+  const ypt = shrinkRate(s.targets ? s.recYds / s.targets : 0, s.targets || 0, priorYpt, C.kRate); // RB targets are shorter-developing than WR targets
   return { rushAtt, ypc, rushTdRate, targets, catchRate, ypt };
 }
 export function projectRB(ctx, type, line) {
@@ -322,8 +363,8 @@ export function projectRB(ctx, type, line) {
   const rest = calculateRestAdjustment(ctx);
   const rushAtt = base.rushAtt * gsRush * wxRush * rest * avail * (ctx.touchShareMult || 1);
   const rushYds = rushAtt * base.ypc * oppRun;
-  const rushTd = rushAtt * base.rushTdRate * oppRunTd * (ctx.goalLineShareMult || 1);
-  const targets = base.targets * gsPass * rest * avail;
+  const rushTd = rushAtt * base.rushTdRate * oppRunTd * (ctx.depthRank === 1 ? V4.td.gl1 : V4.td.gl2) * teamEnv(ctx, V4.env.rushTd); // v4: goal-line share by depth (v3: ctx 1.15 / 0.7)
+  const targets = base.targets * gsPass * rest * avail * teamEnv(ctx, V4.env.targets);
   const rec = targets * base.catchRate * oppCatch;
   const recYds = targets * base.ypt * wxPass * oppPass;
   // RB1s (lead back, more explosive-run volume) break longer runs on average than a committee
@@ -344,19 +385,19 @@ export function projectRB(ctx, type, line) {
 
 /* ---- WR/TE projections ---- */
 export function wrBaseRates(ctx) {
-  const s = ctx.season || {}; const l = ctx.recent || null;
-  const lOK = l && l.games >= MIN_L4_SNAPS;
-  const shareDefault = ctx.pos === "TE" ? 0.14 : (ctx.depthRank === 1 ? LG.targetShareWR1 : ctx.depthRank === 2 ? LG.targetShareWR2 : 0.10);
+  const s = ctx.season || {}; const l = ctx.recent || null; const C = V4.recv;
+  // (an RB reaches here only for Anytime TD's receiving part; v3 and the v4 fit use the WR shares by depth for it)
+  const shareDefault = ctx.pos === "TE" ? C.shareTE : (ctx.depthRank === 1 ? C.shareWR1 : ctx.depthRank === 2 ? C.shareWR2 : C.shareWR3);
   const lgTargets = LG.teamPassAtt * shareDefault;
-  const priorTargets = priorRate(ctx, "targets", "g", lgTargets);
-  const priorCatchRate = priorRate(ctx, "rec", "targets", LG.catchRate);
-  const priorYpt = priorRate(ctx, "recYds", "targets", LG.ypt);
-  const priorRecTdRate = priorRate(ctx, "recTd", "targets", LG.recTdRate);
-  const targetsRaw = blendRate(s.targets && s.g ? s.targets / s.g : priorTargets, lOK ? l.targets / l.games : null, RECENT_WEIGHT);
-  const targets = shrinkValue(targetsRaw, s.g || 0, priorTargets, SHRINK_N.targets);
-  const catchRate = shrinkRate(s.targets ? s.rec / s.targets : 0, s.targets || 0, priorCatchRate, SHRINK_N.rate);
-  const ypt = shrinkRate(s.targets ? s.recYds / s.targets : 0, s.targets || 0, priorYpt, SHRINK_N.rate);
-  const recTdRate = shrinkRate(s.targets ? s.recTd / s.targets : 0, s.targets || 0, priorRecTdRate, SHRINK_N.rate);
+  const priorTargets = priorRate(ctx, "targets", "g", lgTargets, C.kTgt);
+  const priorCatchRate = priorRate(ctx, "rec", "targets", LG.catchRate, C.kRate);
+  const priorYpt = priorRate(ctx, "recYds", "targets", LG.ypt, C.kRate);
+  const priorRecTdRate = priorRate(ctx, "recTd", "targets", LG.recTdRate, V4.td.k);
+  const targetsRaw = blendRate(s.targets && s.g ? s.targets / s.g : priorTargets, l && l.games >= C.minL4 ? l.targets / l.games : null, C.rw);
+  const targets = shrinkValue(targetsRaw, s.g || 0, priorTargets, C.kTgt);
+  const catchRate = shrinkRate(s.targets ? s.rec / s.targets : 0, s.targets || 0, priorCatchRate, C.kRate);
+  const ypt = shrinkRate(s.targets ? s.recYds / s.targets : 0, s.targets || 0, priorYpt, C.kRate);
+  const recTdRate = shrinkRate(s.targets ? s.recTd / s.targets : 0, s.targets || 0, priorRecTdRate, V4.td.k);
   return { targets, catchRate, ypt, recTdRate };
 }
 export function projectWR(ctx, type, line) {
@@ -374,10 +415,10 @@ export function projectWR(ctx, type, line) {
   const oppTd = mTd != null ? mTd : calculateOppDefenseAdjustment(ctx.oppPassTdAllowedToPos, ctx.lgPassTdAllowedToPos);
   const avail = calculateInjuryAvailability(ctx.injuryStatus);
   const rest = calculateRestAdjustment(ctx);
-  const targets = base.targets * gs * rest * avail * (ctx.injuredTeammateBoost || 1); // a hurt WR1 bumps WR2/3 target share
+  const targets = base.targets * gs * rest * avail * (ctx.injuredTeammateBoost || 1) * teamEnv(ctx, V4.env.targets); // a hurt WR1 bumps WR2/3 target share
   const rec = targets * base.catchRate * oppCatch;
   const recYds = targets * base.ypt * wx * oppYds;
-  const recTd = targets * base.recTdRate * oppTd * (ctx.redZoneShareMult || 1);
+  const recTd = targets * base.recTdRate * oppTd * (ctx.redZoneShareMult || 1) * teamEnv(ctx, V4.env.recTdRate);
   // Prior varies by role instead of being one flat constant — a WR1 or a deep-threat's long catches
   // run meaningfully longer than a possession-slot guy's or a TE's, even before real data comes in.
   const longRecPrior = ctx.pos === "TE" ? 24 : (ctx.depthRank === 1 ? 32 : ctx.depthRank === 2 ? 27 : 22);
@@ -399,12 +440,12 @@ export function projectWR(ctx, type, line) {
 // edge) AND a fake receiving-TD mean from WR target priors. A QB scores an anytime TD only by rushing
 // (passing TDs credit the receiver), so QBs now use their own rush-TD/game rate, shrunk toward their
 // prior season (or a 0.12/g league prior), and get no receiving component.
-export const QB_RUSH_TD_PRIOR_PER_G = 0.12;
+export const QB_RUSH_TD_PRIOR_PER_G = V4.td.qbRushPrior; // v4: 0.20 (v3 0.12)
 export function qbRushTdMean(ctx) {
   const s = ctx.season || {};
-  const prior = priorRate(ctx, "rushTd", "g", QB_RUSH_TD_PRIOR_PER_G);
+  const prior = priorRate(ctx, "rushTd", "g", QB_RUSH_TD_PRIOR_PER_G, V4.td.kQb);
   const obs = s.g ? (s.rushTd || 0) / s.g : prior;
-  return shrinkValue(obs, s.g || 0, prior, 6) * calculateInjuryAvailability(ctx.injuryStatus);
+  return shrinkValue(obs, s.g || 0, prior, V4.td.kQb) * calculateInjuryAvailability(ctx.injuryStatus) * teamEnv(ctx, V4.env.qbRushTd);
 }
 export function projectAnytimeTD(ctx) {
   let pNoRush = 1, pNoRec = 1, pNoPass = 1;
@@ -421,10 +462,10 @@ export function projectKicker(ctx, type, line) {
   const rzTdRate = ctx.redZoneTdRate != null ? ctx.redZoneTdRate : 0.58; // share of red-zone trips that end in a TD (not a FG)
   const wxK = calculateWeatherAdjustmentKicking(ctx);
   const drives = ctx.teamDrivesPerGame || 10.8;
-  const fgAtt = drives * LG.fgAttPerDrive * (1 + (0.58 - rzTdRate)) * wxK; // fewer RZ TDs -> more FG tries, all else equal
-  const fgMakePct = clamp(LG.fgMakePct * wxK, 0.65, 0.95);
+  const fgAtt = drives * V4.k.fgPerDrive * (1 + (0.58 - rzTdRate)) * wxK; // fewer RZ TDs -> more FG tries, all else equal
+  const fgMakePct = clamp(V4.k.fgPct * wxK, 0.65, 0.95);
   const fgMade = fgAtt * fgMakePct;
-  const xpMade = clamp(impliedTeamPts / 7 * (1 - (1 - rzTdRate) * 0.3), 0, 5); // rough TD-count proxy for extra points
+  const xpMade = clamp(impliedTeamPts / 7 * (1 - (1 - rzTdRate) * 0.3) * V4.k.xpScale, 0, 5); // rough TD-count proxy for extra points
   const kickPts = fgMade * 3 + xpMade;
   const table = {
     "Kicking Points": { mean: kickPts, phi: NB_PHI.kickPts },

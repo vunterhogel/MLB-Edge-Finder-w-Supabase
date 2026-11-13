@@ -318,6 +318,7 @@ export async function fetchAthleteGamelog(athleteId, n = 4, season = null) {
     // always running on empty data too, not just Trends). Renamed to seasonAgg; no behavior change
     // for callers, which only ever read the RETURNED object's `.season` key, set at the bottom.
     const seasonAgg = sum(all); seasonAgg.g = all.length;
+    seasonAgg.qbAtt = all.map((r) => r.passAtt || 0); // v4: every game's pass attempts in order (QB volume counts starts only)
     for (const k of LONG_KEYS) { const { avg, n: cnt } = avgLong(all, k); seasonAgg[`${k}Avg`] = avg; seasonAgg[`${k}N`] = cnt; }
     const recentSlice = all.slice(-n);
     const recent = sum(recentSlice); recent.games = recentSlice.length;

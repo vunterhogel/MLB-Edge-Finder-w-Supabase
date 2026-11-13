@@ -100,7 +100,7 @@ async function loadGameDetail(g, { date }) {
 /* ---------------- odds rows -> priced board entries ---------------- */
 // gl = the game's parsed market lines; the market spread drives the game-script multiplier
 function buildPropEntries(g, d, rows, book, gl) {
-  const gWithSpread = { ...g, marketSpreadHome: gl && gl.spreads && gl.spreads.homePoint != null ? gl.spreads.homePoint : null };
+  const gWithSpread = { ...g, marketSpreadHome: gl && gl.spreads && gl.spreads.homePoint != null ? gl.spreads.homePoint : null, marketTotal: gl && gl.totals && gl.totals.point != null ? gl.totals.point : null };
   const byName = {};
   for (const side of ["home", "away"]) {
     const teamData = side === "home" ? d.home : d.away;

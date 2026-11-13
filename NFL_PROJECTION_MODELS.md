@@ -187,6 +187,102 @@ Backend only; nothing on the page changes. Edge Finder computes everything itsel
 - **Volume.** Pass and rush volume is unchanged: game script and implied team points still drive it.
 - **Calibration.** It starts fresh under the v3 model version, the same way as MLB.
 
+### v4 (nfl-v4-2026-11-12): replay-fit priors, QB volume from starts, team totals
+
+**How it was fit.**
+- The 2025 regular season was replayed week by week from nflverse box scores (weekly player stats, plus play-by-play for the "longest" stats). Each game's inputs came only from earlier weeks, built the way `context.ts` and `fetchAthleteGamelog` build them.
+- Featured players followed the page's depth-chart picks: the QB who started, RB1-2 and WR1-3 by recent usage, TE1, and K.
+- The replay reproduces the app: on the 2026 board, app projections / replay projections have a median of 1.000 in every market.
+- Settings were fit on 2025 and checked on 2026 weeks 1-9, which were held out.
+
+**What v3 got wrong (2025 replay and 2026 held out).**
+
+| Market | Issue | Actual / projected |
+|---|---|---|
+| QB volume | About 6% low overall; bottom fifth 1.45-1.5. A QB's per-game average and prior counted backup games, so a backup thrust into a start (Minshew 6.4 att vs a 34.5 line, Milton 6 vs 31.5) or a QB with partial games was badly under-projected. | 1.05-1.08 |
+| Pass TDs | Bottom fifth very low | 2.0 |
+| INTs | Bottom fifth very low | 3.4 |
+| Anytime TD | 20% low overall; low-volume players far too low (bottom fifth 2.9-3.5), from shrinking TD rates toward small own samples and an NB spread wider than reality | 1.21-1.23 |
+| Longest Reception | Too high: v3 shrank 60 games toward the role prior, so it was always about the prior (WR1 32) | 0.86 overall, top fifth 0.80 |
+| Field Goals Made | Too low | 1.12-1.15 |
+| Pass Yards spread | var/mean 30, not 20 | — |
+| Receiving Yards spread | var/mean 30, not 22 | — |
+| Rushing Yards spread | var/mean 27, not 20 | — |
+
+**Changes.** All values are in `V4` / `NB_PHI` in `engine.ts`.
+
+- **QB volume (starts only).** Volume uses his starts this season: games with 15+ attempts (`season.qbAtt`, every game's attempts, added in `data.ts`). It shrinks 4 starts toward his last-season per-start average when he had 3+ starts, otherwise toward 30 attempts. A depth-chart starter with no starts projects as a starter. Recent-form weight is 0.15.
+- **Hierarchical priors.** A player's last-season rate, used as the prior, is itself shrunk toward the league / role default, with the same weight as the rate it feeds (`priorRate(..., k)`). Three backup games can't set a starter's completion %, INT rate or rush-TD rate any more. This one change doubled the Pass TD, INT and Anytime TD gains.
+- **Rates and volume.**
+  - QB: comp% / yds per completion shrink 60 attempts; TD / INT 150.
+  - RB carries: shrink 3 games, recent weight 0.30, default share RB1 0.65 / RB2 0.20.
+  - Targets: shrink 3 games, recent weight 0.45, default share WR1 0.16 / WR2 0.13 / WR3 0.06 / TE 0.14 / RB 0.07, catch rate and yds/target shrink 30.
+  - TD rates: shrink 60.
+  - Goal-line share: RB1 1.0 / RB2 0.85.
+  - QB rush-TD prior 0.20/g.
+- **Longest stats.** Shrink 8 games (was 60) toward his last-season average (itself shrunk 8 games) or the role prior × 0.9.
+- **Team implied total.** From the market: total / 2 − spread / 2. Means scale by (team total / 22.25)^e, with exponents:
+
+  | Input | e |
+  |---|---|
+  | Pass attempts | 0.3 |
+  | Yards per completion | 0.2 |
+  | Pass-TD rate | 0.3 |
+  | INT rate | −0.2 |
+  | Targets | 0.3 |
+  | Rec-TD rate | 0.5 |
+  | Rush TDs | 0.8 |
+  | QB rush TDs | 0.8 |
+
+  Rushing volume and kicking showed no effect. In v3, high-total games ran 4-7% above projection and low-total games 2-4% below. This is shown as "team total" in the QB math panel.
+- **Kicker.** FG make rate 0.88 (was 0.85); extra points ×0.9.
+- **Distributions (variance / mean; 1 = Poisson).**
+
+  | Market | v3 | v4 |
+  |---|---|---|
+  | Pass yds | 20 | 27 |
+  | Pass att | 3.0 | 2.0 |
+  | Completions | 2.0 | 1.6 |
+  | Pass TDs | 1.4 | Poisson |
+  | INTs | 1.3 | Poisson |
+  | Longest completion | 7 | 5 |
+  | Rush yds | 20 | 27 |
+  | Longest rush | 6 | 7 |
+  | Receptions | 1.4 | 1.3 |
+  | Rec yds | 22 | 30 |
+  | Rush / rec TDs (and Anytime TD) | 1.5 | Poisson |
+  | Kicking points | 3.5 | 2 |
+  | FG made | 1.3 | Poisson |
+
+**Validation (held-out 2026 weeks 1-9, log-likelihood gain per game vs v3).**
+
+| Market | Gain | z |
+|---|---|---|
+| Pass Attempts | +0.28 | 3.9 |
+| Pass Completions | +0.25 | 3.2 |
+| Pass Yards | +0.24 | 3.3 |
+| Pass TDs | +0.11 | 2.9 |
+| INTs | +0.11 | 2.7 |
+| Kicking Points | +0.07 | 3.9 |
+| Receiving Yards | +0.066 | 5.0 |
+| Longest Rush | +0.052 | 4.1 |
+| Longest Completion | +0.046 | 2.0 |
+| Anytime TD | +0.041 | 4.6 |
+| Longest Reception | +0.039 | 4.7 |
+| Rush Yards | +0.039 | 2.4 |
+| FG Made | +0.038 | 4.3 |
+| Receptions | +0.026 | 3.1 |
+
+- Every market is better.
+- QB volume actual / projected is about 1.00, and the bottom-fifth miss is gone (1.51 → 1.08).
+- Anytime TD goes from 1.21 to 1.04.
+- On the 17-game live board, log-loss across all markets goes from 0.692 (v3) to 0.679. The market's no-vig price is 0.651, so the model still trails the market on the board.
+
+**Known limits.**
+- Low-usage receivers and backs whose role suddenly grows are still under-projected. Box-score usage alone can't see a role change before it shows up.
+- There is no snap / route data.
+- CALIB_KEEP is unchanged until v4 board logs build up week by week.
+
 ## 5. Calibration & pricing (reused verbatim from MLB — sport-agnostic)
 
 `impliedProb`, `probToAmerican`, `evPerUnit`, `noVigProb`, `calibrateToMarket`,
