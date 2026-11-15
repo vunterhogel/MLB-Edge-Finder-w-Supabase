@@ -97,17 +97,61 @@ const histFor = (d, gl) => {
 };
 // a teammate OUT tonight counts as a missing regular starter if he played and started at least 3 of the
 // team's last 5 games (starts from the hoopR box scores; the depth chart when those aren't loaded)
-function startersOut(d, teamData, pid) {
-  let n = 0;
+function outStarterIds(d, teamData) {
+  const ids = [];
   for (const tp of teamData.roster || []) {
-    if (tp.id === pid || calculateInjuryAvailability(tp.injuryStatus) !== 0) continue;
+    if (calculateInjuryAvailability(tp.injuryStatus) !== 0) continue;
     const gl = d.logs[tp.id]; if (!gl || !gl.hist) continue;
     const played = gl.hist.cur.filter((r) => r.date && (teamData.last5 || []).some((t) => Math.abs(Date.parse(r.date) - t) < SIX_HOURS));
     if (played.length < 3) continue;
     const starts = nbaRoleInputs(d.roleData, tp.id).recentStarts(played.map((r) => String(r.eventId)));
-    if (starts != null ? starts >= 3 : tp.isStarter) n++;
+    if (starts != null ? starts >= 3 : tp.isStarter) ids.push(tp.id);
   }
-  return n;
+  return ids;
+}
+function startersOut(d, teamData, pid) { return outStarterIds(d, teamData).filter((id) => id !== pid).length; }
+// did he start his most recent game with a known starter flag (hoopR box scores)? null = no flagged game
+function startedLast(d, pid) {
+  const gl = d.logs[pid]; if (!gl || !gl.hist) return null;
+  const role = nbaRoleInputs(d.roleData, pid);
+  for (const r of histFor(d, gl).cur) { const t = role.tag(r); if (t.starter != null) return t.starter; }
+  return null;
+}
+/* v6 spot starters: for each regular starter OUT tonight, the next available player behind him at his
+   depth-chart slot who didn't start his last game steps in (one per missing starter). A missing starter who's
+   off the depth chart (ESPN already dropped him) -> that position group's healthy depth-chart #1 if he
+   didn't start last game. Cached per game + side (the roster's injury statuses decide it). */
+const spotCache = new WeakMap();
+export function spotStarters(d, teamData) {
+  const key = teamData.roster || teamData;
+  if (spotCache.has(key)) return spotCache.get(key);
+  const out = new Set(), depth = teamData.depth || {};
+  const roster = teamData.roster || [];
+  const avail = (p) => calculateInjuryAvailability(p.injuryStatus) > 0;
+  const outIds = new Set(outStarterIds(d, teamData));
+  const eligible = (p) => p && avail(p) && !outIds.has(p.id) && !out.has(p.id) && startedLast(d, p.id) !== true;
+  for (const sid of outIds) {
+    const sp = roster.find((p) => p.id === sid);
+    const dEntry = depth[sid];
+    let pick = null;
+    if (dEntry) {
+      const slot = dEntry.slots.slice().sort((a, b) => a.rank - b.rank)[0];
+      const behind = roster
+        .filter((p) => depth[p.id] && depth[p.id].slots.some((x) => x.pos === slot.pos && x.rank > slot.rank))
+        .sort((a, b) => depth[a.id].slots.find((x) => x.pos === slot.pos).rank - depth[b.id].slots.find((x) => x.pos === slot.pos).rank);
+      // the first one behind him who's healthy; if that player already started his last game he's a regular
+      // starter elsewhere and nobody is promoted off this slot
+      const first = behind.find((p) => avail(p) && !outIds.has(p.id) && !out.has(p.id));
+      if (first && eligible(first)) pick = first;
+    } else if (sp && Object.keys(depth).length) {
+      const g = posGroup(sp.pos);
+      const top = roster.find((p) => posGroup(p.pos) === g && p.depthRank === 1 && eligible(p));
+      if (top) pick = top;
+    }
+    if (pick) out.add(pick.id);
+  }
+  spotCache.set(key, out);
+  return out;
 }
 function playerCtx(d, side, p, logOverride) {
   const isHome = side === "home";
@@ -119,6 +163,7 @@ function playerCtx(d, side, p, logOverride) {
   const depthKnown = Object.keys(teamData.depth || {}).length > 0;
   return {
     kind: "player", pos: p.pos, isStarter: depthKnown && p.depthRank < 99 ? !!p.isStarter : null,
+    spotStarter: spotStarters(d, teamData).has(p.id), // v6: steps in for a regular starter who's OUT tonight
     season: gl ? gl.season : null, recent: gl ? gl.recent : null, games: gl ? gl.games : null,
     injuryStatus: p.injuryStatus, depthRank: p.depthRank,
     impliedTeamPts: isHome ? d.lambdaH : d.lambdaA, projSpreadAbs: Math.abs(d.lambdaH - d.lambdaA),
@@ -273,7 +318,7 @@ function playerView({ profile, spot, detail }) {
         grid: (() => {
           const rr = playerRoleRates(ctx);
           return [["proj minutes", rr.minutes0.toFixed(1), "sky"], ["recent min", rr.minutesBase.toFixed(1)],
-            ["starter", ctx.isStarter == null ? "unknown" : ctx.isStarter ? "yes" : "no"], ["start share", rr.startShare != null ? `${Math.round(rr.startShare * 100)}%` : "—"],
+            ["started last game", rr.startSig.v == null ? "unknown" : `${rr.startSig.v ? "yes" : "no"} (${rr.startSig.src})`], ["spot starter", rr.spot ? `yes, +${rr.spot} min` : "no", rr.spot ? "warn" : null], ["start share", rr.startShare != null ? `${Math.round(rr.startShare * 100)}%` : "—"],
             ["role shift", rr.shift ? `${rr.shift > 0 ? "+" : ""}${rr.shift.toFixed(1)} min` : "—"], ["starters out", ctx.startersOut || 0, ctx.startersOut ? "warn" : null],
             ["prior base", rr.priorLabel === "none" ? "none" : `${rr.priorGames} gm ${rr.priorLabel}`], ["team change", rr.teamChange ? "yes" : "no", rr.teamChange ? "warn" : null]];
         })(),

@@ -536,7 +536,7 @@ export default function SportApp({ sport, tab: routeTab = null, onTabChange = nu
     const log = loadBoardLog();
     if (!log.length) { alert("No board log entries yet. Load a game to start logging."); return; }
     const esc = (v) => { if (v == null) return ""; const s = String(v); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
-    const headers = ["logId","loggedAt","modelVersion","date","game","gameTimeIso","gamePk","playerId","name","type","line","side","odds","novig","rawModelP","calibratedP","edge","ev","proj","settled","actualStat","result","closingNovig","clv","live"];
+    const headers = ["logId","loggedAt","modelVersion","date","game","gameTimeIso","gamePk","playerId","name","type","line","side","odds","novig","rawModelP","calibratedP","edge","ev","proj","settled","actualStat","result","closingNovig","clv","live","tag"];
     const rows = [headers.join(",")];
     for (const e of log) {
       rows.push([
@@ -546,7 +546,7 @@ export default function SportApp({ sport, tab: routeTab = null, onTabChange = nu
         e.novig ?? "", e.rawModelP ?? "", e.calibratedP ?? "",
         e.edge ?? "", e.ev ?? "", e.proj ?? "",
         e.settled ? "true" : "false",
-        e.actualStat ?? "", esc(e.result), e.closingNovig ?? "", e.clv ?? "", e.live == null ? "" : (e.live ? "true" : "false"),
+        e.actualStat ?? "", esc(e.result), e.closingNovig ?? "", e.clv ?? "", e.live == null ? "" : (e.live ? "true" : "false"), esc(e.tag),
       ].join(","));
     }
     const blob = new Blob([rows.join("\n")], { type: "text/csv;charset=utf-8;" });

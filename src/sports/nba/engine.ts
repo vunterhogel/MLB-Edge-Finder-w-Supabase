@@ -13,7 +13,7 @@ export function probabilityOver(family, line, side, seed, params) {
 // per-market calibration: DAY-1 PRIOR. No settled-bet history for basketball yet, so every
 // category starts at a conservative, uniform "trust the market a lot" weight — same posture
 // NFL launched with. Retune per-category from the Stats tab; don't hand-tune from vibes.
-export const MODEL_VERSION = "nba-v5-2026-11-12";   // bump on every model change (part of every board-log id). v3: opponent defense by position + real pace (matchups.ts). v4: role/minutes model, fitted spreads, points shape. v5: role settings refit on two seasons (bench minutes), DD/TD sim refit, fitted CALIB_KEEP
+export const MODEL_VERSION = "nba-v6-2026-11-15";   // bump on every model change (part of every board-log id). v3: opponent defense by position + real pace (matchups.ts). v4: role/minutes model, fitted spreads, points shape. v5: role settings refit on two seasons (bench minutes), DD/TD sim refit, fitted CALIB_KEEP. v6: starter signal = started his last game (+ depth-chart spot starters), role settings refit on that signal, steals/blocks shrink
 
 /* v5: fitted on the 10/28-11/11 board logs (21.4k prop rows, 110 games), using v5's own probabilities for those
    games: the weight on the model that best predicts results by log-loss, rounded to 0.05. 0 = the model's lean
@@ -78,19 +78,32 @@ export function marginProb(lhEff, laEff, hc, ac, cmp) {
 // 10 games last season fall back to the season before. Fitted on 2024-25; see NBA_PROJECTION_MODELS.md.
 // v5 values: refit on 2024-25 + 2025-26 together and checked on 2026-27 to date (out of time). v4 (fit on
 // 2024-25 alone) projected bench players' minutes ~3-7% high; v5's bench/starter role prior fixes that.
+// v6: refit with the starter signal the app actually has pregame (did he start his LAST game), not "did he
+// start tonight" (box-score truth, which v5 was tuned on and which made it lean too hard on the flag).
 export const V4 = {
-  minHalfLife: 3,       // games
-  priorMinGames: 0.5,   // last season's minutes average counts as this many recent games (v4: 1)
-  rateHalfLife: 50,     // games (rates are far more stable than minutes) (v4: 100)
+  minHalfLife: 2,       // games (v5: 3)
+  priorMinGames: 0.5,   // last season's minutes average counts as this many recent games
+  rateHalfLife: 25,     // games (rates are far more stable than minutes) (v5: 50)
   priorRateGames: 10,   // last season's per-minute rates count as this many games of his minutes
-  teamChange: 0.25,     // last-season (and former-team) weight after a team change (v4: 0.35)
-  roleMpg: { starter: 34, bench: 12 }, roleGames: 0.25, // fallback minutes by role, and its weight in games (v4: 30 / 18)
-  starterShift: 6,      // minutes: + this x (starting tonight - his recent share of starts) (v4: 4)
-  posShrinkMin: 100,    // per-minute rates shrink toward the position prior by this many minutes
+  teamChange: 0.25,     // last-season (and former-team) weight after a team change
+  roleMpg: { starter: 28, bench: 12 }, roleGames: 0.1, // fallback minutes by role, and its weight in games (v5: 34 / 12, 0.25)
+  starterShift: 1,      // minutes: + this x (starter signal - his recent share of starts) (v5: 6)
+  spotMinutes: 5,       // minutes: a spot starter (didn't start his last game, steps in for a regular starter who's OUT)
+  posShrinkMin: 100,    // per-minute rates shrink toward the position prior by this many minutes...
+  posShrinkBy: { stl: 400, blk: 200 }, // ...except steals and blocks, whose small-sample rates regress much harder
   // per regular starter OUT tonight beyond how many were missing in the games his numbers came from:
   // teammates' minutes, and pts/ast/3PM/TO per minute (missBase: assumed count when a game's isn't known)
-  perStarterOut: { minutes: 0.06, usage: 0.02 }, missBase: 0.5, // usage v4: 0.04
+  perStarterOut: { minutes: 0.06, usage: 0.04 }, missBase: 0.5, // usage v5: 0.02
 };
+// v6 starter signal: did he start his most recent game with a known flag (hoopR box scores); no flagged game
+// this season -> last season's start share; neither -> the depth chart; nothing at all -> null (neutral)
+export function lastGameStarter(ctx) {
+  const cur = (ctx && ctx.hist && ctx.hist.cur) || [];
+  for (const x of cur) if (x.starter != null) return { v: x.starter ? 1 : 0, src: "last game" };
+  if (ctx && ctx.priorStartShare != null && !cur.length) return { v: ctx.priorStartShare >= 0.5 ? 1 : 0, src: "last season" };
+  if (ctx && ctx.isStarter != null) return { v: ctx.isStarter ? 1 : 0, src: "depth chart" };
+  return { v: null, src: "unknown" };
+}
 // dispersion, fitted on 2024-25 (var = phi x mean). Points and point combos use a shifted-gamma count
 // (SG_SHIFT): the negative binomial at their spread is too right-skewed and priced overs ~4 points low.
 export const NB_PHI = { reb: 1.45, ast: 1.25, fg3m: 1.2, stl: 1.1, blk: 1.1, tov: 1.05, "Reb+Ast": 1.7, "Blocks+Steals": 1.15 };
@@ -138,7 +151,7 @@ export function playerRoleRates(ctx) {
   if (teamChange) priorW *= V4.teamChange;
   if (!prior.length) { priorW = 0; priorLabel = "none"; }
   const pMpg = prior.length ? avg(prior.map((x) => x.min)) : 0;
-  const tonight = ctx.isStarter == null ? null : ctx.isStarter ? 1 : 0;
+  const sig = lastGameStarter(ctx), tonight = sig.v;
   let wS = 0, mS = 0, sW = 0, sS = 0, rW = 0, rMin = 0; const st = {}; for (const k of RATE_KEYS) st[k] = 0;
   let qW = 0, qS = 0, qrW = 0, qrS = 0; // missing-starter counts behind his minutes / rates (own-team games)
   for (let i = 0; i < cur.length; i++) {
@@ -149,7 +162,8 @@ export function playerRoleRates(ctx) {
     const wr = Math.pow(0.5, i / V4.rateHalfLife) * tw; rW += wr; rMin += wr * x.min; for (const k of RATE_KEYS) st[k] += wr * (x[k] || 0);
   }
   const kp = V4.priorMinGames * priorW;
-  const role = tonight ? V4.roleMpg.starter : V4.roleMpg.bench;
+  // role prior: by the starter signal; unknown -> halfway (v5 fell through to the bench prior here)
+  const role = tonight == null ? (V4.roleMpg.starter + V4.roleMpg.bench) / 2 : tonight ? V4.roleMpg.starter : V4.roleMpg.bench;
   const minutesBase = (mS + kp * pMpg + V4.roleGames * role) / (wS + kp + V4.roleGames);
   let startShare = null, shift = 0;
   if (tonight != null) {
@@ -157,7 +171,8 @@ export function playerRoleRates(ctx) {
     startShare = (sS + kps * (priorStart || 0) + V4.roleGames * tonight) / (sW + kps + V4.roleGames);
     shift = V4.starterShift * (tonight - startShare);
   }
-  const minutes0 = clamp(minutesBase + shift, 4, 42);
+  const spot = ctx.spotStarter && tonight !== 1 ? V4.spotMinutes : 0;
+  const minutes0 = clamp(minutesBase + shift + spot, 4, 42);
   const pp = POS_PRIOR[posGroup(ctx.pos)];
   const kpr = V4.priorRateGames * priorW, pMin = prior.reduce((s, x) => s + x.min, 0);
   const rates = {};
@@ -166,11 +181,12 @@ export function playerRoleRates(ctx) {
     const den = rMin + kpr * pMpg;
     const r36 = den ? ((st[k] + pr * kpr * pMpg) / den) * 36 : pp[`${k}36`];
     const n = rMin + pMin * priorW; // minutes actually seen
-    rates[`${k}36`] = (r36 * n + pp[`${k}36`] * V4.posShrinkMin) / (n + V4.posShrinkMin);
+    const sk = V4.posShrinkBy[k] != null ? V4.posShrinkBy[k] : V4.posShrinkMin;
+    rates[`${k}36`] = (r36 * n + pp[`${k}36`] * sk) / (n + sk);
   }
   const kq = kp + V4.roleGames;
   const missMin = (qS + kq * V4.missBase) / (qW + kq), missRate = (qrS + kpr * V4.missBase) / (qrW + kpr || 1);
-  return { minutes0, minutesBase, shift, startShare, missMin, missRate, curGames: cur.length, priorGames: prior.length, priorLabel, priorMpg: pMpg, teamChange, ...rates };
+  return { minutes0, minutesBase, shift, spot, startSig: sig, startShare, missMin, missRate, curGames: cur.length, priorGames: prior.length, priorLabel, priorMpg: pMpg, teamChange, ...rates };
 }
 
 // v3: a matchup multiplier for this player's position from ctx.mx (matchups.ts: what this opponent
@@ -208,7 +224,9 @@ export function projectPlayer(ctx, type, line) {
   const pg = posGroup(ctx.pos);
   const mults = [["pace", pace], ["availability", avail], [`starters out (${out} vs ${base.missMin.toFixed(1)} usual): minutes`, minBoost]];
   const um = [["starters out: usage", usage]];
-  const baseStr = `${base.minutes0.toFixed(1)} min base (recent ${base.minutesBase.toFixed(1)}${base.shift ? `, role ${base.shift > 0 ? "+" : ""}${base.shift.toFixed(1)}` : ""}${base.teamChange ? ", new team" : ""}) · ${base.curGames} gm this season + ${base.priorLabel === "none" ? "no prior season" : `${base.priorGames} gm ${base.priorLabel}`}`;
+  const baseStr = `${base.minutes0.toFixed(1)} min base (recent ${base.minutesBase.toFixed(1)}${base.shift ? `, role ${base.shift > 0 ? "+" : ""}${base.shift.toFixed(1)}` : ""}${base.spot ? `, spot starter +${base.spot}` : ""}${base.teamChange ? ", new team" : ""}) · ${base.curGames} gm this season + ${base.priorLabel === "none" ? "no prior season" : `${base.priorGames} gm ${base.priorLabel}`}`;
+  // board-log tag (v6): the minutes and starter inputs behind this row, so a bad projection can be traced to its input
+  const logTag = `min=${minutes.toFixed(1)};start=${base.startSig.v == null ? "?" : base.startSig.v}(${base.startSig.src});spot=${base.spot ? 1 : 0};out=${out}`;
   const sg = (k, mean) => ({ fam: "sg", mean, phi: SG[k].phi, shift: SG[k].shift });
   const nb = (k, mean) => ({ fam: "nb", mean, phi: NB_PHI[k] });
   const single = {
@@ -234,12 +252,12 @@ export function projectPlayer(ctx, type, line) {
     const pOver = probFor(t, line, seed);
     const dist = t.fam === "sg" ? "Shifted Gamma·MC" : "Neg.Binom·MC";
     const params = t.fam === "sg" ? `μ=${t.mean.toFixed(2)}, φ=${t.phi}, shift ${t.shift}` : `μ=${t.mean.toFixed(2)}, φ=${t.phi}`;
-    return { pOver, proj: t.mean, calc: fullCalc(dist, params, t.mean, baseStr, t.mults) };
+    return { pOver, proj: t.mean, calc: { ...fullCalc(dist, params, t.mean, baseStr, t.mults), logTag } };
   }
   if (type === "Double-Double" || type === "Triple-Double") {
     const need = type === "Double-Double" ? 2 : 3;
     const p = simulateDoubleTriple({ pts, reb, ast, stl, blk, minutesMean: minutes }, need);
-    return { pOver: p, proj: p, calc: fullCalc("Joint MC", "≥N of {pts,reb,ast,stl,blk} ≥10, shared-minutes-correlated", p, `${need} of 5 stat lines ≥ 10 · ${baseStr}`, mults) };
+    return { pOver: p, proj: p, calc: { ...fullCalc("Joint MC", "≥N of {pts,reb,ast,stl,blk} ≥10, shared-minutes-correlated", p, `${need} of 5 stat lines ≥ 10 · ${baseStr}`, mults), logTag } };
   }
   return { pOver: null, proj: null, calc: null };
 }

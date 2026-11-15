@@ -174,6 +174,8 @@ export function createStorage(prefix, MODEL_VERSION, DEFAULT_BOOK_OVERRIDES = {}
           proj: e.proj != null ? +e.proj.toFixed(3) : null,
           // in-game snapshot? (live and pregame rows were previously indistinguishable in the log)
           live: !!(e.calc && (e.calc.live || /live/i.test(String(e.calc.dist || "")))),
+          // optional per-sport diagnostic tag (e.g. NBA v6: projected minutes + starter signal behind the row)
+          tag: e.calc && e.calc.logTag ? String(e.calc.logTag) : null,
           // settlement (filled later)
           settled: false,
           actualStat: null,

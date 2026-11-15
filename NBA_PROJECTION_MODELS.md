@@ -337,6 +337,56 @@ Log-loss improves in all three seasons. On the board, v5 DD averages 0.136 vs 0.
 - steals about 8% high
 - the game total about 3% high
 
+### v6 (nba-v6-2026-11-15): starter signal the app actually has, spot starters, steals/blocks shrink
+
+**Evidence.** Three nights of v5 board logs (11/12-11/14, 18 games), compared player by player with the replay harness on the same games.
+- The app projected about 5% low: actual / projection was Points 1.050, Rebounds 1.033, Assists 1.066. The same v5 math fed box-score inputs was close to unbiased (Points 1.012, Rebounds 1.002), so the gap came from the starter input, not the model.
+- v5 was tuned on "did he start tonight" (box-score truth), which the app never knows pregame. In the app that flag came from the ESPN depth chart, with three failure modes:
+  - an empty depth chart fell through to the bench role prior (12 mpg);
+  - a regular starter flagged as a non-starter lost the full 6-minute shift;
+  - the depth parse kept only each player's best rank, so the backup was never promoted when the starter was OUT.
+- Spot starters ran at app/harness about 0.69 and actual/app 1.39. Regular starters with a bad flag (8.7% of v5 rows) ran at actual/app 1.24 vs actual/harness 0.98.
+- The low projections became under flags: 160 unders vs 32 overs on the board, and 69% unders on tracked bets, hitting 39.7%.
+
+**Starter signal.** It is now "did he start his most recent game with a known flag" (hoopR box scores). With no flagged game this season it uses last season's start share (≥ 50%), then the depth chart, then unknown. Unknown now gets a neutral role prior (halfway between starter and bench), not the bench prior.
+
+**Spot starters.** For each regular starter OUT tonight (the same "started 3 of the last 5" test as starters-out), the next healthy player behind him at his depth-chart slot is promoted, if that player didn't start his last game. If the missing starter is off the chart (ESPN already moved him), it takes that position group's healthy #1 if he didn't start his last game. One promotion per missing starter, worth +5 minutes.
+- In the replay (2024-26), spot starters are projected about 26% low on minutes without this. The fitted bump is 6 minutes; 2026-27 points to about 4. v6 ships 5, since the app's depth-chart detection is noisier than box truth.
+- `fetchDepthChart` now keeps every slot a player is listed at (`slots`), not just his best rank.
+
+**Role settings.** Refit on 2024-25 and 2025-26 using the last-game signal, then checked on 2026-27 to date.
+
+| Setting | v5 | v6 |
+|---|---|---|
+| Role prior minutes (starter / bench) | 34 / 12 | 28 / 12 |
+| Role prior weight | 0.25 game | 0.1 game |
+| Starter shift | +6 min | +1 min |
+| Minutes half-life | 3 games | 2 games |
+| Rate half-life | 50 games | 25 games |
+| Starters-out usage boost | +2% | +4% |
+| Position shrink, steals / blocks | 100 / 100 min | 400 / 200 min |
+
+On 2026-27 (not used for fitting), with the app-like signal for both, the log-likelihood gains of v6 over v5 are Points +0.004 (z 2.0), Rebounds (z 2.1), Steals +0.005 (z 3.4), Blocks (z 2.1) and PRA +0.006 (z 2.5). Assists and Threes are up slightly, and Turnovers is flat. Spot-starter rows gain on every market except Turnovers.
+
+**Parity.** The shipped engine matches the harness to 1e-14 on 2025-26 (8,240 rows). The only differences are edge cases (no last season, or fewer than 10 games of it), where the engine's neutral prior replaces the harness's bench prior.
+
+**Replay of the 11/12-11/14 board.** The v6 engine was run on harness inputs, and spot starters come from box truth, so this is optimistic:
+
+| Metric | Market | v5 (logged) | v6 |
+|---|---|---|---|
+| Log-loss, all props | 0.6606 | 0.6796 | 0.6734 |
+| Mean P(over) (hit 0.435) | 0.448 | 0.404 | 0.426 |
+
+- Actual / v6 projection: Points 1.009, Rebounds 1.003, PRA 1.022, Assists 1.033, Threes 1.059, Steals 0.882, Blocks 0.844.
+- v6 beats the market on Rebounds and Steals, and trails it on Points and the points combos (those markets carry calibration weights of 0 to 0.05, so they barely flag).
+- Flags with the v5 weights: 138 (54% unders, hit 42%, ROI -10.9%) vs v5's 162 (71% unders, hit 39.5%, ROI -24.7%). That is three nights, so it's a direction, not a verdict.
+
+**Board log.** A new `tag` column (shared core, filled only by NBA for now), e.g. `min=31.2;start=1(last game);spot=0;out=1`. It records the projected minutes, the starter signal and its source, whether he's a spot starter, and the number of regular starters out. A bad projection can now be traced to its input from the export.
+
+**Not changed.**
+- CALIB_KEEP stays at the v5 fit until there are v6 rows to refit on.
+- Steals and blocks are still high for board players (selection: books post those props for high-rate defenders). The stronger shrink narrows the gap, and the fitted weights handle the rest.
+
 ## 5. Calibration & pricing (reused verbatim from MLB/NFL — sport-agnostic)
 
 `impliedProb`, `probToAmerican`, `evPerUnit`, `noVigProb`, `calibrateToMarket`,

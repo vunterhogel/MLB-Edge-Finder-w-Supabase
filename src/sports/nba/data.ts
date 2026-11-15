@@ -118,7 +118,11 @@ export async function fetchDepthChart(teamId, year) {
         for (const a of grp.athletes || []) {
           const id = refId(a.athlete && a.athlete.$ref);
           if (!id) continue;
-          if (!out[id] || (a.rank || 99) < out[id].rank) out[id] = { pos: posKey.toUpperCase(), rank: a.rank || 99 };
+          const slot = { pos: posKey.toUpperCase(), rank: a.rank || 99 };
+          // best rank (as before) plus every slot he's listed at, so a backup can be promoted when the player
+          // ahead of him at that slot is OUT (v6 spot starters)
+          if (!out[id]) out[id] = { ...slot, slots: [slot] };
+          else { out[id].slots.push(slot); if (slot.rank < out[id].rank) { out[id].pos = slot.pos; out[id].rank = slot.rank; } }
         }
       }
     }
