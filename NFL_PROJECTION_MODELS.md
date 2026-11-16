@@ -306,3 +306,7 @@ is what lets it get tuned the same way MLB's did.
    too short to wait out a stale depth chart).
 5. **Ties** in the game-line model (rare, but the grid math has to allow
    `home == away` as a genuine outcome, not just a rounding push).
+
+## v4.1 (nfl-v4.1-2026-11-16): Anytime TD de-vig
+
+Anytime TD is one-sided (DK posts only "Yes"), so its posted price still carried the hold, and the model was being calibrated toward a number that was too high. On 256 settled ATD board rows, players scored at 0.865× the posted implied probability. The fair price is now implied^1.12 (power de-vig, core/math oneSidedFair). The sample is small, so refit as NFL rows build up. Nothing else changed; calibration weights stay until there are enough v4 rows to refit.

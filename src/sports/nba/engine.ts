@@ -1,5 +1,5 @@
 /* NBA projection engine. Methodology: NBA_PROJECTION_MODELS.md (v4: role model + fitted shapes, replay-validated). */
-import { clamp, evPerUnit, gaussian, hashSeed, impliedProb, negativeBinomialPMF, noVigProb, poiCdf, probToAmerican, runMonteCarlo, sampleNegBin, sampleShiftedGammaCount, withSeededRng } from "../../core/math";
+import { clamp, evPerUnit, gaussian, hashSeed, impliedProb, negativeBinomialPMF, noVigProb, poiCdf, probToAmerican, runMonteCarlo, sampleNegBin, sampleShiftedGammaCount, withSeededRng, disagreementWeight, oneSidedFair } from "../../core/math";
 import { NBA_PTS_PHI } from "./config";
 
 export function probabilityOver(family, line, side, seed, params) {
@@ -13,7 +13,7 @@ export function probabilityOver(family, line, side, seed, params) {
 // per-market calibration: DAY-1 PRIOR. No settled-bet history for basketball yet, so every
 // category starts at a conservative, uniform "trust the market a lot" weight — same posture
 // NFL launched with. Retune per-category from the Stats tab; don't hand-tune from vibes.
-export const MODEL_VERSION = "nba-v6-2026-11-15";   // bump on every model change (part of every board-log id). v3: opponent defense by position + real pace (matchups.ts). v4: role/minutes model, fitted spreads, points shape. v5: role settings refit on two seasons (bench minutes), DD/TD sim refit, fitted CALIB_KEEP. v6: starter signal = started his last game (+ depth-chart spot starters), role settings refit on that signal, steals/blocks shrink
+export const MODEL_VERSION = "nba-v6.1-2026-11-16";   // v6.1: calibration refit (one-sided de-vig, disagreement-aware weights, OUT not priced). Bump on every model change (part of every board-log id). v3: opponent defense by position + real pace (matchups.ts). v4: role/minutes model, fitted spreads, points shape. v5: role settings refit on two seasons (bench minutes), DD/TD sim refit, fitted CALIB_KEEP. v6: starter signal = started his last game (+ depth-chart spot starters), role settings refit on that signal, steals/blocks shrink
 
 /* v5: fitted on the 10/28-11/11 board logs (21.4k prop rows, 110 games), using v5's own probabilities for those
    games: the weight on the model that best predicts results by log-loss, rounded to 0.05. 0 = the model's lean
@@ -21,14 +21,30 @@ export const MODEL_VERSION = "nba-v6-2026-11-15";   // bump on every model chang
    moneyline), so it produces no edge there. Only Double-Double and Triple-Double held up when fit on week 1 and
    tested on week 2; the rest are small-sample fits. Turnovers had no board rows and keep their old value.
    Refit as v5 board logs build up. */
+/* v6.1 (2026-11-16) calibration, refit on the board logs 10/27-11/15 (28,600 settled pregame rows):
+   1. One-sided markets de-vigged (ONE_SIDED_GAMMA): DD / TD were being priced against DK's posted Yes price with
+      the hold still in it (DD hit 0.77x implied, TD 0.41x), so a model lean toward Yes looked like edge that wasn't.
+   2. Disagreement-aware weight on player props (CALIB_TAU, core/math disagreementWeight).
+   3. CALIB_KEEP refit with 1 and 2 in place (log-loss minimizing, 0.05 steps). Markets with < 500 rows are set
+      halfway between the fit and the v5 value (small samples). A weight of 0 = the model's lean in that market
+      carries no information beyond the market yet (it still prices and logs; it can earn weight back).
+   Out of sample (fit through 11/08, tested 11/09-11/15): log-loss 0.6563 vs market 0.6565 (v5 weights 0.6575),
+   flags 409 at +1.1% ROI vs 471 at -18.7%. Fitted mostly on v4 probabilities: refit weekly on v6 rows. */
+export const CALIB_TAU = 0.08;
+export const ONE_SIDED_GAMMA = { "Double-Double": 1.20, "Triple-Double": 1.32 };
 export const CALIB_KEEP = {
-  "Points": 0.00, "Rebounds": 0.30, "Assists": 0.25, "Three-Pointers Made": 0.20, "Steals": 0.75, "Blocks": 0.30, "Turnovers": 0.35,
-  "Pts+Reb+Ast": 0.05, "Pts+Reb": 0.00, "Pts+Ast": 0.00, "Reb+Ast": 0.20, "Blocks+Steals": 0.15,
-  "Double-Double": 0.70, "Triple-Double": 0.95, "Spread": 0.20, "Total": 0.00, "Moneyline": 0.00,
+  "Points": 0.65, "Rebounds": 0.25, "Assists": 0.65, "Three-Pointers Made": 0.25, "Steals": 0.00, "Blocks": 0.15, "Turnovers": 0.35,
+  "Pts+Reb+Ast": 0.85, "Pts+Reb": 0.75, "Pts+Ast": 0.75, "Reb+Ast": 0.05, "Blocks+Steals": 0.55,
+  "Double-Double": 0.00, "Triple-Double": 0.00, "Spread": 0.15, "Total": 0.00, "Moneyline": 0.00,
 };
 export const CALIB_KEEP_DEFAULT = 0.5;
 export function keepFor(type) { return (type != null && CALIB_KEEP[type] != null) ? CALIB_KEEP[type] : CALIB_KEEP_DEFAULT; }
-export function calibrateToMarket(p, market, type) { return (p == null || market == null) ? p : clamp(market + keepFor(type) * (p - market), 0.001, 0.999); }
+const NO_TAU = new Set(["Double-Double", "Triple-Double", "Spread", "Total", "Moneyline"]);
+export function calibrateToMarket(p, market, type, proj = null, line = null) {
+  if (p == null || market == null) return p;
+  const w = proj == null || NO_TAU.has(type) ? 1 : disagreementWeight(proj, line, CALIB_TAU);
+  return clamp(market + keepFor(type) * w * (p - market), 0.001, 0.999);
+}
 
 /* ============================================================
    TEAM SCORING MODEL — game lines (Moneyline / Spread / Total)
@@ -219,6 +235,8 @@ export function playerMeans(ctx) {
 export function projectPlayer(ctx, type, line) {
   const M = playerMeans(ctx);
   const { base, minutes, pace, avail, out, minBoost, usage, pts, reb, ast, fg3m, stl, blk, tov } = M;
+  // v6.1: a player who is OUT (availability 0) isn't priced: a 0 projection is an input, not a model view
+  if (!(avail > 0) || !(minutes > 0)) return { pOver: null, proj: null, calc: null };
   const oppPts = M.opp.pts, oppReb = M.opp.reb, oppAst = M.opp.ast, opp3 = M.opp.fg3m, oppStl = M.opp.stl, oppBlk = M.opp.blk, oppTov = M.opp.tov;
 
   const pg = posGroup(ctx.pos);
@@ -293,9 +311,10 @@ export function evalBet(b, pre) {
   const rawP = b.side === "over" ? pOver : 1 - pOver;
   const odds = Number(b.odds);
   const imp = isNaN(odds) ? null : impliedProb(odds);
-  const novig = (b.overOdds != null || b.underOdds != null) ? noVigProb(b.overOdds, b.underOdds, b.side) : imp;
+  const twoSided = b.overOdds != null && b.underOdds != null;
+  const novig = twoSided ? noVigProb(b.overOdds, b.underOdds, b.side) : (ONE_SIDED_GAMMA[b.type] ? oneSidedFair(imp, ONE_SIDED_GAMMA[b.type]) : (b.overOdds != null || b.underOdds != null) ? noVigProb(b.overOdds, b.underOdds, b.side) : imp);
   const fairRef = novig != null ? novig : imp;
-  const modelP = calibrateToMarket(rawP, fairRef, b.type);
+  const modelP = calibrateToMarket(rawP, fairRef, b.type, proj, parseFloat(b.line));
   const bmult = isNaN(odds) ? 0 : (odds > 0 ? odds / 100 : 100 / -odds);
   const edge = (modelP != null && fairRef != null) ? modelP - fairRef : null;
   const ev = (modelP != null && !isNaN(odds)) ? evPerUnit(modelP, odds) : null;

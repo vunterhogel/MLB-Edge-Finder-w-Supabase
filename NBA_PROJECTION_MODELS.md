@@ -387,6 +387,44 @@ On 2026-27 (not used for fitting), with the app-like signal for both, the log-li
 - CALIB_KEEP stays at the v5 fit until there are v6 rows to refit on.
 - Steals and blocks are still high for board players (selection: books post those props for high-rate defenders). The stronger shrink narrows the gap, and the fitted weights handle the rest.
 
+### v6.1 (nba-v6.1-2026-11-16): calibration refit, no hidden markets
+
+No market is switched off or hidden. Every row is still projected, priced and logged. What changed is how much of the model's lean each probability keeps, refit on the board logs (10/27-11/15, 28,600 settled pregame rows).
+
+1. **One-sided markets are de-vigged.** DK only posts "Yes" on Double-Double and Triple-Double, so their price still carried the book's hold. We were measuring the model against a number that was too high: DD hit 0.77× the posted implied probability, TD 0.41×. The fair price now uses a power de-vig, fair = implied^γ, with γ 1.20 for DD and 1.32 for TD. Fit on the first half of the logs, tested on the second, it improves log-loss on both (DD 0.2723 → 0.2632, TD 0.0708 → 0.0596).
+2. **Disagreement-aware weight on player props.** calibrated = market + k × w × (model − market), with w = exp(−(ln(proj / line) / 0.08)²). The model keeps its full weight near the line and less the further it disagrees, because big disagreements were mostly news the market had.
+3. **Weights refit** with 1 and 2 in place (log-loss minimizing, 0.05 steps). Markets with under 500 rows are set halfway between the fit and the v5 value.
+4. **OUT players aren't priced.** Availability 0 means no probability, instead of a 0 projection that made every under look like a lock.
+
+| Market | v5 weight | v6.1 weight |
+|---|---|---|
+| Points | 0 | 0.65 |
+| Pts+Reb+Ast | 0.05 | 0.85 |
+| Pts+Reb, Pts+Ast | 0 | 0.75 |
+| Assists | 0.25 | 0.65 |
+| Blocks+Steals | 0.15 | 0.55 |
+| Rebounds | 0.30 | 0.25 |
+| Threes | 0.20 | 0.25 |
+| Blocks | 0.30 | 0.15 |
+| Spread | 0.20 | 0.15 |
+| Reb+Ast | 0.20 | 0.05 |
+| Steals | 0.75 | 0 |
+| Double-Double | 0.70 | 0 |
+| Triple-Double | 0.95 | 0 |
+| Total, Moneyline | 0 | 0 |
+
+Weights go up where the model is right near the line (points and its combos) and down where its lean has carried no information so far (steals, DD, TD). A 0 still prices the market at the de-vigged fair, so it can earn weight back at the next refit.
+
+**Validation (fit through 11/08, tested 11/09-11/15):**
+
+| | Log-loss | Flags | Flag ROI |
+|---|---|---|---|
+| Market | 0.6565 | | |
+| v5 weights | 0.6575 | 471 | -18.7% |
+| v6.1 | 0.6563 | 409 | +1.1% |
+
+Shipped weights are refit on all days. In sample since 11/04: 905 flags at -0.4%, 5 losing days of 12. The fit mostly uses v4 probabilities, so refit weekly on v6 rows.
+
 ## 5. Calibration & pricing (reused verbatim from MLB/NFL — sport-agnostic)
 
 `impliedProb`, `probToAmerican`, `evPerUnit`, `noVigProb`, `calibrateToMarket`,

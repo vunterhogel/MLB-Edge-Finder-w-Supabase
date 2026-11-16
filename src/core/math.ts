@@ -109,6 +109,20 @@ export const evPerUnit = (p, o) => { const b = o > 0 ? o / 100 : 100 / -o; retur
 export const pct = (x) => (x == null || isNaN(x) ? "—" : `${(x * 100).toFixed(1)}%`);
 export const fmtOdds = (o) => (o == null ? "—" : (o > 0 ? `+${o}` : `${o}`));
 // no-vig probability for a side given both prices; falls back to raw if one side missing
+/* One-sided markets (only "Yes" offered: NBA Double-Double / Triple-Double, NFL Anytime TD): there is no
+   opposite price to remove the vig with, so the posted implied probability still carries the book's hold.
+   Power de-vig: fair = implied^gamma, gamma fitted per market on our board logs (gamma 1 = no vig removed).
+   Longshots carry the most hold, which a power curve captures (DK DD at +900 implied 0.10, hit 0.05-0.07). */
+export function oneSidedFair(imp, gamma) { return imp == null ? null : (gamma && gamma !== 1 ? Math.pow(imp, gamma) : imp); }
+/* Disagreement-aware calibration weight: the model keeps its full calibration weight when its projection sits
+   near the line and less the further it sits from it, w = exp(-(ln(proj / line) / tau)^2). Big disagreements
+   are mostly news the market has and we don't (late scratches, minutes changes); this prices that in. */
+export function disagreementWeight(proj, line, tau) {
+  const p = Number(proj), l = Number(line);
+  if (!tau || !Number.isFinite(p) || !Number.isFinite(l) || l <= 0) return 1;
+  const r = Math.log(Math.max(p, 0.05) / l);
+  return Math.exp(-(r / tau) * (r / tau));
+}
 export function noVigProb(overOdds, underOdds, side) {
   if (overOdds == null && underOdds == null) return null;
   if (overOdds == null || underOdds == null) return impliedProb(side === "over" ? overOdds : underOdds);

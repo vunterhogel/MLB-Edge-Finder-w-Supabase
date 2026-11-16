@@ -1,5 +1,5 @@
 /* NFL projection engine (moved from the old src/nfl/NFLApp.tsx; model math unchanged, nfl-v2). */
-import { clamp, evPerUnit, hashSeed, impliedProb, negativeBinomialPMF, noVigProb, poiCdf, probToAmerican, runMonteCarlo, sampleNegBin } from "../../core/math";
+import { clamp, evPerUnit, hashSeed, impliedProb, negativeBinomialPMF, noVigProb, poiCdf, probToAmerican, runMonteCarlo, sampleNegBin, oneSidedFair } from "../../core/math";
 import { DST_PROPS, K_PROPS, LG_PPG, NFL_PTS_PHI, QB_PROPS, RB_PROPS, WR_PROPS } from "./config";
 
 export function probabilityOver(family, line, side, seed, params) {
@@ -20,7 +20,7 @@ export function liveProbabilityOver(family, seed, params, currentTotal, line) {
 // for football yet, so every category starts at a conservative, uniform "trust the market a lot"
 // weight. Retune per-category from the Stats tab exactly the way MLB did — do NOT hand-tune
 // these from vibes; wait for graded volume.
-export const MODEL_VERSION = "nfl-v4-2026-11-12";   // bump on every model change (part of every board-log id). v3: opponent positional matchups (nflverse weekly stats). v4: replay-fit priors / shrinkage / spreads, QB volume from starts
+export const MODEL_VERSION = "nfl-v4.1-2026-11-16";   // v4.1: Anytime TD one-sided de-vig. Bump on every model change (part of every board-log id). v3: opponent positional matchups (nflverse weekly stats). v4: replay-fit priors / shrinkage / spreads, QB volume from starts
 /* v4 (2026-11-12): every prior, shrink weight and spread refit by replaying the 2025 season week by week from
    nflverse box scores (inputs built only from earlier weeks, the way the page builds them; the app's own
    projections match the replay at a median ratio of 1.000) and checked on 2026 weeks 1-9 (held out).
@@ -41,6 +41,9 @@ export const CALIB_KEEP = {
   "Spread": 0.25, "Total": 0.25, "Moneyline": 0.25,
 };
 export const EXPERIMENTAL_TYPES = new Set(["Spread", "Total", "Moneyline", "Longest Completion", "Longest Rush", "Longest Reception", "Kicking Points", "Field Goals Made", "Sacks", "Def. Interceptions"]);
+// 2026-11-16: Anytime TD is one-sided (Yes only), so its posted price still carries the hold. Power de-vig
+// (core/math oneSidedFair), gamma fitted on the board logs (256 settled ATD rows: hit 0.865x implied -> gamma 1.12).
+export const ONE_SIDED_GAMMA = { "Anytime TD": 1.12 };
 export const CALIB_KEEP_DEFAULT = 0.5;
 export function keepFor(type) { return (type != null && CALIB_KEEP[type] != null) ? CALIB_KEEP[type] : CALIB_KEEP_DEFAULT; }
 export function calibrateToMarket(p, market, type) { return (p == null || market == null) ? p : clamp(market + keepFor(type) * (p - market), 0.001, 0.999); }
@@ -530,7 +533,8 @@ export function evalBet(b, pre) {
   const { pOver, proj, calc } = pre || projectProp(b.ctx, b.type, parseFloat(b.line));
   const odds = Number(b.odds);
   const imp = isNaN(odds) ? null : impliedProb(odds);
-  const novig = (b.overOdds != null || b.underOdds != null) ? noVigProb(b.overOdds, b.underOdds, b.side) : imp;
+  const twoSided = b.overOdds != null && b.underOdds != null;
+  const novig = !twoSided && ONE_SIDED_GAMMA[b.type] ? oneSidedFair(imp, ONE_SIDED_GAMMA[b.type]) : (b.overOdds != null || b.underOdds != null) ? noVigProb(b.overOdds, b.underOdds, b.side) : imp;
   const bmult = isNaN(odds) ? 0 : (odds > 0 ? odds / 100 : 100 / -odds);
   // v2: a missing/invalid model probability stays missing on BOTH sides (previously 1 - null = 1,
   // i.e. a fake 100% raw under).
