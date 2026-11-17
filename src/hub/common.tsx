@@ -1,15 +1,32 @@
 /* Pieces shared by the hub pages. */
+import React from "react";
 import { betStats } from "../core/bets";
-import { mono } from "../core/ui";
+import { profitUnits } from "../core/math";
+import { MenuBtn, fDay } from "../ui/kit";
+import { parlayDate, parlayProfitUnits, unitsOf } from "../parlay/store";
 import { HUB_SPORTS } from "./sports";
 
-export function HubHeader({ title, accent, sub }) {
-  return (
-    <header className="pt-6 pb-3 border-b border-slate-800">
-      <h1 className="text-2xl font-black tracking-tight">{title} <span className="text-emerald-400">{accent}</span></h1>
-      <p className="text-[11px] text-slate-500 mt-0.5" style={mono}>{sub}</p>
-    </header>
-  );
+// the page's top bar: title on the left, the page's actions on the right
+export function HubTop({ title, children = null }) {
+  return <header className="top"><MenuBtn /><h1>{title}</h1><span className="grow" />{children}</header>;
+}
+// sport selector options for the hub pages (parlays optional)
+export const SPORT_SEG = [["all", "All sports"], ...HUB_SPORTS.map((s) => [s.id, s.label])];
+export const BET_SEG = [...SPORT_SEG, ["parlays", "Parlays"]];
+export const isSettled = (b) => b.status === "won" || b.status === "lost" || b.status === "push" || b.status === "void";
+export const betUnits = (b) => (b.units != null && b.units !== "" && !isNaN(b.units) ? Number(b.units) : 1);
+export const betNet = (b) => profitUnits(b.status, Number(b.odds), betUnits(b)) || 0;
+
+/* Running totals by slate date for the units chart: your stakes against a flat 1 unit on every bet.
+   bets: settled tracked bets. parlays: settled tracked parlays (optional). */
+export function dailySeries(bets, parlays = []) {
+  const days = {};
+  const add = (d, net, flat) => { if (!d) return; const x = (days[d] = days[d] || { net: 0, flat: 0 }); x.net += net; x.flat += flat; };
+  for (const b of bets) if (isSettled(b)) add(b.date, betNet(b), profitUnits(b.status, Number(b.odds), 1) || 0);
+  for (const p of parlays) if (p.status !== "open") add(parlayDate(p), parlayProfitUnits(p.status, p.legs, unitsOf(p)), parlayProfitUnits(p.status, p.legs, 1));
+  let a = 0, f = 0; const labels = [], staked = [], flat = [];
+  for (const d of Object.keys(days).sort()) { a += days[d].net; f += days[d].flat; labels.push(fDay(d).replace(/^\w+, /, "")); staked.push(+a.toFixed(2)); flat.push(+f.toFixed(2)); }
+  return { labels, staked, flat };
 }
 
 /* Stats across every sport: the overall line over all bets, plus each sport's own stats and its

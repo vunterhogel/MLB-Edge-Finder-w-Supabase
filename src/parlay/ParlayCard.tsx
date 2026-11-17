@@ -1,83 +1,72 @@
-/* Parlay cards shared by the Parlay Builder and Hub My Bets. */
-import { mono } from "../core/ui";
-import { fmtOdds, fmtPct } from "./model";
-import { parlayDate, parlayProfitUnits, removeParlay, setLegResult, setParlayUnits, unitsOf } from "./store";
+/* Parlay pieces shared by the Parlay builder and My bets. */
+import React from "react";
+import { RotateCcw, X } from "lucide-react";
+import { HUB_SPORT } from "../hub/sports";
+import { parlayDate, parlayProfitUnits, removeParlay, setLegResult, setParlays, setParlayUnits, unitsOf } from "./store";
+import { Badge, Btn, Pop, SportIcon, StatusBadge, cx, fDay, fOdds, fPct, fSigned, fUnits, pickLabel, toast, tone } from "../ui/kit";
 
-const SPORT_ICON = { mlb: "⚾", nfl: "🏈", nba: "🏀", nhl: "🏒" };
+export const legPick = (l) => (HUB_SPORT[l.sport] ? pickLabel(l, HUB_SPORT[l.sport].rowCfg) : `${l.side} ${l.line}`);
+const legWho = (l) => (l.isLine || !l.name ? String(l.game || "").replace("@", " at ") : l.name);
 
-export function ResultBadge({ result }) {
-  if (!result) return <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-800 text-slate-400">open</span>;
-  const map = { won: "bg-emerald-600 text-white", lost: "bg-rose-600 text-white", push: "bg-amber-600 text-slate-950", void: "bg-slate-600 text-slate-200" };
-  return <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${map[result] || "bg-slate-700 text-slate-200"}`}>{result}</span>;
-}
-
-// one leg, bet-slip style: sport, player / game, market line side, odds, and an optional right slot
-export function LegRow({ leg, index, right = null, sub = null }) {
+// one leg, bet-slip style: sport, player or game, the pick, odds, and an optional right slot
+export function LegRow({ leg, right = null, sub = null }) {
   return (
-    <div className={`flex items-center gap-2.5 px-2.5 py-1.5 ${index > 0 ? "border-t border-slate-800" : ""} bg-slate-900/60`}>
-      <span className="w-5 text-center shrink-0" title={String(leg.sport).toUpperCase()}>{SPORT_ICON[leg.sport] || String(leg.sport).toUpperCase()}</span>
-      <div className="flex-1 min-w-0">
-        <div className="text-[13px] font-semibold text-slate-100 truncate">{leg.name || leg.game}</div>
-        <div className="text-[11px] text-slate-500 truncate">{leg.game && leg.name ? `${leg.game} · ` : ""}{leg.type} {leg.line} <span className="uppercase text-slate-400">{leg.side}</span>{sub}</div>
-      </div>
-      <span className="text-sm font-bold shrink-0" style={mono}>{fmtOdds(leg.odds)}</span>
-      {right}
+    <div className="legrow">
+      <span className="trunc"><span className="mid" style={{ display: "inline-block", verticalAlign: "-3px", marginRight: 6 }} title={HUB_SPORT[leg.sport] ? HUB_SPORT[leg.sport].label : leg.sport}><SportIcon sport={leg.sport} size={15} /></span><span className="name">{legWho(leg)}</span> <span className="pick"><b>{legPick(leg)}</b> <span className="mid">{leg.type}</span></span></span>
+      <span className="num">{fOdds(leg.odds)}</span>
+      {right || <span />}
+      <small className="num">{leg.name && !leg.isLine && leg.game ? `${String(leg.game).replace("@", " at ")}, ` : ""}model {fPct(leg.modelP)}{leg.ev != null ? `, EV ${fSigned(leg.ev)}` : ""}{sub}</small>
     </div>
   );
 }
 
-// combined numbers line for a parlay or candidate
-export function ParlayNumbers({ legs, american, modelP, edge, ev, sgp }) {
+// combined numbers line for a parlay or a candidate
+export function ParlayNumbers({ american, modelP, edge, ev, sgp }) {
   return (
-    <>
-      <span className="font-bold">{legs} legs</span>
-      <span style={mono}>{fmtOdds(american)}</span>
-      <span className="text-slate-400">model {fmtPct(modelP)}</span>
-      <span className={edge > 0 ? "text-emerald-400" : "text-rose-400"}>edge {fmtPct(edge)}</span>
-      <span className={`font-bold ${ev > 0 ? "text-emerald-400" : "text-rose-400"}`}>EV {fmtPct(ev)}</span>
-      {sgp && <span className="text-amber-400 font-bold text-xs" title="Same-game legs are correlated, so the combined EV is optimistic">SGP</span>}
-    </>
+    <span className="row num wrap" style={{ gap: 14 }}>
+      <b style={{ fontSize: 15 }}>{fOdds(american)}</b>
+      <span className="mid">win {fPct(modelP)}</span>
+      <span className={tone(edge)}>edge {fSigned(edge)}</span>
+      <span className={tone(ev)} style={{ fontWeight: 620 }}>EV {fSigned(ev)}</span>
+      {sgp ? <Badge kind="warn" title="Legs from the same game move together, so the combined EV is optimistic">Same game</Badge> : null}
+    </span>
   );
 }
 
-// a tracked parlay: status, combined numbers as built, units, profit, legs with results + manual override
+// a tracked parlay: status, combined numbers as built, units, profit, legs with results and a manual override
 export function TrackedParlay({ p }) {
   const units = unitsOf(p);
   const profit = parlayProfitUnits(p.status, p.legs, units);
+  const remove = () => { removeParlay(p.id); toast("Parlay removed.", () => setParlays((cur) => (cur.some((x) => x.id === p.id) ? cur : [p, ...cur]))); };
   return (
-    <div className="p-2.5 rounded-xl bg-slate-900/70 border border-slate-800">
-      <div className="flex flex-wrap items-center gap-3 text-sm mb-1.5">
-        <span className="text-base" title="Parlay">🧩</span>
-        <ResultBadge result={p.status === "open" ? null : p.status} />
-        <ParlayNumbers legs={p.legs.length} american={p.builtAmerican} modelP={p.builtModelP} edge={p.builtEdge} ev={p.builtEV} sgp={p.sgp} />
-        {p.status !== "open" && <span className={`font-bold ${profit > 0 ? "text-emerald-400" : profit < 0 ? "text-rose-400" : "text-slate-400"}`} style={mono}>{profit >= 0 ? "+" : ""}{profit.toFixed(2)}u</span>}
-        <span className="ml-auto flex items-center gap-2">
-          <label className="text-[10px] text-slate-500 flex items-center gap-1">units
-            <input value={p.units ?? 1} onChange={(e) => setParlayUnits(p.id, e.target.value)} inputMode="decimal" className="w-12 bg-slate-950 border border-slate-700 rounded px-1.5 py-0.5 text-xs text-slate-100" style={mono} />
-          </label>
-          <span className="text-[10px] text-slate-500" title={`built ${new Date(p.builtAt).toLocaleString()}`}>{parlayDate(p)}</span>
-          <button onClick={() => { if (window.confirm("Remove this tracked parlay? This cannot be undone.")) removeParlay(p.id); }} className="text-slate-600 hover:text-rose-400 text-lg leading-none" title="Remove">×</button>
-        </span>
-      </div>
-      <div className="rounded-lg border border-slate-800 overflow-hidden">
+    <section className="panel">
+      <header>
+        <div className="grow">
+          <h2>{p.legs.length}-leg parlay</h2>
+          <p title={`Built ${new Date(p.builtAt).toLocaleString()}`}>{fDay(parlayDate(p))}</p>
+        </div>
+        {p.status !== "open" ? <span className={cx("num", tone(profit))} style={{ fontWeight: 640 }}>{fUnits(profit)}</span> : null}
+        <StatusBadge status={p.status} />
+        <label className="row" style={{ gap: 6 }}><span className="label">Units</span><input className="cell num" style={{ width: 52 }} aria-label="Units" inputMode="decimal" value={p.units ?? 1} onChange={(e) => setParlayUnits(p.id, e.target.value)} /></label>
+        <Btn sm icon kind="ghost" aria-label="Remove parlay" title="Remove parlay" onClick={remove}><X /></Btn>
+      </header>
+      <div style={{ padding: "10px 14px", borderBottom: "1px solid var(--line)" }}><ParlayNumbers american={p.builtAmerican} modelP={p.builtModelP} edge={p.builtEdge} ev={p.builtEV} sgp={p.sgp} /></div>
+      <div>
         {p.legs.map((l, j) => (
-          <LegRow key={j} leg={l} index={j}
-            sub={l.actualStat != null ? <span className="text-slate-500"> · actual {l.actualStat}</span> : null}
+          <LegRow key={j} leg={l}
+            sub={l.actualStat != null ? `, actual ${l.actualStat}` : ""}
             right={
-              <div className="flex items-center gap-1.5 shrink-0">
-                <ResultBadge result={l.result} />
-                {l.manual && <button onClick={() => setLegResult(p.id, j, null)} className="text-[9px] text-slate-500 hover:text-slate-300" title="Clear the result you set by hand; automatic settlement fills it again">reset</button>}
-                {!l.result && (
-                  <div className="flex gap-1">
-                    {["won", "lost", "push", "void"].map((r) => (
-                      <button key={r} onClick={() => setLegResult(p.id, j, r)} className="text-[9px] px-1.5 py-0.5 rounded border border-slate-700 hover:border-slate-400 text-slate-300" title="Set this leg's result by hand">{r}</button>
-                    ))}
-                  </div>
+              <span className="row" style={{ gap: 4 }}>
+                {l.result ? <StatusBadge status={l.result} /> : (
+                  <Pop right width={150} button={(o, t) => <button type="button" onClick={t} title="Set this leg's result by hand" aria-label="Set this leg's result by hand"><StatusBadge status="open" /></button>}>
+                    {(close) => ["won", "lost", "push", "void"].map((r) => <button type="button" className="menu-item" key={r} onClick={() => { setLegResult(p.id, j, r); close(); }}>{r[0].toUpperCase() + r.slice(1)}</button>)}
+                  </Pop>
                 )}
-              </div>
+                {l.manual ? <Btn sm icon kind="ghost" aria-label="Clear the result set by hand" title="Clear the result you set by hand. Automatic settlement fills it again." onClick={() => setLegResult(p.id, j, null)}><RotateCcw /></Btn> : null}
+              </span>
             } />
         ))}
       </div>
-    </div>
+    </section>
   );
 }

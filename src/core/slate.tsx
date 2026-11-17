@@ -1,137 +1,116 @@
-/* The MLB shell's Slate pieces (status chip, score line, game subtitle, expanded game panel), shared by every
-   sport. The markup and behavior are MLB's; a sport only supplies data:
+/* The Slate's expanded game panel, shared by every sport. A sport only supplies data:
      sport.game      = { subtitle(g), liveLabel(g), finalSuffix(g) }   text for the game row
      sport.slateView = (g, d) => view                                    what the expanded game shows
    view = {
-     env: [{ label, v, hot?, cold? }],                                   game-condition chips
-     gameLine: { lambdaA, lambdaH, home, away, total, note },             MODEL GAME LINE card
+     env: [{ label, v, hot?, cold? }],                                   game conditions
+     gameLine: { lambdaA, lambdaH, home, away, total, note },             model game line
      sections: [[Column, Column], ...],                                   two-column rows
    }
-   Column = lineup list (MLB LineupCol):  { title, empty?, rows: Row[] }
-          | starter card (MLB SPCard):    { starter: true, title, empty?, row: Row | null }
+   Column = lineup list:   { title, empty?, rows: Row[] }
+          | starter card:  { starter: true, title, empty?, row: Row | null }
    Row = { id, idx?, name, chip?: { text, tone, title? }, chips?: [...], stat?, sub?, hot?, detail: [{ text, strong? }],
-           player (opens Player Analysis), draft: { kind, id, name } (manual bet "+") } */
-import { useState } from "react";
+           player (opens the player page), draft: { kind, id, name } (manual bet "+") } */
+import React, { useState } from "react";
+import { LineChart as ChartIcon, Plus } from "lucide-react";
 import { pct, probToAmerican } from "./math";
-import { Env, HotBadge, mono } from "./ui";
+import { Badge, Btn, Expander, Stat, cap, cx } from "../ui/kit";
 
-/* ---------------- status chip (MLB vocabulary) ---------------- */
+/* ---------------- game status, in plain words ---------------- */
 export const STATUS = {
-  POSTED: { t: "LINEUP POSTED", c: "bg-emerald-500 text-slate-950" },
-  PARTIAL: { t: "PARTIAL", c: "bg-teal-600 text-white" },
-  PENDING: { t: "PENDING · PROBABLES", c: "bg-amber-500 text-slate-950" },
-  SCHEDULED: { t: "NO DATA YET", c: "bg-slate-700 text-slate-300" },
-  LIVE: { t: "LIVE", c: "bg-rose-500 text-white" },
-  FINAL: { t: "FINAL", c: "bg-slate-600 text-slate-200" },
-  MANUAL: { t: "MANUAL", c: "bg-violet-500 text-white" },
+  POSTED: { t: "Lineups posted", k: "accent" },
+  PARTIAL: { t: "Lineup partial", k: "warn" },
+  PENDING: { t: "Lineups pending", k: "" },
+  SCHEDULED: { t: "Scheduled", k: "" },
+  LIVE: { t: "Live", k: "live" },
+  FINAL: { t: "Final", k: "" },
+  MANUAL: { t: "Manual", k: "line" },
 };
-export function Chip({ s }) { const m = STATUS[s] || STATUS.SCHEDULED; return <span className={`px-2 py-0.5 rounded text-[10px] font-bold tracking-wide ${m.c}`}>{m.t}</span>; }
+export function Chip({ s }) { const m = STATUS[s] || STATUS.SCHEDULED; return <Badge kind={m.k}>{s === "LIVE" ? <span className="dot" /> : null}{m.t}</Badge>; }
 
-/* ---------------- game row text ---------------- */
-export function ScoreLine({ g, game }) {
-  const a = g.awayScore, h = g.homeScore;
-  if (g.status === "FINAL") {
-    return <div className="text-[12px] truncate" style={mono}><span className={a > h ? "text-slate-100 font-bold" : "text-slate-400"}>{g.away} {a}</span><span className="text-slate-600">, </span><span className={h > a ? "text-slate-100 font-bold" : "text-slate-400"}>{g.home} {h}</span><span className="text-slate-500"> · Final{game.finalSuffix(g) || ""}</span></div>;
-  }
-  return <div className="text-[12px] truncate" style={mono}><span className="text-slate-200">{g.away} {a}</span><span className="text-slate-600">, </span><span className="text-slate-200">{g.home} {h}</span><span className="text-rose-400"> · {game.liveLabel(g)}</span></div>;
-}
-export function GameSubtitle({ g, game }) {
-  return <div className="text-[11px] text-slate-500 truncate">{game.subtitle(g)}</div>;
-}
-
-/* ---------------- row chips (MLB platoon-chip style) ---------------- */
-const CHIP_TONE = { bad: "bg-rose-900/50 text-rose-300", good: "bg-emerald-900/50 text-emerald-300", warn: "bg-amber-900/50 text-amber-300", muted: "bg-slate-800 text-slate-400" };
-function RowChip({ c }) { return <span className={`text-[9px] px-1 rounded ${CHIP_TONE[c.tone] || CHIP_TONE.muted}`} style={mono} title={c.title}>{c.text}</span>; }
-// injury / availability designation -> a row chip
+// column headings for each sport's lineup stat line (the adapter's row.stat string, split on its separators)
+const LINEUP_HEADERS = { mlb: ["AVG", "OPS"], nba: ["MIN", "PTS", "REB", "AST", "3PM"], nhl: ["GP", "G-A-P", "SOG", "TOI"] };
+const TONE = { bad: "lost", good: "won", warn: "warn", muted: "" };
+// injury / availability designation -> a row chip (used by the sport adapters)
 export function injuryChip(status) {
   if (!status) return null;
   const s = String(status).toUpperCase();
   return { text: s.replace(/_/g, " "), tone: s === "OUT" || s === "IR" || s === "SUSPENDED" || s === "DOUBTFUL" ? "bad" : "warn" };
 }
+const nice = (t) => { const s = String(t); return s.length > 3 && s === s.toUpperCase() ? s[0] + s.slice(1).toLowerCase() : s; };
 
-/* ---------------- expanded game panel (MLB SlateDetail) ---------------- */
-function PlayerRow({ r, onDraft, onAnalysis }) {
+function PlayerRow({ r, heads, onDraft, onAnalysis }) {
   const [exp, setExp] = useState(false);
-  const onPlayerClick = r.player && onAnalysis ? () => onAnalysis(r.player) : null;
   const chips = [r.chip, ...(r.chips || [])].filter(Boolean);
-  return (
-    <div className="text-[12px]">
-      <div className="flex items-center gap-2">
-        <span className="text-slate-600 w-4" style={mono}>{r.idx}</span>
-        <button onClick={() => setExp((e) => !e)} className="text-slate-500 hover:text-slate-300 text-[10px] w-3 flex-shrink-0">{exp ? "▾" : "▸"}</button>
-        <button
-          onClick={onPlayerClick || undefined}
-          disabled={!onPlayerClick}
-          className={`flex-1 text-left truncate ${onPlayerClick ? "hover:text-sky-300 cursor-pointer" : "cursor-default"}`}
-          title={onPlayerClick ? "Open player analysis" : undefined}
-        >{r.name || "—"}</button>
-        {chips.map((c, i) => <RowChip key={i} c={c} />)}
-        <span className="text-slate-400" style={mono}>{r.stat != null ? r.stat : "—"}</span>
-        {r.hot != null && <HotBadge delta={r.hot} />}
-        <button onClick={() => r.draft && onDraft(r.draft)} className="text-emerald-500 hover:text-emerald-300 font-bold w-5 text-center" title="manual bet">+</button>
-      </div>
-      {exp && (
-        <div className="ml-7 mb-1 mt-0.5 text-[11px] text-slate-400" style={mono}>
-          {(r.detail || []).map((d, i) => <span key={i} className={`${i ? "ml-2" : ""} ${d.strong ? "text-slate-300" : ""}`}>{d.text}</span>)}
-        </div>
-      )}
-    </div>
-  );
+  const parts = r.stat != null ? String(r.stat).split(/ · |\//) : [];
+  const split = heads.length > 1 && parts.length === heads.length;
+  return (<>
+    <tr className={exp ? "open" : ""}>
+      <td className="dim num" style={{ width: 28 }}>{r.idx}</td>
+      <td>
+        {r.player && onAnalysis ? <button type="button" className="name" title="Open player" onClick={() => onAnalysis(r.player)}>{r.name || "–"}</button> : <span className="name">{r.name || "–"}</span>}
+        {chips.map((c, i) => <React.Fragment key={i}> <Badge kind={TONE[c.tone] || ""} title={c.title}>{nice(c.text)}</Badge></React.Fragment>)}
+        {r.hot != null && r.hot > 0.08 ? <> <Badge kind="warn" title="Running hot against his season line">Hot</Badge></> : null}
+        {r.hot != null && r.hot < -0.08 ? <> <Badge kind="accent" title="Running cold against his season line">Cold</Badge></> : null}
+      </td>
+      {split ? parts.map((v, i) => <td className="r num" key={i}>{v}</td>) : <td className="r num mid" colSpan={heads.length}>{r.stat != null ? r.stat : "–"}</td>}
+      <td className="r" style={{ whiteSpace: "nowrap" }}>
+        {(r.detail || []).length ? <Expander open={exp} onClick={() => setExp((x) => !x)} label="More on this player" /> : null}
+        {r.player && onAnalysis ? <Btn sm icon kind="ghost" aria-label={`Open ${r.name}`} title="Open player" onClick={() => onAnalysis(r.player)}><ChartIcon /></Btn> : null}
+        {r.draft ? <Btn sm icon kind="ghost" aria-label={`Add a manual bet on ${r.name}`} title="Add a manual bet" onClick={() => onDraft(r.draft)}><Plus /></Btn> : null}
+      </td>
+    </tr>
+    {exp ? <tr className="detail"><td colSpan={heads.length + 3} style={{ padding: "2px 14px 10px 42px" }}><span className="note num">{(r.detail || []).map((d, i) => <span key={i} style={{ marginRight: 12, color: d.strong ? "var(--ink)" : undefined }}>{d.text}</span>)}</span></td></tr> : null}
+  </>);
 }
-function LineupCol({ c, onDraft, onAnalysis }) {
+function LineupCol({ c, heads, onDraft, onAnalysis }) {
   return (
-    <div className="bg-slate-950/60 border border-slate-800 rounded-lg p-2.5">
-      <div className="text-[10px] text-slate-500 font-bold tracking-wide mb-1.5">{c.title}</div>
-      {c.rows.length === 0 && <div className="text-[11px] text-slate-600 py-2">{c.empty || "— not posted —"}</div>}
-      <div className="space-y-0.5">{c.rows.map((r) => <PlayerRow key={r.id} r={r} onDraft={onDraft} onAnalysis={onAnalysis} />)}</div>
+    <div className="lineup">
+      <h4>{c.title}</h4>
+      {c.rows.length === 0 ? <div className="note" style={{ padding: 14 }}>{c.empty || "Not posted yet."}</div> : (
+        <table className="tbl inset tight">
+          <thead><tr><th>#</th><th>Player</th>{heads.map((h) => <th className="r" key={h}>{h}</th>)}<th /></tr></thead>
+          <tbody>{c.rows.map((r) => <PlayerRow key={r.id} r={r} heads={heads} onDraft={onDraft} onAnalysis={onAnalysis} />)}</tbody>
+        </table>
+      )}
     </div>
   );
 }
 function StarterCard({ c, onDraft, onAnalysis }) {
   const r = c.row;
-  const onPlayerClick = r && r.player && onAnalysis ? () => onAnalysis(r.player) : null;
   return (
-    <div className="bg-slate-950/60 border border-slate-800 rounded-lg p-2.5">
-      <div className="text-[10px] text-slate-500 font-bold tracking-wide mb-1">{c.title}</div>
-      {!r ? <div className="text-[11px] text-slate-600">{c.empty || "TBD"}</div> : (
-        <div className="flex items-center justify-between">
-          <div>
-            <button
-              onClick={onPlayerClick || undefined}
-              disabled={!onPlayerClick}
-              className={`text-[12px] font-semibold text-left ${onPlayerClick ? "hover:text-sky-300 cursor-pointer" : "cursor-default"}`}
-              title={onPlayerClick ? "Open player analysis" : undefined}
-            >
-              {r.name}{r.nameBadge ? <span className="ml-1 text-[9px] text-amber-400 font-bold">{r.nameBadge}</span> : null}
-            </button>
-            <div className="text-[11px] text-slate-400" style={mono}>{r.sub || "—"}</div>
+    <div className="lineup">
+      <h4>{c.title}</h4>
+      <div className="row" style={{ padding: "10px 14px" }}>
+        {!r ? <span className="dim">{c.empty || "To be announced"}</span> : (<>
+          <div className="grow">
+            {r.player && onAnalysis ? <button type="button" className="name" title="Open player" onClick={() => onAnalysis(r.player)}>{r.name}</button> : <span className="name">{r.name}</span>}
+            {r.nameBadge ? <> <Badge kind="warn">{r.nameBadge}</Badge></> : null}
+            <div className="note num">{r.sub || "–"}</div>
           </div>
-          <button onClick={() => r.draft && onDraft(r.draft)} className="text-emerald-500 hover:text-emerald-300 font-bold text-lg" title="manual bet">+</button>
-        </div>
-      )}
+          {r.draft ? <Btn sm icon kind="ghost" aria-label={`Add a manual bet on ${r.name}`} title="Add a manual bet" onClick={() => onDraft(r.draft)}><Plus /></Btn> : null}
+        </>)}
+      </div>
     </div>
   );
 }
-export function GameDetail({ g, view, onDraft, onAnalysis }) {
+export function GameDetail({ g, view, sportId, statLabel = null, onDraft, onAnalysis }) {
   const gl = view.gameLine;
+  const heads = statLabel ? String(statLabel).split(/ · |\//) : (LINEUP_HEADERS[sportId] || ["Recent"]);
   return (
     <>
-      <div className="flex flex-wrap gap-2 mt-3 text-[11px]" style={mono}>
-        {(view.env || []).map((e) => <Env key={e.label} label={e.label} v={e.v} hot={e.hot} cold={e.cold} />)}
-      </div>
-      <div className="mt-3 bg-slate-950/60 border border-slate-800 rounded-lg p-3">
-        <div className="text-[10px] text-slate-500 font-bold tracking-wide mb-2">MODEL GAME LINE</div>
-        <div className="flex flex-wrap items-center gap-x-6 gap-y-1 text-[13px]" style={mono}>
-          <span className="text-slate-300">proj score <b className="text-sky-300">{g.away} {gl.lambdaA.toFixed(1)} – {gl.lambdaH.toFixed(1)} {g.home}</b></span>
-          <span>{g.home} <b className="text-emerald-400">{pct(gl.home)}</b> <span className="text-slate-600">({probToAmerican(gl.home)})</span></span>
-          <span>{g.away} <b className="text-emerald-400">{pct(gl.away)}</b> <span className="text-slate-600">({probToAmerican(gl.away)})</span></span>
-          <span>total <b className="text-sky-300">{gl.total.toFixed(1)}</b></span>
+      {(view.env || []).length ? <div className="envs">{view.env.map((e) => <span key={e.label}>{nice(e.label)}<b className={cx("num", e.hot && "warn", e.cold && "accent-t")}>{e.v}</b></span>)}</div> : null}
+      {gl ? (<>
+        <div className="stats" style={{ maxWidth: 820 }}>
+          <Stat k="Projected score" v={<span className="num" style={{ fontSize: 19, whiteSpace: "nowrap" }}>{g.away} {gl.lambdaA.toFixed(1)}, {g.home} {gl.lambdaH.toFixed(1)}</span>} />
+          <Stat k={`${g.home} win`} v={<span className="num">{pct(gl.home)}</span>} s={<span className="num">fair {probToAmerican(gl.home)}</span>} />
+          <Stat k={`${g.away} win`} v={<span className="num">{pct(gl.away)}</span>} s={<span className="num">fair {probToAmerican(gl.away)}</span>} />
+          <Stat k="Projected total" v={<span className="num">{gl.total.toFixed(1)}</span>} />
         </div>
-        <div className="text-[10px] text-slate-600 mt-1.5">{gl.note}</div>
-      </div>
+        {gl.note ? <p className="note" style={{ maxWidth: 820 }}>{cap(String(gl.note).replace(/ — /g, ", "))}</p> : null}
+      </>) : null}
       {(view.sections || []).map((cols, i) => (
-        <div key={i} className="grid sm:grid-cols-2 gap-3 mt-3">
-          {cols.map((c) => (c.starter ? <StarterCard key={c.title} c={c} onDraft={onDraft} onAnalysis={onAnalysis} /> : <LineupCol key={c.title} c={c} onDraft={onDraft} onAnalysis={onAnalysis} />))}
+        <div key={i} className="grid g2">
+          {cols.map((c) => (c.starter ? <StarterCard key={c.title} c={c} onDraft={onDraft} onAnalysis={onAnalysis} /> : <LineupCol key={c.title} c={c} heads={heads} onDraft={onDraft} onAnalysis={onAnalysis} />))}
         </div>
       ))}
     </>

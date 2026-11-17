@@ -1,123 +1,122 @@
 import React, { useEffect, useState } from "react";
+import { CalendarCheck, Layers, Moon, PanelLeftClose, PanelLeftOpen, RotateCcw, Sun, Ticket, TrendingUp } from "lucide-react";
 import MLBApp from "./App";
 import NFLApp from "./sports/nfl/Page";
 import NBAApp from "./sports/nba/Page";
 import NHLApp from "./sports/nhl/Page";
 import ParlayBuilder from "./parlay/ParlayBuilder";
+import Today from "./hub/Today";
 import MyBets from "./hub/MyBets";
 import MyStats from "./hub/MyStats";
 import { useHubBets } from "./hub/useHubBets";
+import { HUB_SPORTS } from "./hub/sports";
 import { useParlays } from "./parlay/store";
 import { SPORT_PAGES, resetSportTabs, useRoute } from "./core/route";
+import { clearAllLive, getBoard, getCredits, getSlate, useLive } from "./core/live";
+import { Btn, DialogHost, Logo, SportIcon, Toasts, confirmDialog, cx, setNavMin, setNavOpen, setTheme, todayYmd, useChrome } from "./ui/kit";
 
 /* Root: the app frame. A sidebar (a slide-out menu on phones) switches pages, and the page address
    (#/mlb/board, #/parlay) says which page is showing. Every sport renders through the shared
    SportApp shell. A page stays mounted after its first visit and is only hidden when you switch
    away, so a loaded slate and pulled odds survive switching sports. */
-const NAV = [
-  { section: "HUB", items: [
-    { page: "bets", label: "My Bets", icon: "📋" },
-    { page: "stats", label: "My Stats", icon: "📈" },
-    { page: "parlay", label: "Parlay Builder", icon: "🧩" },
-  ] },
-  { section: "EDGE FINDER", items: [
-    { page: "mlb", label: "MLB", icon: "⚾" },
-    { page: "nfl", label: "NFL", icon: "🏈" },
-    { page: "nba", label: "NBA", icon: "🏀" },
-    { page: "nhl", label: "NHL", icon: "🏒" },
-  ] },
+const HUB = [
+  { page: "today", label: "Today", Icon: CalendarCheck },
+  { page: "bets", label: "My bets", Icon: Ticket },
+  { page: "stats", label: "My stats", Icon: TrendingUp },
+  { page: "parlay", label: "Parlay builder", Icon: Layers },
 ];
-const LABEL = Object.fromEntries(NAV.flatMap((s) => s.items).map((i) => [i.page, i]));
-const TAB_LABEL = { slate: "Slate", board: "Board", trends: "Trends", analysis: "Player Analysis", log: "Board Log" };
+const SPORTS = HUB_SPORTS.map((s) => ({ page: s.id, label: s.label }));
+const LABEL = Object.fromEntries([...HUB, ...SPORTS].map((i) => [i.page, i.label]));
+const TAB_LABEL = { slate: "Slate", board: "Board", trends: "Trends", analysis: "Players", log: "Model" };
 
-function Sidebar({ route, navigate, onPick, onFreshSports }) {
-  // open tracked bets across every sport, shown next to My Bets
+function Sidebar({ route, navigate, onFreshSports }) {
+  const c = useChrome();
+  useLive();
+  // open tracked bets across every sport, shown next to My bets
   const all = useHubBets();
   const parlays = useParlays();
   const open = Object.values(all).reduce((n, bets) => n + bets.filter((b) => b.status === "open").length, 0) + parlays.filter((p) => p.status === "open").length;
+  const credits = getCredits() ?? HUB_SPORTS.map((s) => s.sport.storage.loadCredits()).find((v) => v != null) ?? null;
+  const today = todayYmd();
+  const go = (page) => { navigate(page); setNavOpen(false); };
   return (
-    <nav className="flex flex-col h-full">
-      <div className="px-4 pt-5 pb-4 border-b border-slate-800">
-        <div className="text-lg font-black tracking-tight leading-none"><span className="text-emerald-400">EDGE</span> FINDER</div>
-      </div>
-      <div className="flex-1 overflow-y-auto py-3">
-        {NAV.map((s) => (
-          <div key={s.section} className="mb-4">
-            <div className="px-4 mb-1 text-[10px] font-bold tracking-wider text-slate-500">{s.section}</div>
-            {s.items.map((i) => {
-              const active = route.page === i.page;
-              return (
-                <button
-                  key={i.page}
-                  onClick={() => { navigate(i.page); onPick && onPick(); }}
-                  className={`w-full flex items-center gap-2.5 px-4 py-2 text-sm font-semibold text-left border-l-2 ${active ? "border-emerald-400 bg-slate-900 text-emerald-400" : "border-transparent text-slate-400 hover:text-slate-200 hover:bg-slate-900/60"}`}
-                >
-                  <span className="w-5 text-center">{i.icon}</span>{i.label}
-                  {i.page === "bets" && open > 0 && <span className="ml-auto text-[10px] font-bold text-emerald-300 bg-emerald-900/40 border border-emerald-800 rounded-full px-1.5 py-0.5" title={`${open} open tracked bet(s) and parlay(s)`}>{open}</span>}
-                </button>
-              );
-            })}
-            {s.section === "EDGE FINDER" && (
-              <button onClick={() => { onFreshSports(); onPick && onPick(); }} className="w-full text-left px-4 pt-2 text-[11px] text-slate-500 hover:text-slate-300" title="Every sport back to today's Slate: clears loaded games, odds, boards and filters. Tracked bets, stats and board logs are kept.">↺ Fresh start (all sports)</button>
-            )}
-          </div>
+    <nav className="side" aria-label="Main">
+      <div className="brand"><Logo /><b>Edge Finder</b></div>
+      <div className="nav">
+        <h3>Hub</h3>
+        {HUB.map(({ page, label, Icon }) => (
+          <button type="button" key={page} className={cx("nav-item", route.page === page && "on")} title={label} onClick={() => go(page)}>
+            <Icon /><span>{label}</span>{page === "bets" && open > 0 ? <span className="count num" title={`${open} open tracked bets and parlays`}>{open}</span> : null}
+          </button>
         ))}
+        <h3>Sports</h3>
+        {SPORTS.map(({ page, label }) => {
+          const slate = getSlate(page), mine = slate && slate.date === today ? slate.games : null;
+          const live = mine ? mine.some((g) => g.status === "LIVE") : false;
+          const b = getBoard(page), pulled = b && b.board ? Object.keys(b.board).length : 0;
+          return (
+            <button type="button" key={page} className={cx("nav-item", route.page === page && "on")} title={label} onClick={() => go(page)}>
+              <SportIcon sport={page} /><span>{label}</span>
+              {live ? <i className="livedot" title="Games in progress" /> : mine ? <span className="count num" title={`${mine.length} games today${pulled ? `, odds pulled for ${pulled}` : ""}`}>{mine.length}</span> : null}
+            </button>
+          );
+        })}
+      </div>
+      <div className="side-foot">
+        <div className="credits" title="Odds credits left this month"><span>Odds credits</span><b className={cx("num", credits != null && credits < 1000 && "warn")}>{credits != null ? credits.toLocaleString() : "–"}</b></div>
+        <button type="button" className="ghostline row" onClick={onFreshSports} title="Every sport back to today's slate: clears loaded games, pulled odds and filters. Tracked bets, stats and board logs are kept."><RotateCcw size={14} />Fresh start, all sports</button>
+        <div className="row" style={{ justifyContent: "space-between" }}>
+          <Btn sm icon kind="ghost" aria-label={c.theme === "dark" ? "Switch to the light theme" : "Switch to the dark theme"} title="Switch theme" onClick={() => setTheme(c.theme === "dark" ? "light" : "dark")}>{c.theme === "dark" ? <Sun /> : <Moon />}</Btn>
+          <Btn sm icon kind="ghost" className="hide-s" aria-label={c.navMin ? "Expand the sidebar" : "Collapse the sidebar"} title={c.navMin ? "Expand the sidebar" : "Collapse the sidebar"} onClick={() => setNavMin(!c.navMin)}>{c.navMin ? <PanelLeftOpen /> : <PanelLeftClose />}</Btn>
+        </div>
       </div>
     </nav>
   );
 }
 
 export default function Root() {
+  const c = useChrome();
   const [route, navigate] = useRoute();
   const [visited, setVisited] = useState(() => new Set([route.page]));
-  const [menuOpen, setMenuOpen] = useState(false);
-  // bumping this reloads every sport page from scratch (today's Slate, nothing loaded, no filters).
+  // bumping this reloads every sport page from scratch (today's slate, nothing loaded, default filters).
   // Tracked bets, stats, board logs and saved book overrides live in storage, so they're untouched.
   const [sportEpoch, setSportEpoch] = useState(0);
   function freshSports() {
-    if (!window.confirm("Fresh start for all sports? Every sport goes back to today's Slate with loaded games, odds, boards and filters cleared (re-pulling odds uses credits). Tracked bets, stats and board logs are kept.")) return;
-    resetSportTabs();
-    // sports you're not on are unloaded entirely and load fresh on your next visit
-    setVisited((v) => new Set([...v].filter((k) => !SPORT_PAGES.includes(k) || k === route.page)));
-    setSportEpoch((e) => e + 1);
-    if (SPORT_PAGES.includes(route.page)) navigate(route.page, "slate");
+    confirmDialog({
+      title: "Fresh start for all sports?", confirm: "Start fresh",
+      body: "Every sport goes back to today's slate with loaded games, pulled odds and search cleared. Pulling odds again uses credits. Tracked bets, stats and board logs are kept.",
+      onConfirm: () => {
+        resetSportTabs();
+        clearAllLive(SPORT_PAGES);
+        // sports you're not on are unloaded entirely and load fresh on your next visit
+        setVisited((v) => new Set([...v].filter((k) => !SPORT_PAGES.includes(k) || k === route.page)));
+        setSportEpoch((e) => e + 1);
+        if (SPORT_PAGES.includes(route.page)) navigate(route.page, "slate");
+      },
+    });
   }
   useEffect(() => { setVisited((v) => (v.has(route.page) ? v : new Set([...v, route.page]))); }, [route.page]);
   useEffect(() => {
-    const i = LABEL[route.page];
-    document.title = `Edge Finder · ${i ? i.label : ""}${route.tab ? ` · ${TAB_LABEL[route.tab] || route.tab}` : ""}`;
+    document.title = `Edge Finder: ${LABEL[route.page] || ""}${route.tab ? `, ${TAB_LABEL[route.tab] || route.tab}` : ""}`;
   }, [route]);
 
-  const page = (key, el) => (visited.has(key) ? <div key={SPORT_PAGES.includes(key) ? `${key}:${sportEpoch}` : key} className={route.page === key ? "" : "hidden"}>{el}</div> : null);
+  const page = (key, el) => (visited.has(key) ? <div key={SPORT_PAGES.includes(key) ? `${key}:${sportEpoch}` : key} className={cx("pagewrap", route.page !== key && "off")}>{el}</div> : null);
   const tabProps = (key) => ({ tab: route.page === key ? route.tab : null, onTabChange: (t) => navigate(key, t) });
-  const cur = LABEL[route.page];
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 md:flex">
-      {/* desktop sidebar */}
-      <aside className="hidden md:block w-52 shrink-0 bg-slate-950 border-r border-slate-800 sticky top-0 h-screen z-20">
-        <Sidebar route={route} navigate={navigate} onFreshSports={freshSports} />
-      </aside>
-      {/* phone: top bar (scrolls away so the sport page's own sticky header keeps the top) + slide-out menu */}
-      <div className="md:hidden flex items-center gap-3 px-3 py-2 border-b border-slate-800 bg-slate-950">
-        <button onClick={() => setMenuOpen(true)} className="text-slate-300 text-xl leading-none px-1" aria-label="Open menu">☰</button>
-        <div className="text-sm font-bold">{cur ? `${cur.icon} ${cur.label}` : ""}</div>
-      </div>
-      {menuOpen && (
-        <div className="md:hidden fixed inset-0 z-50 flex">
-          <div className="w-60 bg-slate-950 border-r border-slate-800 h-full"><Sidebar route={route} navigate={navigate} onPick={() => setMenuOpen(false)} onFreshSports={freshSports} /></div>
-          <div className="flex-1 bg-black/60" onClick={() => setMenuOpen(false)} />
-        </div>
-      )}
-      <main className="flex-1 min-w-0">
+    <div className={cx("app", c.navMin && "nav-min", c.navOpen && "nav-open")}>
+      <Sidebar route={route} navigate={navigate} onFreshSports={freshSports} />
+      <div className="main" onClick={() => { if (c.navOpen) setNavOpen(false); }}>
         {page("mlb", <MLBApp {...tabProps("mlb")} />)}
         {page("nfl", <NFLApp {...tabProps("nfl")} />)}
         {page("nba", <NBAApp {...tabProps("nba")} />)}
         {page("nhl", <NHLApp {...tabProps("nhl")} />)}
+        {page("today", <Today active={route.page === "today"} navigate={navigate} />)}
         {page("bets", <MyBets active={route.page === "bets"} />)}
         {page("stats", <MyStats active={route.page === "stats"} />)}
         {page("parlay", <ParlayBuilder active={route.page === "parlay"} navigate={navigate} />)}
-      </main>
+      </div>
+      <Toasts /><DialogHost />
     </div>
   );
 }

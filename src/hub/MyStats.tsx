@@ -1,27 +1,23 @@
-/* Hub · My Stats: tracked-bet performance, filterable by sport. With one sport selected it is that
-   sport's old Stats tab (the board log tools stay on the sport page). "All" adds a by-sport breakdown
-   and labels each market with its sport; parlays count toward the totals with their own row.
-   "Parlays" shows parlay results on their own, by leg count. */
-import { useEffect, useMemo, useState } from "react";
-import { Sel, StatCard, mono } from "../core/ui";
-import { pct } from "../core/math";
-import { betStats, betsCsv, downloadText } from "../core/bets";
-import { BET_FILTER_LABELS, BET_FILTER_OPTS, HUB_SPORT, HUB_SPORTS } from "./sports";
+/* Hub · My stats: tracked-bet performance, filterable by sport and date. With one sport selected it is
+   that sport's results by market. "All sports" adds a by-sport breakdown and labels each market with its
+   sport; parlays count toward the totals with their own rows. "Parlays" shows parlay results on their
+   own, by leg count. Only tracked bets are measured here: the board log is each sport's Model tab. */
+import React, { useEffect, useMemo, useState } from "react";
+import { Download, Trash2 } from "lucide-react";
+import { betStats, betsCsv, deriveBet, downloadText } from "../core/bets";
+import { HUB_SPORT, HUB_SPORTS } from "./sports";
 import { parlayDate, parlayStats, parlaysCsv, syncParlayResults, useParlays } from "../parlay/store";
 import { scopedBets, setSportBets, useHubBets } from "./useHubBets";
-import { HubHeader, combinedStats, mergeOverall } from "./common";
+import { BET_SEG, HubTop, betNet, betUnits, combinedStats, dailySeries, isSettled, mergeOverall } from "./common";
+import { Btn, Empty, HBar, Panel, Seg, SportTag, Stat, Th, cmp, confirmDialog, cx, fNum, fPct, fSigned, fUnits, toast, tone } from "../ui/kit";
+import { LineChart } from "../ui/charts";
 
-const signed = (x, d = 2) => `${x >= 0 ? "+" : ""}${x.toFixed(d)}`;
-
-function RecordRow({ label, s }) {
-  return (
-    <div className="flex items-center gap-3 bg-slate-900/70 border border-slate-800 rounded-xl px-4 py-2.5 text-[12px]" style={mono}>
-      <div className="flex-1 font-semibold">{label}</div>
-      <div className="text-slate-400">{s.w}-{s.l}{s.ps ? `-${s.ps}` : ""}</div>
-      <div className="text-slate-300 w-16 text-right">{s.winPct != null ? pct(s.winPct) : "—"}</div>
-      <div className={`w-20 text-right font-bold ${s.net >= 0 ? "text-emerald-400" : "text-rose-400"}`}>{signed(s.net)}u</div>
-    </div>
-  );
+const EDGE_BANDS = [["Below 3%", -9, 0.03], ["3 to 5%", 0.03, 0.05], ["5 to 7%", 0.05, 0.07], ["7% and up", 0.07, 9]];
+const record = (s) => `${s.w}-${s.l}${s.ps ? `-${s.ps}` : ""}`;
+function summarize(list) {
+  const w = list.filter((b) => b.status === "won").length, l = list.filter((b) => b.status === "lost").length;
+  const net = list.reduce((a, b) => a + betNet(b), 0), staked = list.filter((b) => b.status === "won" || b.status === "lost").reduce((a, b) => a + betUnits(b), 0);
+  return { n: list.length, w, l, ps: list.filter((b) => b.status === "push").length, winPct: w + l ? w / (w + l) : null, net, roi: staked ? net / staked : null };
 }
 
 export default function MyStats({ active = true }) {
@@ -30,6 +26,7 @@ export default function MyStats({ active = true }) {
   const [sportFilter, setSportFilter] = useState("all");
   const [start, setStart] = useState("");
   const [end, setEnd] = useState("");
+  const [msort, setMsort] = useState({ k: "i", d: 1 });
   const onlyParlays = sportFilter === "parlays";
   const one = sportFilter !== "all" && !onlyParlays ? HUB_SPORT[sportFilter] : null;
   useEffect(() => { if (active) void syncParlayResults(HUB_SPORTS); }, [active]);
@@ -47,6 +44,17 @@ export default function MyStats({ active = true }) {
   }, [all, one, onlyParlays, pStats, start, end]);
   const typeOrder = one ? one.sport.config.STAT_ORDER : stats.typeOrder;
   const o = stats.overall;
+  const inRange = (d) => (!start || (d && d >= start)) && (!end || (d && d <= end));
+  const settled = useMemo(() => bets.filter((b) => isSettled(b) && inRange(b.date)), [bets, start, end]);
+  const settledParlays = useMemo(() => (one ? [] : parlays.filter((p) => p.status !== "open" && inRange(parlayDate(p)))), [parlays, one, start, end]);
+  const series = useMemo(() => dailySeries(settled, settledParlays), [settled, settledParlays]);
+  const derived = useMemo(() => settled.map(deriveBet), [settled]);
+  const byEdge = EDGE_BANDS.map(([label, lo, hi]) => ({ label, ...summarize(derived.filter((b) => b.edge != null && b.edge >= lo && b.edge < hi)) }));
+  const withMove = derived.filter((b) => b.clv != null), avgMove = withMove.length ? withMove.reduce((a, b) => a + b.clv, 0) / withMove.length : null;
+  const marketRows = typeOrder.filter((t) => stats.byType[t]).map((t, i) => {
+    const parts = one ? [null, t] : t.split(" · ");
+    return { i, key: t, group: parts[0], type: parts.length > 1 ? parts.slice(1).join(" · ") : t, ...stats.byType[t] };
+  });
 
   function exportCSV() {
     const stamp = new Date().toISOString().slice(0, 10);
@@ -57,80 +65,84 @@ export default function MyStats({ active = true }) {
   // clears one sport's bets (pick the sport first); never every sport at once
   function resetStats() {
     if (!one) return;
-    if (!window.confirm(`Clear ALL tracked ${one.label} bets (open + settled)? This cannot be undone. Export a CSV first if you want a copy.`)) return;
-    setSportBets(one.id, []);
+    const prev = all[one.id];
+    confirmDialog({
+      title: `Clear all tracked ${one.label} bets?`, danger: true, confirm: "Clear bets",
+      body: `${prev.length.toLocaleString()} ${one.label} bets, open and settled, are removed. Download a CSV or a backup first if you want a copy.`,
+      onConfirm: () => { setSportBets(one.id, []); toast(`Cleared ${prev.length.toLocaleString()} ${one.label} bets.`, () => setSportBets(one.id, prev)); },
+    });
   }
+  const groupName = (g) => { const s = HUB_SPORTS.find((x) => x.label === g); return s ? <SportTag sport={s.id} label={s.label} /> : <span className="mid">{g}</span>; };
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100" style={{ fontFamily: "ui-sans-serif, system-ui, sans-serif" }}>
-      <div className="max-w-5xl mx-auto px-4 pb-28">
-        <HubHeader title="MY" accent="STATS" sub="tracked-bet results · stake-weighted net & ROI · by sport and market" />
-        <div className="mt-3">
-          <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
-            <div className="flex items-center gap-3 flex-wrap">
-              <Sel compact label="sport" v={sportFilter} opts={BET_FILTER_OPTS} labels={BET_FILTER_LABELS} onChange={setSportFilter} />
-              <div className="text-[11px] text-slate-500" style={mono}>net & ROI are stake-weighted (units per bet) · flat-1u shown for comparison</div>
-            </div>
-            <div className="flex items-center gap-2">
-              <button onClick={exportCSV} disabled={bets.length === 0 && (one || parlays.length === 0)} className="bg-sky-600 hover:bg-sky-500 disabled:opacity-40 text-white font-bold text-xs rounded-lg px-3 py-1.5">Download CSV</button>
-              <button onClick={resetStats} disabled={!one || bets.length === 0} title={one ? undefined : "Pick a sport to reset its stats (parlays are removed one at a time in My Bets)"} className="bg-slate-800 hover:bg-rose-700 disabled:opacity-40 border border-slate-700 text-slate-200 font-bold text-xs rounded-lg px-3 py-1.5">Reset stats</button>
-            </div>
-          </div>
-
-          {/* Date range filter */}
-          <div className="flex items-end gap-3 flex-wrap mb-4 p-2.5 rounded-lg bg-slate-900/40 border border-slate-800">
-            <label className="text-xs text-slate-400 flex flex-col gap-1">start date
-              <input type="date" value={start} min={dates[0] || ""} max={end || dates[dates.length - 1] || ""} onChange={(e) => setStart(e.target.value)} className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm text-slate-100 w-36" />
-            </label>
-            <label className="text-xs text-slate-400 flex flex-col gap-1">end date
-              <input type="date" value={end} min={start || dates[0] || ""} max={dates[dates.length - 1] || ""} onChange={(e) => setEnd(e.target.value)} className="bg-slate-950 border border-slate-700 rounded px-2 py-1.5 text-sm text-slate-100 w-36" />
-            </label>
-            {(start || end) && (
-              <button onClick={() => { setStart(""); setEnd(""); }} className="text-[11px] text-slate-400 hover:text-rose-300 border border-slate-700 rounded px-2.5 py-1.5">clear</button>
-            )}
-            <div className="text-[11px] text-slate-500 self-end pb-1.5" style={mono}>
-              {start || end ? `${start || dates[0] || "…"} → ${end || dates[dates.length - 1] || "…"}` : "all time"}
-            </div>
-          </div>
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-4">
-            <StatCard label="Settled" v={o.n} />
-            <StatCard label="Win %" v={o.winPct != null ? pct(o.winPct) : "—"} good={o.winPct != null && o.winPct >= 0.524} />
-            <StatCard label="Net (units)" v={`${signed(o.net)}u`} good={o.net >= 0} />
-            <StatCard label="ROI" v={o.roi != null ? `${signed(o.roi * 100, 1)}%` : "—"} good={o.roi != null && o.roi >= 0} />
-          </div>
-          <div className="text-[11px] text-slate-500 mb-3" style={mono}>
-            record {o.w}-{o.l}{o.ps ? `-${o.ps}` : ""}{o.v ? ` · ${o.v} void` : ""} · {o.staked.toFixed(2)}u staked · {stats.openCount} open · break-even ≈ 52.4% at −110
-          </div>
-          <div className="text-[11px] mb-3 px-3 py-2 rounded-lg bg-slate-900/70 border border-slate-800" style={mono}>
-            <span className="text-slate-500">strategy compare · </span>
-            <span className="text-slate-300">staked: <span className={o.net >= 0 ? "text-emerald-400 font-bold" : "text-rose-400 font-bold"}>{signed(o.net)}u</span> ({o.roi != null ? `${(o.roi * 100).toFixed(1)}%` : "—"} ROI)</span>
-            <span className="text-slate-600"> vs </span>
-            <span className="text-slate-300">flat 1u: <span className={o.flatNet >= 0 ? "text-emerald-400 font-bold" : "text-rose-400 font-bold"}>{signed(o.flatNet)}u</span> ({o.flatRoi != null ? `${(o.flatRoi * 100).toFixed(1)}%` : "—"} ROI)</span>
-          </div>
-          {!one && !onlyParlays && stats.overall.n > 0 && (
-            <div className="mb-4">
-              <div className="text-[10px] text-slate-500 font-bold tracking-wide mb-1.5">BY SPORT</div>
-              <div className="space-y-2">
-                {HUB_SPORTS.filter((s) => stats.bySport[s.id].overall.n > 0).map((s) => <RecordRow key={s.id} label={`${s.icon} ${s.label}`} s={stats.bySport[s.id].overall} />)}
-                {pStats.overall.n > 0 && <RecordRow label="🧩 Parlays" s={pStats.overall} />}
-              </div>
-            </div>
-          )}
-          {Object.keys(stats.byType).length === 0 ? (
-            <div className="text-sm text-slate-500 py-8 text-center">{onlyParlays ? "No settled parlays yet. Track parlays in the Parlay Builder; their legs settle as each sport's results come in." : "No settled bets yet. Track bets, then hit “Settle finished” on My Bets after games end."}</div>
-          ) : (
-            <div>
-              {!one && <div className="text-[10px] text-slate-500 font-bold tracking-wide mb-1.5">{onlyParlays ? "BY LEG COUNT" : "BY MARKET"}</div>}
-              <div className="space-y-2">
-                {typeOrder.filter((t) => stats.byType[t]).map((t) => <RecordRow key={t} label={t} s={stats.byType[t]} />)}
-              </div>
-            </div>
-          )}
-          <div className="mt-5 text-[11px] text-slate-600 leading-relaxed">
-            Net/ROI use each bet’s unit stake; the flat-1u line shows what the same bets return at a flat stake, so you can see whether the ¼-Kelly suggestion actually beats flat. Kelly only helps if the model’s edges are real, so trust the comparison over many bets, not a handful. Once there’s a real sample, also compare win% by edge bucket to tune the priors (RECENT_WEIGHT, NB_PHI, shrinkage).
-          </div>
+    <>
+      <HubTop title="My stats">
+        <Btn disabled={bets.length === 0 && (!!one || parlays.length === 0)} onClick={exportCSV}><Download /><span className="hide-s">Download CSV</span></Btn>
+        <Btn kind="danger" disabled={!one || bets.length === 0} onClick={resetStats} title={one ? `Clear every tracked ${one.label} bet` : "Pick one sport to clear its bets. Parlays are removed one at a time in My bets."}><Trash2 /><span className="hide-s">Reset stats</span></Btn>
+      </HubTop>
+      <div className="screen">
+        <div className="bar">
+          <Seg label="Sport" value={sportFilter} onChange={(v) => { setSportFilter(v); setMsort({ k: "i", d: 1 }); }} options={BET_SEG} />
+          <span className="sep" />
+          <span className="label">From</span><input type="date" className="field datefield num" aria-label="Start date" value={start} min={dates[0] || ""} max={end || dates[dates.length - 1] || ""} onChange={(e) => setStart(e.target.value)} />
+          <span className="label">to</span><input type="date" className="field datefield num" aria-label="End date" value={end} min={start || dates[0] || ""} max={dates[dates.length - 1] || ""} onChange={(e) => setEnd(e.target.value)} />
+          {start || end ? <Btn sm kind="ghost" onClick={() => { setStart(""); setEnd(""); }}>All time</Btn> : null}
+          <span className="grow" /><span className="note hide-s">Tracked bets only. The board log is measured on each sport's Model tab.</span>
         </div>
+        <div className="scroll"><div className="page" style={{ display: "grid", gap: 16 }}>
+          {!o.n ? <Empty title={onlyParlays ? "No settled parlays in this range" : "No settled bets in this range"}>{onlyParlays ? "Track parlays in the Parlay builder. Their legs settle as each sport's results come in." : "Track bets, then press Settle finished on My bets after the games end."}{stats.openCount ? ` ${stats.openCount} still open.` : ""}</Empty> : (<>
+            <div className="stats">
+              <Stat k="Record" v={<span className="num">{record(o)}</span>} s={`${o.n} settled${o.v ? `, ${o.v} void` : ""}, ${stats.openCount} open`} />
+              <Stat k="Win rate" v={<span className="num">{fPct(o.winPct)}</span>} s="Break-even is about 52.4% at −110" />
+              <Stat k="Net units" v={<span className="num">{fUnits(o.net)}</span>} cls={tone(o.net)} s={`${fNum(o.staked, 2)}u staked`} />
+              <Stat k="Return on stake" v={<span className="num">{fSigned(o.roi)}</span>} cls={tone(o.roi)} s={<span className="num">Flat 1u: {fUnits(o.flatNet)}, {fSigned(o.flatRoi)}</span>} />
+              {avgMove != null ? <Stat k="Average line move" v={<span className="num">{fSigned(avgMove, 2)}</span>} cls={tone(avgMove)} s={`Positive means you beat the close. ${withMove.length} bets.`} /> : null}
+            </div>
+            <div className="grid g-3-2">
+              <Panel title="Units over time" sub="Running total by slate date. Your stakes against a flat 1 unit on every bet.">
+                {series.labels.length > 1
+                  ? <LineChart height={320} labels={series.labels} fmt={(v) => `${v > 0 ? "+" : ""}${Number(v).toFixed(Math.abs(v) < 10 && v % 1 ? 1 : 0)}u`} series={[{ name: "Your stakes", color: "var(--s1)", values: series.staked }, { name: "Flat 1 unit", color: "var(--s2)", values: series.flat }]} />
+                  : <p className="note">The chart appears once bets have settled on two or more dates.</p>}
+              </Panel>
+              <div className="grid" style={{ alignContent: "start" }}>
+                {!one && !onlyParlays ? (
+                  <Panel title="By sport" flush>
+                    <table className="tbl inset"><thead><tr><th>Sport</th><th className="r">Record</th><th className="r">Win rate</th><th className="r">Net</th><th className="r">Return</th></tr></thead>
+                      <tbody>
+                        {HUB_SPORTS.filter((s) => stats.bySport[s.id].overall.n > 0).map((s) => { const x = stats.bySport[s.id].overall; return <tr key={s.id}><td><SportTag sport={s.id} label={s.label} /></td><td className="r num">{record(x)}</td><td className="r num">{fPct(x.winPct)}</td><td className={cx("r num", tone(x.net))}>{fUnits(x.net)}</td><td className={cx("r num", tone(x.roi))}>{fSigned(x.roi)}</td></tr>; })}
+                        {pStats.overall.n > 0 ? <tr><td className="mid">Parlays</td><td className="r num">{record(pStats.overall)}</td><td className="r num">{fPct(pStats.overall.winPct)}</td><td className={cx("r num", tone(pStats.overall.net))}>{fUnits(pStats.overall.net)}</td><td className={cx("r num", tone(pStats.overall.roi))}>{fSigned(pStats.overall.roi)}</td></tr> : null}
+                      </tbody></table>
+                  </Panel>
+                ) : null}
+                {!onlyParlays ? (
+                  <Panel title="By edge when you bet" sub="Are the bigger edges paying more?" flush>
+                    <table className="tbl inset"><thead><tr><th>Model edge</th><th className="r">Bets</th><th className="r">Win rate</th><th className="r">Net</th><th className="r">Return</th></tr></thead>
+                      <tbody>{byEdge.map((x) => <tr key={x.label}><td>{x.label}</td><td className="r num">{x.n}</td><td className="r num">{fPct(x.winPct)}</td><td className={cx("r num", tone(x.net))}>{x.n ? fUnits(x.net) : "–"}</td><td className={cx("r num", tone(x.roi))}>{fSigned(x.roi)}</td></tr>)}</tbody></table>
+                  </Panel>
+                ) : null}
+              </div>
+            </div>
+            <Panel title={onlyParlays ? "By leg count" : "By market"} sub="Click a column to sort" flush>
+              <table className="tbl inset">
+                <thead><tr>
+                  {!one && !onlyParlays ? <Th k="i" sort={msort} onSort={setMsort}>Sport</Th> : null}
+                  <Th k={one || onlyParlays ? "i" : "type"} sort={msort} onSort={setMsort}>{onlyParlays ? "Parlay" : "Market"}</Th><Th k="n" sort={msort} onSort={setMsort} r>Bets</Th><th className="r">Record</th>
+                  <Th k="winPct" sort={msort} onSort={setMsort} r>Win rate</Th><Th k="net" sort={msort} onSort={setMsort} r>Net</Th><Th k="roi" sort={msort} onSort={setMsort} r>Return</Th><Th k="flatNet" sort={msort} onSort={setMsort} r className="hide-s" title="The same bets at a flat 1 unit each">Flat 1u</Th>
+                </tr></thead>
+                <tbody>{marketRows.slice().sort(cmp(msort.k, msort.d)).map((x) => (
+                  <tr key={x.key}>
+                    {!one && !onlyParlays ? <td>{groupName(x.group)}</td> : null}
+                    <td className="name">{x.type}</td><td className="r num">{x.n}</td><td className="r num mid">{record(x)}</td>
+                    <td className="r"><span className="row" style={{ justifyContent: "flex-end" }}><HBar value={x.winPct ?? 0} width={64} /><span className="num" style={{ minWidth: 44, textAlign: "right" }}>{fPct(x.winPct)}</span></span></td>
+                    <td className={cx("r num", tone(x.net))}>{fUnits(x.net)}</td><td className={cx("r num", tone(x.roi))}>{fSigned(x.roi)}</td><td className={cx("r num hide-s", tone(x.flatNet))}>{fUnits(x.flatNet)}</td>
+                  </tr>
+                ))}</tbody>
+              </table>
+            </Panel>
+            <p className="note" style={{ maxWidth: 860 }}>Net and return use each bet's unit stake. The flat 1 unit figures show what the same bets return at a flat stake, so you can see whether sizing your bets is helping. Trust the comparison over many bets, not a handful.</p>
+          </>)}
+        </div></div>
       </div>
-    </div>
+    </>
   );
 }

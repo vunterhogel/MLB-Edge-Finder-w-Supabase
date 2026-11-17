@@ -1,10 +1,10 @@
-/* Page addresses for the app frame: #/<page>[/<tab>], e.g. #/mlb/board, #/parlay.
+/* Page addresses for the app frame: #/<page>[/<tab>], e.g. #/today, #/mlb/board, #/parlay.
    The address drives what's shown, so a refresh or the back button keeps your place. The last page
    is remembered (and each sport's last tab), and the app reopens there when no address is given. */
 import { useEffect, useRef, useState } from "react";
 
 export const SPORT_PAGES = ["mlb", "nfl", "nba", "nhl"];
-export const HUB_PAGES = ["bets", "stats", "parlay"];
+export const HUB_PAGES = ["today", "bets", "stats", "parlay"];
 export const SPORT_TABS = ["slate", "board", "trends", "analysis", "log"];
 // addresses from before the hub: a sport's My Bets tab moved to Hub My Bets, its Stats tab is now Board Log
 const MOVED_TABS = { mybets: { page: "bets" }, stats: { tab: "log" } };
