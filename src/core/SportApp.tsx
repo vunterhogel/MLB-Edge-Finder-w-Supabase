@@ -609,7 +609,7 @@ export default function SportApp({ sport, tab: routeTab = null, onTabChange = nu
             <span className="mid">{loading && !games.length ? "Loading the schedule" : `${games.length} game${games.length === 1 ? "" : "s"}${liveCount ? `, ${liveCount} live` : ""}. Odds pulled for ${pulledCount}.`}</span>
             <span className="grow" />
             <span className="note num hide-s">Odds credits <b className={credits != null && credits < 1000 ? "warn" : ""} style={{ fontWeight: 620, color: credits != null && credits < 1000 ? undefined : "var(--ink)" }}>{credits != null ? credits.toLocaleString() : "–"}</b>{stamp ? `, schedule loaded ${stamp.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}` : ""}</span>
-            <Btn disabled={!unpulled.length || !!pullingAll || oddsLoading != null} onClick={askPullAll}><Download />{pullingAll ? `Pulling ${pullingAll.done} of ${pullingAll.total}` : unpulled.length ? `Pull all upcoming (${unpulled.length})` : "All games pulled"}</Btn>
+            <Btn disabled={!unpulled.length || !!pullingAll || oddsLoading != null} onClick={askPullAll}><Download />{pullingAll ? `Pulling ${pullingAll.done} of ${pullingAll.total}` : unpulled.length ? `Pull odds for all ${unpulled.length}` : "All games pulled"}</Btn>
           </div>
           <div className="scroll">
             {games.map((g) => {
@@ -619,32 +619,32 @@ export default function SportApp({ sport, tab: routeTab = null, onTabChange = nu
               return (
                 <div key={g.pk} className={cx("game", isOpen && "open")}>
                   <div className="game-row" onClick={() => expand(g)}>
-                    <div className="num" style={{ fontWeight: 600 }}>
+                    <div className="num game-when">
                       {g.status === "LIVE" ? <span className="row" style={{ gap: 6, color: "var(--live)" }}><span className="livedot" />{scored ? sport.game.liveLabel(g) : "Live"}</span> : fin ? <span className="mid">Final{sport.game.finalSuffix(g) || ""}</span> : g.time}
                     </div>
                     <div className="matchup">
-                      <Team sport={sport.id} ab={g.away} lg />{scored ? <span className={cx("num", fin && g.awayScore < g.homeScore && "mid")}>{g.awayScore}</span> : null}
+                      <Team sport={sport.id} ab={g.away} lg /><span className={cx("num", fin && g.awayScore < g.homeScore && "lose")}>{scored ? g.awayScore : ""}</span>
                       <span className="at">at</span>
-                      <Team sport={sport.id} ab={g.home} lg />{scored ? <span className={cx("num", fin && g.homeScore < g.awayScore && "mid")}>{g.homeScore}</span> : null}
+                      <Team sport={sport.id} ab={g.home} lg /><span className={cx("num", fin && g.homeScore < g.awayScore && "lose")}>{scored ? g.homeScore : ""}</span>
                     </div>
                     <div className="hide-s"><Chip s={g.status} /></div>
                     <div className="hide-s mid trunc">{g.manual ? "Added by hand" : sport.game.subtitle(g)}</div>
-                    <div className="row" onClick={(e) => e.stopPropagation()}>
-                      {trackedByGame[g.pk] ? <span className="hide-s"><Badge kind="accent" title={`${trackedByGame[g.pk]} open tracked bet${trackedByGame[g.pk] === 1 ? "" : "s"} on this game`}>{trackedByGame[g.pk]} tracked</Badge></span> : null}
-                      {g.manual || fin ? null : hasOdds
-                        ? <Btn sm kind="ghost" disabled={busy || !!pullingAll} title={`${hasOdds} priced plays. Pull this game's odds again.`} onClick={() => getOdds(g)}><RefreshCw />{busy ? "Pulling" : pulledAt[g.pk] ? clock(pulledAt[g.pk]) : "Pulled"}</Btn>
-                        : <Btn sm kind="primary" disabled={busy || !!pullingAll} onClick={() => getOdds(g)}>{busy ? "Pulling" : "Pull odds"}</Btn>}
+                    <div className="game-actions" onClick={(e) => e.stopPropagation()}>
+                      <span className="hide-s">{trackedByGame[g.pk] ? <Badge kind="accent" title={`${trackedByGame[g.pk]} open tracked bet${trackedByGame[g.pk] === 1 ? "" : "s"} on this game`}>{trackedByGame[g.pk]} tracked</Badge> : null}</span>
+                      {g.manual || fin ? <span /> : hasOdds
+                        ? <Btn disabled={busy || !!pullingAll} title={`${hasOdds} priced plays on the Board. Pull this game's odds again.`} onClick={() => getOdds(g)}><RefreshCw />{busy ? "Pulling" : pulledAt[g.pk] ? `Pulled ${clock(pulledAt[g.pk])}` : "Pull again"}</Btn>
+                        : <Btn kind="primary" disabled={busy || !!pullingAll} onClick={() => getOdds(g)}><Download />{busy ? "Pulling" : "Pull odds"}</Btn>}
                     </div>
                     <Expander open={isOpen} label={isOpen ? "Hide lineups" : "Show lineups"} onClick={(e) => { e.stopPropagation(); expand(g); }} />
                   </div>
                   {isOpen ? (
                     <div className="game-detail">
-                      {d && d.loading ? <div className="note" style={{ padding: "12px 0" }}>Loading stats.</div> : null}
+                      {d && d.loading ? <div className="note" style={{ padding: "12px 0" }}>Loading lineups and stats.</div> : null}
                       {g.manual ? <div className="note" style={{ padding: "12px 0" }}>A game added by hand has no model context. Track its bets by hand from My bets.</div> : null}
                       {d && d.ready ? (<>
                         <GameDetail g={g} view={sport.slateView(g, d)} sportId={sport.id} onDraft={(dr) => draftFromGame(g, dr.kind, dr.id, dr.name)} onAnalysis={goToAnalysis} />
-                        {hasOdds ? <div className="note">{hasOdds} priced plays from this game are on the Board. <button type="button" className="link" onClick={() => { setF({ game: String(g.pk) }); setTab("board"); }}>Open them</button></div>
-                          : !fin ? <div className="note">Pull odds to price this game's props on the Board ({BOOK_LABELS[book] || book}).</div> : null}
+                        {hasOdds ? <div className="row"><span className="mid">{hasOdds} priced plays from this game are on the Board.</span><Btn sm onClick={() => { setF({ game: String(g.pk) }); setTab("board"); }}>Open them on the Board</Btn></div>
+                          : !fin ? <div className="row"><span className="mid">No odds pulled for this game yet.</span><Btn sm kind="primary" disabled={busy || !!pullingAll} onClick={() => getOdds(g)}><Download />{busy ? "Pulling" : `Pull ${BOOK_LABELS[book] || book} odds`}</Btn></div> : null}
                       </>) : null}
                     </div>
                   ) : null}
