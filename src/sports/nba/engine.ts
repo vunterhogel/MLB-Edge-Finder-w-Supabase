@@ -13,7 +13,7 @@ export function probabilityOver(family, line, side, seed, params) {
 // per-market calibration: DAY-1 PRIOR. No settled-bet history for basketball yet, so every
 // category starts at a conservative, uniform "trust the market a lot" weight — same posture
 // NFL launched with. Retune per-category from the Stats tab; don't hand-tune from vibes.
-export const MODEL_VERSION = "nba-v6.1-2026-11-16";   // v6.1: calibration refit (one-sided de-vig, disagreement-aware weights, OUT not priced). Bump on every model change (part of every board-log id). v3: opponent defense by position + real pace (matchups.ts). v4: role/minutes model, fitted spreads, points shape. v5: role settings refit on two seasons (bench minutes), DD/TD sim refit, fitted CALIB_KEEP. v6: starter signal = started his last game (+ depth-chart spot starters), role settings refit on that signal, steals/blocks shrink
+export const MODEL_VERSION = "nba-v6.2-2026-11-19";   // v6.2: weights = measured information of the model lean (all 0 for now). v6.1: calibration refit (one-sided de-vig, disagreement-aware weights, OUT not priced). Bump on every model change (part of every board-log id). v3: opponent defense by position + real pace (matchups.ts). v4: role/minutes model, fitted spreads, points shape. v5: role settings refit on two seasons (bench minutes), DD/TD sim refit, fitted CALIB_KEEP. v6: starter signal = started his last game (+ depth-chart spot starters), role settings refit on that signal, steals/blocks shrink
 
 /* v5: fitted on the 10/28-11/11 board logs (21.4k prop rows, 110 games), using v5's own probabilities for those
    games: the weight on the model that best predicts results by log-loss, rounded to 0.05. 0 = the model's lean
@@ -30,14 +30,26 @@ export const MODEL_VERSION = "nba-v6.1-2026-11-16";   // v6.1: calibration refit
       carries no information beyond the market yet (it still prices and logs; it can earn weight back).
    Out of sample (fit through 11/08, tested 11/09-11/15): log-loss 0.6563 vs market 0.6565 (v5 weights 0.6575),
    flags 409 at +1.1% ROI vs 471 at -18.7%. Fitted mostly on v4 probabilities: refit weekly on v6 rows. */
+/* v6.2 (2026-11-19): weights set to the information the model's lean has actually carried, measured directly.
+   For each market: regress (result - no-vig) on (model raw - no-vig), clustered by player-game. The slope is the
+   share of the model's disagreement with the line that shows up in results, which is the log-loss-optimal weight
+   for this calibration form. Board logs 10/28-11/18, v4 + v5 + v6 probabilities (about 18,000 settled over-side rows):
+     pooled across props -0.004 +/- 0.043, no market reliably different (Assists +0.19 +/- 0.14, Rebounds +0.09
+     +/- 0.14, Points -0.08 +/- 0.12, PRA -0.12 +/- 0.12, Threes -0.16 +/- 0.15; v6 alone: Threes -1.07 +/- 0.31).
+   Shrinking each market toward the pooled value (empirical Bayes) gives 0 everywhere. So every NBA market now prices
+   at the no-vig market (one-sided DD / TD at their de-vigged fair): the model still projects, every row is still
+   priced and logged with its raw probability, and a market gets weight back the moment its slope turns positive.
+   Why v6.1 flooded unders: its weights (0.65-0.85 on points markets) were fit mostly on v4 probabilities and passed
+   v6's systematic under lean (raw P(over) averaged 0.04 below the market, while overs hit at the market rate)
+   straight into the flags: 306 of 317 tracked v6.1 bets were unders. */
 export const CALIB_TAU = 0.08;
 export const ONE_SIDED_GAMMA = { "Double-Double": 1.20, "Triple-Double": 1.32 };
 export const CALIB_KEEP = {
-  "Points": 0.65, "Rebounds": 0.25, "Assists": 0.65, "Three-Pointers Made": 0.25, "Steals": 0.00, "Blocks": 0.15, "Turnovers": 0.35,
-  "Pts+Reb+Ast": 0.85, "Pts+Reb": 0.75, "Pts+Ast": 0.75, "Reb+Ast": 0.05, "Blocks+Steals": 0.55,
-  "Double-Double": 0.00, "Triple-Double": 0.00, "Spread": 0.15, "Total": 0.00, "Moneyline": 0.00,
+  "Points": 0.00, "Rebounds": 0.00, "Assists": 0.00, "Three-Pointers Made": 0.00, "Steals": 0.00, "Blocks": 0.00, "Turnovers": 0.00,
+  "Pts+Reb+Ast": 0.00, "Pts+Reb": 0.00, "Pts+Ast": 0.00, "Reb+Ast": 0.00, "Blocks+Steals": 0.00,
+  "Double-Double": 0.00, "Triple-Double": 0.00, "Spread": 0.00, "Total": 0.00, "Moneyline": 0.00,
 };
-export const CALIB_KEEP_DEFAULT = 0.5;
+export const CALIB_KEEP_DEFAULT = 0.0;
 export function keepFor(type) { return (type != null && CALIB_KEEP[type] != null) ? CALIB_KEEP[type] : CALIB_KEEP_DEFAULT; }
 const NO_TAU = new Set(["Double-Double", "Triple-Double", "Spread", "Total", "Moneyline"]);
 export function calibrateToMarket(p, market, type, proj = null, line = null) {

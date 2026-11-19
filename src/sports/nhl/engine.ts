@@ -8,7 +8,7 @@
 import { clamp, evPerUnit, impliedProb, negativeBinomialProbabilityOver, noVigProb, poiCdf, poiPmf, probToAmerican } from "../../core/math";
 import { LG, PRIOR, PRIOR_SEASON_MAX, PRIOR_SEASON_WEIGHT, SHRINK_G } from "./config";
 
-export const MODEL_VERSION = "nhl-v3.1-2026-11-16";   // v3.1: calibration weights refit on v3 board logs
+export const MODEL_VERSION = "nhl-v3.2-2026-11-19";   // v3.1: calibration weights refit on v3 board logs
 /* v3 (2026-11-12): skater base rates rebuilt. v2 shrank every skater's per-game rates 25-30 games toward a league-average forward /
    defenseman, so the players books post props on (top six, power play) were projected 15-30% low on points
    and assists and nearly every flag was an under. v3 projects ice time from recent games, works in per-60
@@ -38,7 +38,12 @@ export const REG_SHARE = 0.97;          // share of a team's goals scored in reg
    0.40 -> 0.30, Saves 0.35 -> 0.15); game lines fit 0 on 2+ weeks of v2 + v3 rows -> 0. A weight of 0 = the market
    price (the model's lean adds nothing there yet; it still prices and logs). Leave-one-night-out: log-loss ties the
    market (0.6552) and flags go -8.0% -> -4.6%. Refit weekly. Goals / PPP have no logged rows: unchanged. */
-export const CALIB_KEEP = { "Shots on Goal": 0.30, "Points": 0.60, "Goals": 0.30, "Assists": 0.55, "Power Play Points": 0.30, "Saves": 0.15, "Moneyline": 0.00, "Puck Line": 0.00, "Total": 0.00 };
+/* v3.2 (2026-11-19): weights = the measured information in the model's lean (slope of (result - no-vig) on
+   (raw - no-vig), clustered by player-game), over v3 + v3.1 board logs 11/12-11/18 (same skater model; 2,300 over
+   rows): Points +0.47 +/- 0.38, Assists +0.56 +/- 0.42, SOG +0.19 +/- 0.37; pooled skater props +0.39 +/- 0.22.
+   Shrunk to the pooled value (empirical Bayes, no between-market spread detected) -> 0.40 for skater props.
+   Saves -1.1 +/- 1.1 (87 rows) -> 0; game lines 45 games each, slopes negative -> 0. Refit weekly. */
+export const CALIB_KEEP = { "Shots on Goal": 0.40, "Points": 0.40, "Goals": 0.40, "Assists": 0.40, "Power Play Points": 0.40, "Saves": 0.00, "Moneyline": 0.00, "Puck Line": 0.00, "Total": 0.00 };
 export const keepFor = (t) => (CALIB_KEEP[t] != null ? CALIB_KEEP[t] : 0.4);
 export const calibrateToMarket = (p, market, type) => (p == null || market == null ? p : clamp(market + keepFor(type) * (p - market), 0.001, 0.999));
 

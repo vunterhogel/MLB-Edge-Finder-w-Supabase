@@ -387,6 +387,40 @@ On 2026-27 (not used for fitting), with the app-like signal for both, the log-li
 - CALIB_KEEP stays at the v5 fit until there are v6 rows to refit on.
 - Steals and blocks are still high for board players (selection: books post those props for high-rate defenders). The stronger shrink narrows the gap, and the fitted weights handle the rest.
 
+### v6.2 (nba-v6.2-2026-11-19): weights set to the information the model actually carries
+
+**What went wrong with v6.1.** Its tracked bets were 306 unders out of 317. On the v6 rows (11/15-11/18):
+- Raw P(over) averaged 0.04 below the no-vig line, but overs hit at the line's own rate (hit minus market about 0.00).
+- Rows with the projection within 3% of the line had raw P(over) 0.459, market 0.496, actual 0.512.
+- The v6.1 weights (0.65-0.85 on the points markets) were fit mostly on v4 probabilities. They passed that under lean straight into the flags.
+
+**The measurement.** For each market, regress (result − no-vig) on (raw − no-vig), clustered by player-game. The slope is the share of the model's disagreement with the line that actually shows up in results. It is also the log-loss-optimal weight for our calibration form. Board logs 10/28-11/18, v4 + v5 + v6 probabilities, about 18,000 settled over-side rows:
+
+| Market | Slope ± SE |
+|---|---|
+| All props pooled | −0.004 ± 0.043 |
+| Assists | +0.19 ± 0.14 |
+| Steals | +0.41 ± 0.28 |
+| Rebounds | +0.09 ± 0.14 |
+| Reb+Ast | +0.07 ± 0.14 |
+| Double-Double | +0.09 ± 0.15 |
+| Points | −0.08 ± 0.12 |
+| Pts+Ast | −0.08 ± 0.13 |
+| Pts+Reb | −0.09 ± 0.12 |
+| Pts+Reb+Ast | −0.12 ± 0.12 |
+| Threes | −0.16 ± 0.15 (v6 alone: −1.07 ± 0.31) |
+
+No market differs from the pooled value by more than noise. Shrinking each toward the pool (empirical Bayes) gives 0 for all of them. The same holds within each model version: v4 era +0.03 ± 0.10, v6 era −0.02 ± 0.18. By time before tip-off, no window is reliably positive. The closest is 1-3 hours before tip, at +0.20 ± 0.11, which is worth watching once the pre-tip refresh exists.
+
+**What it means.** So far, the NBA model's disagreement with DraftKings has not predicted results, in any market or any version. Every flag it produced was noise plus vig, which explains the NBA losses since October.
+
+**What v6.2 does.** Every NBA weight is 0, so each market prices at its no-vig fair (DD and TD at their de-vigged fair). The model still projects every row, and every row is still logged with its raw probability. A market gets weight back as soon as its measured slope turns positive.
+
+**What has to change is the projection, not the calibration:**
+- v6 points-family projections run about 3% low against hoopR box scores (minutes 1% low, per-minute 2% low).
+- Threes are anti-predictive in v6.
+- The path to real information is what the market prices late or misses: the pre-tip lineup refresh, injury redistribution, and multi-book prices.
+
 ### v6.1 (nba-v6.1-2026-11-16): calibration refit, no hidden markets
 
 No market is switched off or hidden. Every row is still projected, priced and logged. What changed is how much of the model's lean each probability keeps, refit on the board logs (10/27-11/15, 28,600 settled pregame rows).
