@@ -5,7 +5,7 @@ import { RNG, binCdf, clamp, evPerUnit, hashSeed, impliedProb, negativeBinomialP
 // Bump on EVERY model change: it's part of every board-log id, so a new version logs its own snapshot
 // of the same bet next to the old one. (v4.2 was never bumped through the Jul-Sep calibration edits;
 // v4.3 marks rows from 2026-10-18 on.)
-export const MODEL_VERSION = "v4.4-2026-10-19";   // v4.4: playoff games in recent windows + postseason mode
+export const MODEL_VERSION = "v4.5-2026-11-19";   // v4.5: priced against the market consensus of other books (core/consensus.ts). v4.4: playoff games in recent windows + postseason mode
 
 /* ---------- engine constants (tunable) ---------- */
 export const RECENT_WEIGHT = 0.20;

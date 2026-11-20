@@ -8,7 +8,7 @@
 import { clamp, evPerUnit, impliedProb, negativeBinomialProbabilityOver, noVigProb, poiCdf, poiPmf, probToAmerican } from "../../core/math";
 import { LG, PRIOR, PRIOR_SEASON_MAX, PRIOR_SEASON_WEIGHT, SHRINK_G } from "./config";
 
-export const MODEL_VERSION = "nhl-v3.2-2026-11-19";   // v3.1: calibration weights refit on v3 board logs
+export const MODEL_VERSION = "nhl-v3.3-2026-11-19";   // v3.3: priced against the market consensus of other books (core/consensus.ts)   // v3.1: calibration weights refit on v3 board logs
 /* v3 (2026-11-12): skater base rates rebuilt. v2 shrank every skater's per-game rates 25-30 games toward a league-average forward /
    defenseman, so the players books post props on (top six, power play) were projected 15-30% low on points
    and assists and nearly every flag was an under. v3 projects ice time from recent games, works in per-60

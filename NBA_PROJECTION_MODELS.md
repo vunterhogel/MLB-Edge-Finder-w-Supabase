@@ -387,6 +387,18 @@ On 2026-27 (not used for fitting), with the app-like signal for both, the log-li
 - CALIB_KEEP stays at the v5 fit until there are v6 rows to refit on.
 - Steals and blocks are still high for board players (selection: books post those props for high-rate defenders). The stronger shrink narrows the gap, and the fitted weights handle the rest.
 
+### v6.3 (nba-v6.3-2026-11-19): priced against the market consensus (all sports)
+
+Until now, "fair" was DraftKings' own line with the vig removed. A book can never show an edge against its own price, so with the NBA weights at 0 every row came out at minus DK's cut (about -4%).
+
+Each odds call now also asks for up to nine other books: FanDuel, Caesars, Pinnacle, BetMGM, ESPN BET, Fanatics, BetRivers, BetOnline and Hard Rock. Per The Odds API, up to 10 bookmakers cost the same credits as one region, so the call costs what it did before. For every row, each other book that prices the same market at the same line is de-vigged on its own. The fair price is their average, used when at least 2 books qualify. The bet is still priced at the book you picked; the others are only the yardstick.
+
+- The model sits on top of the consensus with the weight it already had: calibrated = consensus + w × (raw − consensus), where w = CALIB_KEEP × disagreement weight.
+- NBA weights are 0, so NBA rows are priced at the consensus alone. +EV now means DK's price is better than the rest of the market's fair price.
+- One-sided markets (DD, TD, Anytime TD, HR) have nothing to de-vig against and keep the book's own fair price.
+- New board-log columns: `fairP` (consensus fair for that side), `fairBooks` (how many books), `bookModelP` (the price against DK alone, for comparison).
+- To check whether it works, measure the information slope of (fairP − DK no-vig) on results over the coming nights, the same test the model got.
+
 ### v6.2 (nba-v6.2-2026-11-19): weights set to the information the model actually carries
 
 **What went wrong with v6.1.** Its tracked bets were 306 unders out of 317. On the v6 rows (11/15-11/18):

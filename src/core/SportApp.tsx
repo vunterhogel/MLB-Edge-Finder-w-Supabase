@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { BookmarkPlus, Bug, Check, ChevronDown, ChevronLeft, ChevronRight, Download, ListFilter, MoreHorizontal, Plus, RefreshCw, Trash2, X } from "lucide-react";
 import { probToAmerican, suggestedUnits } from "./math";
+import { applyConsensus, consensusBooks } from "./consensus";
 import { BoardHead, BoardRow, TrendRow } from "./cards";
 import { makeDeltaSignal } from "./signals";
 import { Chip, GameDetail } from "./slate";
@@ -246,14 +247,22 @@ export default function SportApp({ sport, tab: routeTab = null, onTabChange = nu
       // (region, market) however many bookmakers you list, so this costs the same as a single-book fetch.
       const validOverrides = Object.fromEntries(Object.entries(bookOverrides).filter(([t, bk]) => bk && bk !== book && BOOKS.some((b) => b.key === bk) && ALL_PROPS.includes(t)));
       const booksNeeded = [...new Set([book, ...Object.values(validOverrides)])];
+      // + the market-consensus books (core/consensus.ts): up to 10 books per call costs the same credits as one
+      const consBooks = consensusBooks(booksNeeded);
       const before = creditsRef.current;
-      const res = await fetchEventOdds(ev.id, booksNeeded.join(","));
+      const res = await fetchEventOdds(ev.id, [...booksNeeded, ...consBooks].join(","));
       if (res.remaining != null) { setCredits(res.remaining); if (before != null && before - res.remaining > 0) setPullCost(before - res.remaining); creditsRef.current = res.remaining; }
       fetchesRef.current += 1;
-      const dbg = oddsDebug(res.data, book);
+      // the call also returns the consensus books: the board's own parsing only ever sees the books it asked for
+      // (MLB / NFL parsers fall back to the first book returned when one is missing), and each consensus book
+      // is parsed on its own, so no price is ever read under another book's name
+      const allBms = (res.data && res.data.bookmakers) || [];
+      const dataFor = (keys) => ({ ...res.data, bookmakers: allBms.filter((b) => keys.includes(b.key)) });
+      const data = dataFor(booksNeeded);
+      const dbg = oddsDebug(data, book);
       // rows are parsed per book, then merged type by type: a type with an override sources its rows
       // from that book instead of the primary one, but only when the primary book is missing that market.
-      const rowsByBook = {}; for (const bk of booksNeeded) rowsByBook[bk] = parseEventOdds(res.data, bk);
+      const rowsByBook = {}; for (const bk of booksNeeded) rowsByBook[bk] = parseEventOdds(data, bk);
       const rows = [];
       for (const t of ALL_PROPS) {
         const overrideBook = validOverrides[t];
@@ -263,10 +272,20 @@ export default function SportApp({ sport, tab: routeTab = null, onTabChange = nu
         for (const r of bkRows) rows.push({ ...r, srcBook: effectiveBook });
       }
       const hrOverrideBook = validOverrides[meta.diagnosticsType];
-      const hrDbg = hrOverrideBook ? oddsDebug(res.data, hrOverrideBook) : null;
-      const gl = parseGameOdds(res.data, book, g);          // moneyline / spread / total
-      const entries = sport.buildPropEntries(g, d, rows, book, gl);
-      const lineEntries = buildGameLineEntries(g, d, gl, book);
+      const hrDbg = hrOverrideBook ? oddsDebug(data, hrOverrideBook) : null;
+      const gl = parseGameOdds(data, book, g);          // moneyline / spread / total
+      const entries0 = sport.buildPropEntries(g, d, rows, book, gl);
+      const lineEntries0 = buildGameLineEntries(g, d, gl, book);
+      // price every row against the rest of the market: each other book's de-vigged price at the same line
+      const byBook = {};
+      for (const bk of [...booksNeeded, ...consBooks]) {
+        if (!allBms.some((b) => b.key === bk)) continue;
+        const one = dataFor([bk]);
+        byBook[bk] = { rows: parseEventOdds(one, bk), gl: parseGameOdds(one, bk, g) };
+      }
+      const withCons = (e) => applyConsensus(e, Object.fromEntries(Object.entries(byBook).filter(([bk]) => bk !== (e.book || book))), sport.api.matchCurrentOdds);
+      const entries = entries0.map(withCons);
+      const lineEntries = lineEntries0.map(withCons);
       entries.push(...lineEntries);
       const returned = [...new Set(rows.map((r) => r.type)), ...lineEntries.map((e) => e.type)];
       const matched = [...new Set(entries.map((e) => e.type))];

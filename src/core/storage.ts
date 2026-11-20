@@ -176,6 +176,10 @@ export function createStorage(prefix, MODEL_VERSION, DEFAULT_BOOK_OVERRIDES = {}
           live: !!(e.calc && (e.calc.live || /live/i.test(String(e.calc.dist || "")))),
           // optional per-sport diagnostic tag (e.g. NBA v6: projected minutes + starter signal behind the row)
           tag: e.calc && e.calc.logTag ? String(e.calc.logTag) : null,
+          // market consensus (core/consensus.ts): other books' average de-vigged price for this side + how many books
+          fairP: e.fairP != null ? +Number(e.fairP).toFixed(4) : null,
+          fairBooks: e.fairBooks != null ? e.fairBooks : null,
+          bookModelP: e.bookModelP != null ? +Number(e.bookModelP).toFixed(4) : null,
           // settlement (filled later)
           settled: false,
           actualStat: null,

@@ -20,7 +20,7 @@ export function liveProbabilityOver(family, seed, params, currentTotal, line) {
 // for football yet, so every category starts at a conservative, uniform "trust the market a lot"
 // weight. Retune per-category from the Stats tab exactly the way MLB did — do NOT hand-tune
 // these from vibes; wait for graded volume.
-export const MODEL_VERSION = "nfl-v4.1-2026-11-16";   // v4.1: Anytime TD one-sided de-vig. Bump on every model change (part of every board-log id). v3: opponent positional matchups (nflverse weekly stats). v4: replay-fit priors / shrinkage / spreads, QB volume from starts
+export const MODEL_VERSION = "nfl-v4.2-2026-11-19";   // v4.2: priced against the market consensus of other books (core/consensus.ts). v4.1: Anytime TD one-sided de-vig. Bump on every model change (part of every board-log id). v3: opponent positional matchups (nflverse weekly stats). v4: replay-fit priors / shrinkage / spreads, QB volume from starts
 /* v4 (2026-11-12): every prior, shrink weight and spread refit by replaying the 2025 season week by week from
    nflverse box scores (inputs built only from earlier weeks, the way the page builds them; the app's own
    projections match the replay at a median ratio of 1.000) and checked on 2026 weeks 1-9 (held out).

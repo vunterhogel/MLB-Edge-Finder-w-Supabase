@@ -46,7 +46,7 @@ export function downloadBoardLogCsv(sport) {
   const log = sport.storage.loadBoardLog();
   if (!log.length) return false;
   const esc = (v) => { if (v == null) return ""; const s = String(v); return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s; };
-  const headers = ["logId","loggedAt","modelVersion","date","game","gameTimeIso","gamePk","playerId","name","type","line","side","odds","novig","rawModelP","calibratedP","edge","ev","proj","settled","actualStat","result","closingNovig","clv","live","tag"];
+  const headers = ["logId","loggedAt","modelVersion","date","game","gameTimeIso","gamePk","playerId","name","type","line","side","odds","novig","rawModelP","calibratedP","edge","ev","proj","settled","actualStat","result","closingNovig","clv","live","tag","fairP","fairBooks","bookModelP"];
   const rows = [headers.join(",")];
   for (const e of log) {
     rows.push([
@@ -56,7 +56,7 @@ export function downloadBoardLogCsv(sport) {
       e.novig ?? "", e.rawModelP ?? "", e.calibratedP ?? "",
       e.edge ?? "", e.ev ?? "", e.proj ?? "",
       e.settled ? "true" : "false",
-      e.actualStat ?? "", esc(e.result), e.closingNovig ?? "", e.clv ?? "", e.live == null ? "" : (e.live ? "true" : "false"), esc(e.tag),
+      e.actualStat ?? "", esc(e.result), e.closingNovig ?? "", e.clv ?? "", e.live == null ? "" : (e.live ? "true" : "false"), esc(e.tag), e.fairP ?? "", e.fairBooks ?? "", e.bookModelP ?? "",
     ].join(","));
   }
   const blob = new Blob([rows.join("\n")], { type: "text/csv;charset=utf-8;" });
